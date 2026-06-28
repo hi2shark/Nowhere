@@ -23,11 +23,12 @@ protocol and requires no separate server option.
 
 | Document | Scope |
 | --- | --- |
-| [Quick start](quick-start.md) | Build, run, and smoke-check a local Portal. |
 | [Configuration reference](configuration.md) | URL shape, query parameters, listener rules, TLS inputs, and examples. |
+| [Integration guide](integrations.md) | OpenCtrl management and Anywhere client setup. |
 | [Operations guide](operations.md) | Logging, event records, rate limits, runtime controls, shutdown, and deployment habits. |
-| [Security notes](security.md) | Shared-key handling, TLS trust, authentication failure behavior, and exposure guidance. |
 | [Protocol specification](protocol.md) | Normative v1 wire format, derivation, TCP, QUIC DATAGRAM, UoT, limits, and conformance checks. |
+| [Quick start](quick-start.md) | Build, run, and smoke-check a local Portal. |
+| [Security notes](security.md) | Shared-key handling, TLS trust, authentication failure behavior, and exposure guidance. |
 
 ## Reading Paths
 
@@ -36,13 +37,15 @@ For operators:
 1. [Quick start](quick-start.md)
 2. [Configuration reference](configuration.md)
 3. [Operations guide](operations.md)
-4. [Security notes](security.md)
+4. [Integration guide](integrations.md)
+5. [Security notes](security.md)
 
 For client authors:
 
 1. [Protocol specification](protocol.md)
 2. [Configuration reference](configuration.md)
-3. [Security notes](security.md)
+3. [Integration guide](integrations.md)
+4. [Security notes](security.md)
 
 For release maintainers:
 

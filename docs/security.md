@@ -103,6 +103,8 @@ rotated deliberately when certificates change.
 - Monitor `CHECK_POINT` counters and process restarts.
 - Rotate shared keys through a coordinated client and server rollout.
 - Treat debug logs as sensitive because they may expose operational details.
+- Treat management-layer state, API responses, event streams, and logs as
+  sensitive when they contain a Portal URL: its username is the shared key.
 
 ## Non-Goals
 
@@ -116,3 +118,6 @@ The Portal does not provide:
 - plaintext transport.
 
 Implement those controls outside the Portal when a deployment requires them.
+[OpenCtrl](https://github.com/NodePassProject/OpenCtrl) is a supported external
+management layer; see the [integration guide](integrations.md) for its security
+and process-lifecycle boundaries.
