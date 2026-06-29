@@ -35,6 +35,10 @@ Required URL parts:
   shared-key       Non-empty URL username. Percent-encode reserved characters.
   listen-port      TCP and/or UDP listen port.
 
+Unsupported URL forms:
+  password         Password credentials are not supported.
+  tls=0            tls=0 is not supported.
+
 Listen host:
   empty            Bind IPv4 and IPv6 wildcard sockets.
   0.0.0.0          Bind IPv4 wildcard only.
