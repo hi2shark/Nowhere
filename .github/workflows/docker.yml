@@ -42,6 +42,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
