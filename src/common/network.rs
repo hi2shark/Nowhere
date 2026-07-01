@@ -95,7 +95,7 @@ pub async fn dial_udp_from_local_ip(
         .map_err(|_| anyhow!("common::util::dial_udp_from_local_ip: dial timeout"))?
 }
 
-fn parse_local_ip(dialer_ip: &str) -> Option<IpAddr> {
+pub(super) fn parse_local_ip(dialer_ip: &str) -> Option<IpAddr> {
     if dialer_ip == DEFAULT_DIALER_IP {
         None
     } else {
@@ -103,7 +103,7 @@ fn parse_local_ip(dialer_ip: &str) -> Option<IpAddr> {
     }
 }
 
-fn filter_addrs(
+pub(super) fn filter_addrs(
     addrs: impl Iterator<Item = SocketAddr>,
     local_ip: Option<IpAddr>,
 ) -> Vec<SocketAddr> {
@@ -117,7 +117,10 @@ fn filter_addrs(
         .collect()
 }
 
-async fn connect_tcp_addr(local_ip: Option<IpAddr>, target: SocketAddr) -> Result<TcpStream> {
+pub(super) async fn connect_tcp_addr(
+    local_ip: Option<IpAddr>,
+    target: SocketAddr,
+) -> Result<TcpStream> {
     if let Some(ip) = local_ip {
         let socket = if target.is_ipv4() {
             TcpSocket::new_v4()
@@ -138,7 +141,10 @@ async fn connect_tcp_addr(local_ip: Option<IpAddr>, target: SocketAddr) -> Resul
     }
 }
 
-async fn connect_udp_addr(local_ip: Option<IpAddr>, target: SocketAddr) -> Result<UdpSocket> {
+pub(super) async fn connect_udp_addr(
+    local_ip: Option<IpAddr>,
+    target: SocketAddr,
+) -> Result<UdpSocket> {
     let bind_addr = match local_ip {
         Some(ip) => SocketAddr::new(ip, 0),
         None if target.is_ipv4() => SocketAddr::from(([0, 0, 0, 0], 0)),

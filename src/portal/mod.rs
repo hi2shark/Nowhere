@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use crate::common::{Logger, TLSMode};
+use crate::common::{Logger, OutboundDialer, TLSMode};
 use crate::protocol::Credentials;
 use crate::transport::{Buffers, RateLimiter, Stats};
 
@@ -34,7 +34,7 @@ struct PortalInner {
     endpoint_addr: String,
     bind_addrs: Vec<SocketAddr>,
     listen_port: u16,
-    dialer_ip: String,
+    outbound: OutboundDialer,
     rate_limit: i32,
     etar_limit: i32,
     logger: Logger,

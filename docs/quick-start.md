@@ -40,14 +40,15 @@ This starts the Portal with these effective defaults:
 | shared key | `secret` |
 | listen host | empty host, dual-stack wildcard |
 | listen port | `2077` |
+| `log` | `info` |
 | `tls` | `1`, generated self-signed certificate |
 | `net` | `mix`, TLS/TCP and QUIC/UDP listeners |
 | `spec` | `auto` |
 | `alpn` | `now/1` |
-| `dial` | `auto` |
 | `rate` | `0`, disabled |
 | `etar` | `0`, disabled |
-| `log` | `info` |
+| `dial` | `auto` |
+| `socks` | `none`, direct outbound connections |
 
 The startup log prints the effective URL after parsing. Treat that line as the
 operator-facing source of truth for the running process.

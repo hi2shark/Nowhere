@@ -67,7 +67,7 @@ For a long-lived Portal, use a stable certificate and an explicit public
 configuration:
 
 ```text
-portal://change-me@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem&spec=nightfall&alpn=now%2F1&net=mix
+portal://change-me@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem&net=mix&spec=nightfall&alpn=now%2F1
 ```
 
 Certificate and private-key paths are resolved by the Nowhere child process
@@ -172,7 +172,7 @@ A Portal using `net=mix` accepts either client mode. A Portal restricted to
 Run a public Portal with a stable certificate:
 
 ```text
-portal://change-me@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem&spec=nightfall&alpn=now%2F1&net=mix
+portal://change-me@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem&net=mix&spec=nightfall&alpn=now%2F1
 ```
 
 Import a QUIC/UDP client configuration in Anywhere:

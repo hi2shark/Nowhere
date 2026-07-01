@@ -8,12 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{UDP_FRAME_SCRATCH_SIZE, udp_idle_timeout};
+use crate::common::{OutboundUdpSocket, UDP_FRAME_SCRATCH_SIZE, udp_idle_timeout};
 use crate::protocol::append_frame_payload;
 
 use super::PortalSession;
@@ -52,7 +51,7 @@ impl Hash for UdpFlowKey {
 pub(super) struct PortalUdpFlow {
     session: Weak<PortalSession>,
     key: UdpFlowKey,
-    socket: Arc<UdpSocket>,
+    socket: Arc<OutboundUdpSocket>,
     response_header: Vec<u8>,
     closed: AtomicBool,
     last_used: Mutex<Instant>,
@@ -64,7 +63,7 @@ impl PortalUdpFlow {
     pub(super) fn new(
         session: Weak<PortalSession>,
         key: UdpFlowKey,
-        socket: UdpSocket,
+        socket: OutboundUdpSocket,
         response_header: Vec<u8>,
     ) -> Self {
         Self {
@@ -84,7 +83,7 @@ impl PortalUdpFlow {
     }
 
     /// Sends one client payload to the target UDP socket.
-    pub(super) async fn send_to_target(&self, payload: &[u8]) -> std::io::Result<usize> {
+    pub(super) async fn send_to_target(&self, payload: &[u8]) -> anyhow::Result<usize> {
         self.socket.send(payload).await
     }
 

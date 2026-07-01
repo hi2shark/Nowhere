@@ -6,6 +6,7 @@
 mod config;
 mod logger;
 mod network;
+mod socks;
 mod tls;
 
 pub use config::{
@@ -16,4 +17,5 @@ pub use config::{
 };
 pub use logger::{LogLevel, Logger};
 pub use network::{bind_udp_addrs, dial_tcp_from_local_ip, dial_udp_from_local_ip};
+pub(crate) use socks::{OutboundDialer, OutboundUdpSocket, SocksConfig};
 pub use tls::{TLSMode, new_server_configs};

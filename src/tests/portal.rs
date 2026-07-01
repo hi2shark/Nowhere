@@ -29,11 +29,11 @@ fn empty_host_listens_on_both_wildcard_families() {
             SocketAddr::from(([0u16; 8], 2077)),
         ]
     );
-    assert_eq!(portal.inner.dialer_ip, "127.0.0.1");
+    assert_eq!(portal.inner.outbound.dialer_ip(), "127.0.0.1");
     assert_eq!(portal.inner.network_mode, NetworkMode::Mix);
     assert_eq!(
         portal.effective_url(),
-        "portal://:2077?tls=1&spec=auto&alpn=now/1&net=mix&dial=127.0.0.1&rate=0&etar=0"
+        "portal://:2077?tls=1&net=mix&spec=auto&alpn=now/1&rate=0&etar=0&dial=127.0.0.1&socks=none"
     );
 }
 
@@ -55,14 +55,14 @@ fn explicit_wildcard_host_selects_one_address_family() {
         ipv4.inner.bind_addrs,
         vec![SocketAddr::from(([0, 0, 0, 0], 2077))]
     );
-    assert_eq!(ipv4.inner.dialer_ip, "auto");
+    assert_eq!(ipv4.inner.outbound.dialer_ip(), "auto");
 
     assert_eq!(ipv6.inner.endpoint_addr, "[::]:2077");
     assert_eq!(
         ipv6.inner.bind_addrs,
         vec![SocketAddr::from(([0u16; 8], 2077))]
     );
-    assert_eq!(ipv6.inner.dialer_ip, "::1");
+    assert_eq!(ipv6.inner.outbound.dialer_ip(), "::1");
 }
 
 #[test]
@@ -96,10 +96,31 @@ fn network_mode_rejects_unknown_values() {
 }
 
 #[test]
+fn socks_configuration_is_validated_and_redacted_in_effective_url() {
+    let portal = Portal::new(
+        Url::parse("portal://secret@127.0.0.1:2077?log=none&socks=user:p%40ss@proxy.test:1080")
+            .unwrap(),
+        test_logger(),
+    )
+    .unwrap();
+    let effective = portal.effective_url();
+    assert!(effective.contains("socks=proxy.test:1080"));
+    assert!(!effective.contains("user"));
+    assert!(!effective.contains("p@ss"));
+
+    let duplicate = Portal::new(
+        Url::parse("portal://secret@127.0.0.1:2077?socks=proxy.test:1080&socks=other.test:1080")
+            .unwrap(),
+        test_logger(),
+    );
+    assert!(duplicate.is_err());
+}
+
+#[test]
 fn all_network_modes_reject_tls_zero() {
     for mode in ["mix", "tcp", "udp"] {
         let portal = Portal::new(
-            Url::parse(&format!("portal://secret@127.0.0.1:2077?net={mode}&tls=0")).unwrap(),
+            Url::parse(&format!("portal://secret@127.0.0.1:2077?tls=0&net={mode}")).unwrap(),
             test_logger(),
         );
         assert!(portal.is_err());

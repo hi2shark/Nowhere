@@ -9,11 +9,30 @@ and UDP listeners must both bind successfully. The process logs the effective
 startup URL after defaults are applied:
 
 ```text
-portal::run: starting: portal://:<port>?tls=1&spec=auto&alpn=now/1&net=mix&dial=auto&rate=0&etar=0
+portal::run: starting: portal://:<port>?tls=1&net=mix&spec=auto&alpn=now/1&rate=0&etar=0&dial=auto&socks=none
 ```
 
 Use this line when comparing intended configuration with runtime behavior. It
-prints effective values, not necessarily the exact command-line URL.
+prints effective values, not necessarily the exact command-line URL. When
+SOCKS5 authentication is configured, this line prints only the proxy endpoint
+and never prints the username or password.
+
+## SOCKS5 Outbound Behavior
+
+When `socks` is configured, all TCP and UDP target traffic is routed through
+that SOCKS5 server. TCP uses CONNECT. Every QUIC DATAGRAM and UoT flow uses its
+own UDP ASSOCIATE control connection and relay socket. Closing the control
+connection closes the associated flow.
+
+Target domain names are resolved by the SOCKS5 server. The Portal resolves only
+the proxy endpoint and any domain returned by the proxy for its UDP relay. If
+`dial` specifies a local IP, proxy addresses and relay sockets must use the same
+address family.
+
+Proxy connection, authentication, command, or relay failures close only the
+affected Nowhere flow. The Portal never bypasses the configured proxy by
+falling back to a direct target connection. TCP proxy setup shares
+`NOW_TCP_DIAL_TIMEOUT`; UDP proxy setup shares `NOW_UDP_DIAL_TIMEOUT`.
 
 ## Logging
 

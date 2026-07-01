@@ -9,10 +9,16 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-use crate::protocol::{DATAGRAM_UDP_REQUEST, new_udp_datagram_header, write_auth_frame};
+use crate::protocol::{
+    DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram, new_udp_datagram_header,
+    write_auth_frame,
+};
 
 use super::super::*;
-use super::support::{connect_test_quic, stop_test_quic};
+use super::support::{
+    TestSocksAuth, connect_test_quic, connect_test_quic_with_url, spawn_test_socks5_udp,
+    stop_test_quic,
+};
 
 #[tokio::test]
 async fn quic_pre_auth_stream_limit_is_raised_and_early_datagram_is_preserved() {
@@ -60,6 +66,52 @@ async fn quic_pre_auth_stream_limit_is_raised_and_early_datagram_is_preserved() 
 
     connection.close(VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn quic_datagram_relays_through_socks5_udp_associate() {
+    let (socks_addr, socks_task) = spawn_test_socks5_udp(TestSocksAuth::None, "dns.test").await;
+    let url = format!("portal://secret@127.0.0.1:0?log=none&net=udp&socks={socks_addr}");
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic_with_url(&url).await;
+
+    let (mut auth_send, _auth_recv) = connection.open_bi().await.unwrap();
+    let auth = write_auth_frame(
+        portal.inner.credentials.key,
+        &portal.inner.credentials.protocol_spec,
+        [23; 32],
+    );
+    auth_send.write_all(&auth).await.unwrap();
+    auth_send.finish().unwrap();
+    timeout(Duration::from_secs(2), connection.open_bi())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut request = new_udp_datagram_header(
+        DATAGRAM_UDP_REQUEST,
+        11,
+        "dns.test:53",
+        &portal.inner.credentials.protocol_spec,
+    )
+    .unwrap();
+    request.extend_from_slice(b"ping");
+    connection.send_datagram(Bytes::from(request)).unwrap();
+
+    let response = timeout(Duration::from_secs(3), connection.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    let (frame_type, flow_id, target, payload) =
+        decode_udp_datagram(&response, &portal.inner.credentials.protocol_spec).unwrap();
+    assert_eq!(frame_type, DATAGRAM_UDP_RESPONSE);
+    assert_eq!(flow_id, 11);
+    assert_eq!(target, "dns.test:53");
+    assert_eq!(payload, b"pong");
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+    socks_task.await.unwrap();
 }
 
 #[tokio::test]

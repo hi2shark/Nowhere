@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{dial_udp_from_local_ip, udp_dial_timeout};
+use crate::common::udp_dial_timeout;
 use crate::protocol::{
     DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram,
     new_udp_datagram_header,
@@ -130,8 +130,11 @@ impl PortalSession {
             return Ok(flow);
         }
 
-        let socket =
-            dial_udp_from_local_ip(&self.portal.dialer_ip, target_addr, udp_dial_timeout()).await?;
+        let socket = self
+            .portal
+            .outbound
+            .dial_udp(target_addr, udp_dial_timeout())
+            .await?;
         let response_header = new_udp_datagram_header(
             DATAGRAM_UDP_RESPONSE,
             flow_id,

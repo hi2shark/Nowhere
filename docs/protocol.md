@@ -33,7 +33,7 @@ and **MAY** are to be interpreted as normative requirements.
 The Portal is configured with one URL:
 
 ```text
-portal://<shared-key>@<listen-host>:<listen-port>?tls=<mode>&spec=<spec>&alpn=<alpn>&net=<mode>&dial=<ip-or-auto>&rate=<mbps>&etar=<mbps>&crt=<path>&key=<path>&log=<level>
+portal://<shared-key>@<listen-host>:<listen-port>?log=<level>&tls=<mode>&crt=<path>&key=<path>&net=<mode>&spec=<spec>&alpn=<alpn>&rate=<mbps>&etar=<mbps>&dial=<ip-or-auto>&socks=<proxy>
 ```
 
 Minimal configuration:
@@ -50,28 +50,32 @@ Unknown query parameters are ignored.
 
 The shared key, `spec`, and `alpn` are percent-decoded as UTF-8. A literal `+`
 in `spec` or `alpn` remains `+`; it is not converted to a space. If a query key
-occurs more than once, the first occurrence is used.
+occurs more than once, the first occurrence is used. Duplicate `socks`
+parameters MUST be rejected.
 
 | Input | Requirement | Decoded UTF-8 byte length |
 | --- | --- | --- |
 | Shared key | Required and non-empty | `1..255` |
 | `spec` | Optional; empty is treated as omitted | `1..255` when non-empty |
 | `alpn` | Optional; empty is treated as omitted | `1..255` when non-empty |
+| SOCKS username | Required when SOCKS authentication is configured | `1..255` |
+| SOCKS password | Required when SOCKS authentication is configured | `1..255` |
 
 ### 3.2 Parameters
 
 | Parameter | Default | Semantics |
 | --- | --- | --- |
+| `log` | `info` | `none`, `debug`, `info`, `warn`, `error`, or `event`. An unknown value selects `info`. |
 | `tls` | `1` | `1` creates a self-signed certificate. `2` loads PEM files from `crt` and `key`. Other values are invalid. |
-| `spec` | `auto` | Deterministic seed for v1 authentication, padding, and frame layouts. |
-| `alpn` | `now/1` | QUIC/TLS ALPN override. It does not alter any other protocol field. |
-| `net` | `mix` | Selects ingress transports. `tcp` enables TLS/TCP, `udp` enables QUIC/UDP, and `mix` enables both. Missing and empty values select `mix`; other values are invalid. |
-| `dial` | `auto` | Local IP literal for outbound TCP and UDP sockets. Empty, invalid, hostname, and `auto` values select the operating-system default. |
-| `rate` | `0` | Client-to-target rate limit in Mbps. |
-| `etar` | `0` | Target-to-client rate limit in Mbps. |
 | `crt` | Empty | PEM certificate chain used by `tls=2`. |
 | `key` | Empty | PEM private key used by `tls=2`. |
-| `log` | `info` | `none`, `debug`, `info`, `warn`, `error`, or `event`. An unknown value selects `info`. |
+| `net` | `mix` | Selects ingress transports. `tcp` enables TLS/TCP, `udp` enables QUIC/UDP, and `mix` enables both. Missing and empty values select `mix`; other values are invalid. |
+| `spec` | `auto` | Deterministic seed for v1 authentication, padding, and frame layouts. |
+| `alpn` | `now/1` | QUIC/TLS ALPN override. It does not alter any other protocol field. |
+| `rate` | `0` | Client-to-target rate limit in Mbps. |
+| `etar` | `0` | Target-to-client rate limit in Mbps. |
+| `dial` | `auto` | Local IP literal for outbound TCP and UDP sockets. Empty, invalid, hostname, and `auto` values select the operating-system default. |
+| `socks` | `none` | SOCKS5 proxy as `host:port` or `user:pass@host:port`. Missing, empty, and `none` disable proxying. |
 
 `rate` and `etar` accept positive decimal integers. Zero, a negative value, an
 invalid value, or omission disables the corresponding limit. The conversion is:
@@ -86,6 +90,12 @@ has independent client-to-target and target-to-client buckets.
 `net` does not select the proxied traffic type. TLS/TCP supports ordinary TCP
 relay and UoT. QUIC supports TCP relay on bidirectional streams and UDP relay
 in DATAGRAM frames.
+
+When `socks` is configured, every target MUST use that proxy. TCP uses SOCKS5
+CONNECT. Each UDP flow uses a separate UDP ASSOCIATE and retains its control
+connection for the flow lifetime. Target domain names are encoded in SOCKS5
+requests and resolved by the proxy. Proxy failure MUST NOT fall back to direct
+target access. `dial` binds connections and relay sockets toward the proxy.
 
 ### 3.3 Listen Address
 
@@ -359,10 +369,12 @@ The receiver MUST reject a version other than `1`, an invalid target, an
 incorrect padding length, or incorrect padding bytes. The request padding is
 not forwarded to the target.
 
-After parsing the request, the Portal resolves and connects to the target,
-optionally binding the outbound socket to `dial`. It then relays bytes in both
-directions. When one direction reaches EOF, the other direction may continue
-for at most `NOW_TCP_READ_TIMEOUT`.
+After parsing the request, the Portal either resolves and connects directly to
+the target or sends the target unchanged in a configured SOCKS5 CONNECT
+request. `dial` binds the direct target socket or the connection to the SOCKS5
+server. The Portal then relays bytes in both directions. When one direction
+reaches EOF, the other direction may continue for at most
+`NOW_TCP_READ_TIMEOUT`.
 
 ## 9. UDP Relay
 
@@ -429,7 +441,9 @@ target_len_u16 || target_utf8
 `target_len_u16` MUST be from 1 through 512, and `target_utf8` MUST satisfy
 Section 10. The Portal bounds reading the complete setup target by
 `NOW_HANDSHAKE_TIMEOUT`. It then resolves the target and opens one connected UDP
-socket, optionally binding its source address according to `dial`.
+socket, optionally binding its source address according to `dial`. With SOCKS5
+enabled, it instead creates a per-flow UDP ASSOCIATE, keeps the associated TCP
+control connection open, and sends the target in each SOCKS5 UDP packet.
 
 After setup, both directions consist only of packet frames:
 

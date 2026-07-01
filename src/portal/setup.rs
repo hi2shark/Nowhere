@@ -10,8 +10,9 @@ use anyhow::Result;
 use url::Url;
 
 use crate::common::{
-    DEFAULT_RATE_LIMIT, Logger, bind_udp_addrs, init_dialer_ip, new_server_configs, query_int,
-    rate_limit_bytes_per_second, tcp_data_buf_size, udp_data_buf_size,
+    DEFAULT_RATE_LIMIT, Logger, OutboundDialer, SocksConfig, bind_udp_addrs, init_dialer_ip,
+    new_server_configs, query_int, rate_limit_bytes_per_second, tcp_data_buf_size,
+    udp_data_buf_size,
 };
 use crate::protocol::Credentials;
 use crate::transport::{Buffers, RateLimiter, Stats};
@@ -60,6 +61,9 @@ impl Portal {
                 .map(|(_, v)| v.into_owned())
                 .as_deref(),
         );
+        let socks = SocksConfig::from_url(&parsed_url).map_err(|e| {
+            anyhow::anyhow!("portal::new: failed to parse socks configuration: {e}")
+        })?;
         let rate_limit = query_int(
             parsed_url
                 .query_pairs()
@@ -91,7 +95,7 @@ impl Portal {
                 endpoint_addr,
                 bind_addrs,
                 listen_port: port,
-                dialer_ip,
+                outbound: OutboundDialer::new(dialer_ip, socks),
                 rate_limit,
                 etar_limit,
                 logger,

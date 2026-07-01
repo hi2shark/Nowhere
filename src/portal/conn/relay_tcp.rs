@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::common::{dial_tcp_from_local_ip, tcp_dial_timeout};
+use crate::common::tcp_dial_timeout;
 use crate::portal::PortalInner;
 
 use super::SessionGuard;
@@ -28,16 +28,19 @@ pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
     portal.stats.add_session(false);
     let _done = SessionGuard::new(portal.clone(), false);
 
-    let target_conn =
-        match dial_tcp_from_local_ip(&portal.dialer_ip, &target_addr, tcp_dial_timeout()).await {
-            Ok(conn) => conn,
-            Err(err) => {
-                portal.logger.error(format_args!(
-                    "portal::conn::relay_tcp_target: failed to dial target: {err}"
-                ));
-                return;
-            }
-        };
+    let target_conn = match portal
+        .outbound
+        .dial_tcp(&target_addr, tcp_dial_timeout())
+        .await
+    {
+        Ok(conn) => conn,
+        Err(err) => {
+            portal.logger.error(format_args!(
+                "portal::conn::relay_tcp_target: failed to dial target: {err}"
+            ));
+            return;
+        }
+    };
     let target_local = target_conn
         .local_addr()
         .map(|address| address.to_string())

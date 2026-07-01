@@ -27,8 +27,9 @@ Portal URL:
 
 Examples:
   nowhere 'portal://secret@:2077'
-  nowhere 'portal://secret@0.0.0.0:2077?net=tcp&log=info'
+  nowhere 'portal://secret@0.0.0.0:2077?log=info&net=tcp'
   nowhere 'portal://secret@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem'
+  nowhere 'portal://secret@:2077?socks=user:pass@127.0.0.1:1080'
   nowhere 'portal://secret@:2077?rate=100&etar=200'
 
 Required URL parts:
@@ -46,20 +47,27 @@ Listen host:
   IP or hostname   Bind the resolved listen address.
 
 URL parameters:
+  log=<level>      none, debug, info, warn, error, event. Default: info.
   tls=1|2          TLS mode. 1 for RAM certificate; 2 for PEM files. Default: 1.
   crt=<path>       PEM certificate chain for tls=2.
   key=<path>       PEM private key for tls=2.
   net=mix|tcp|udp  Listener mode. Default: mix.
   spec=<value>     Protocol shape seed. Default: auto.
   alpn=<value>     TLS/QUIC ALPN. Default: now/1.
-  dial=<ip|auto>   Local source IP for outbound target connections. Default: auto.
   rate=<mbps>      Client-to-target traffic limit. 0 disables it.
   etar=<mbps>      Target-to-client traffic limit. 0 disables it.
-  log=<level>      none, debug, info, warn, error, event. Default: info.
+  dial=<ip|auto>   Local source IP for outbound target connections. Default: auto.
+  socks=<proxy>    SOCKS5 outbound proxy: host:port or user:pass@host:port.
+                   Omit, leave empty, or use none to disable. Default: none.
 
 Transport capabilities:
   TLS/TCP          TCP relay and UDP-over-TCP (UoT).
   QUIC/UDP         TCP relay streams and DATAGRAM UDP flows.
+
+SOCKS5 outbound:
+  CONNECT proxies every TCP relay. UDP ASSOCIATE proxies every DATAGRAM/UoT flow.
+  Target hostnames are resolved by the proxy. Proxy failure never falls back direct.
+  Percent-encode reserved characters in SOCKS usernames and passwords.
 
 Environment:
   NOW_QUIC_MAX_STREAMS     Maximum authenticated QUIC streams.

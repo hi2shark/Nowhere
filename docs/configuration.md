@@ -3,7 +3,7 @@
 The Portal is configured by one URL.
 
 ```text
-portal://<shared-key>@<listen-host>:<listen-port>?tls=<mode>&spec=<spec>&alpn=<alpn>&net=<mode>&dial=<ip-or-auto>&rate=<mbps>&etar=<mbps>&crt=<path>&key=<path>&log=<level>
+portal://<shared-key>@<listen-host>:<listen-port>?log=<level>&tls=<mode>&crt=<path>&key=<path>&net=<mode>&spec=<spec>&alpn=<alpn>&rate=<mbps>&etar=<mbps>&dial=<ip-or-auto>&socks=<proxy>
 ```
 
 The URL username is the shared key. A password component is not supported. The
@@ -11,34 +11,38 @@ listen port and a non-empty shared key are required. Unknown query parameters
 are ignored.
 
 Use percent encoding for reserved URL characters in the shared key, `spec`,
-`alpn`, and file paths.
+`alpn`, SOCKS credentials, and file paths.
 
 ## Input Rules
 
 The shared key, `spec`, and `alpn` are percent-decoded as UTF-8. A literal `+`
 in `spec` or `alpn` remains `+`; it is not converted to a space. If a query key
-appears more than once, the first occurrence is used.
+appears more than once, the first occurrence is used, except that duplicate
+`socks` parameters are rejected.
 
 | Input | Requirement | Decoded UTF-8 byte length |
 | --- | --- | --- |
 | shared key | Required and non-empty | `1..255` |
 | `spec` | Optional; empty means omitted | `1..255` when non-empty |
 | `alpn` | Optional; empty means omitted | `1..255` when non-empty |
+| SOCKS username | Required when SOCKS authentication is configured | `1..255` |
+| SOCKS password | Required when SOCKS authentication is configured | `1..255` |
 
 ## Parameters
 
 | Parameter | Default | Semantics |
 | --- | --- | --- |
+| `log` | `info` | `none`, `debug`, `info`, `warn`, `error`, or `event`. An unknown value selects `info`. |
 | `tls` | `1` | `1` creates an in-memory self-signed certificate. `2` loads PEM files from `crt` and `key`. `0` and all other values are rejected. |
-| `spec` | `auto` | Seed for v1 authentication material, deterministic padding, and field order. |
-| `alpn` | `now/1` | TLS and QUIC ALPN value. It does not alter authentication, padding, or frame layout. |
-| `net` | `mix` | Selects ingress transports: `tcp` enables TLS/TCP, `udp` enables QUIC/UDP, and `mix` enables both. Missing and empty values select `mix`. |
-| `dial` | `auto` | Local IP literal for outbound TCP and UDP sockets. Empty, invalid, hostname, and `auto` values select the operating-system default. |
-| `rate` | `0` | Client-to-target traffic limit in Mbps. |
-| `etar` | `0` | Target-to-client traffic limit in Mbps. |
 | `crt` | Empty | PEM certificate chain used by `tls=2`. |
 | `key` | Empty | PEM private key used by `tls=2`. |
-| `log` | `info` | `none`, `debug`, `info`, `warn`, `error`, or `event`. An unknown value selects `info`. |
+| `net` | `mix` | Selects ingress transports: `tcp` enables TLS/TCP, `udp` enables QUIC/UDP, and `mix` enables both. Missing and empty values select `mix`. |
+| `spec` | `auto` | Seed for v1 authentication material, deterministic padding, and field order. |
+| `alpn` | `now/1` | TLS and QUIC ALPN value. It does not alter authentication, padding, or frame layout. |
+| `rate` | `0` | Client-to-target traffic limit in Mbps. |
+| `etar` | `0` | Target-to-client traffic limit in Mbps. |
+| `dial` | `auto` | Local IP literal for outbound TCP and UDP sockets. Empty, invalid, hostname, and `auto` values select the operating-system default. |
+| `socks` | `none` | SOCKS5 outbound proxy as `host:port` or `user:pass@host:port`. Missing, empty, and `none` disable proxying. IPv6 endpoints require brackets. |
 
 `rate` and `etar` accept positive decimal integers. Zero, a negative value, an
 invalid value, or omission disables the corresponding direction. The conversion
@@ -135,6 +139,36 @@ invalid address lets the operating system select the source address. When an IP
 is set, the Portal considers only target addresses from the same address
 family.
 
+When `socks` is enabled, `dial` instead binds the TCP control/CONNECT
+connections and UDP relay sockets used to reach the proxy. It does not bind a
+direct connection to the final target.
+
+## SOCKS5 Outbound Proxy
+
+SOCKS5 proxying applies to every outbound target, including loopback and
+private addresses:
+
+```text
+portal://secret@:2077?socks=proxy.example:1080
+portal://secret@:2077?socks=user:pass@proxy.example:1080
+portal://secret@:2077?socks=user:p%40ss@[2001:db8::10]:1080
+```
+
+Without credentials, the Portal offers only the SOCKS5 no-authentication
+method. With credentials, it offers only username/password authentication and
+does not permit a downgrade to no authentication. Target hostnames are sent to
+the proxy without local resolution. The proxy endpoint itself is resolved by
+the Portal.
+
+TCP relays use CONNECT. Each QUIC DATAGRAM or UoT flow owns a separate UDP
+ASSOCIATE control connection and relay socket. SOCKS5 UDP fragmentation is not
+supported; fragmented responses are discarded. A proxy error closes the
+current flow and never falls back to a direct target connection.
+
+The startup URL displays only the SOCKS endpoint. Credentials are omitted, so
+an authenticated startup URL is intentionally not a round-trippable copy of
+the command line.
+
 ## Logging Level
 
 The default level is `info`:
@@ -175,11 +209,17 @@ portal://secret@:2077?net=udp
 PEM certificate with event logs:
 
 ```text
-portal://secret@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem&log=event
+portal://secret@:2077?log=event&tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem
 ```
 
 Directional limits:
 
 ```text
 portal://secret@:2077?rate=100&etar=200
+```
+
+Authenticated SOCKS5 outbound routing:
+
+```text
+portal://secret@:2077?socks=user:pass@proxy.example:1080
 ```

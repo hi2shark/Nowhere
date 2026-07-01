@@ -9,9 +9,7 @@ use std::sync::atomic::Ordering;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Instant, timeout};
 
-use crate::common::{
-    dial_udp_from_local_ip, handshake_timeout, udp_dial_timeout, udp_idle_timeout,
-};
+use crate::common::{handshake_timeout, udp_dial_timeout, udp_idle_timeout};
 use crate::portal::PortalInner;
 use crate::protocol::{read_uot_packet, read_uot_setup_target, write_uot_packet_frame};
 
@@ -44,16 +42,19 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
         }
     };
 
-    let socket =
-        match dial_udp_from_local_ip(&portal.dialer_ip, &target_addr, udp_dial_timeout()).await {
-            Ok(socket) => socket,
-            Err(err) => {
-                portal.logger.error(format_args!(
-                    "portal::conn::relay_udp_over_tcp_target: failed to dial target: {err}"
-                ));
-                return;
-            }
-        };
+    let socket = match portal
+        .outbound
+        .dial_udp(&target_addr, udp_dial_timeout())
+        .await
+    {
+        Ok(socket) => socket,
+        Err(err) => {
+            portal.logger.error(format_args!(
+                "portal::conn::relay_udp_over_tcp_target: failed to dial target: {err}"
+            ));
+            return;
+        }
+    };
     let target_local = socket
         .local_addr()
         .map(|address| address.to_string())

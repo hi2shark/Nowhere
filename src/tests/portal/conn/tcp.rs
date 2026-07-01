@@ -20,7 +20,9 @@ use crate::protocol::{
 };
 
 use super::super::*;
-use super::support::connect_test_tls;
+use super::support::{
+    TestSocksAuth, connect_test_tls, spawn_test_socks5_tcp, spawn_test_socks5_udp,
+};
 
 #[tokio::test]
 async fn tls_tcp_pool_waits_beyond_handshake_timeout_then_relays() {
@@ -37,7 +39,7 @@ async fn tls_tcp_pool_waits_beyond_handshake_timeout_then_relays() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
     let portal = Portal::new(
-        Url::parse("portal://secret@127.0.0.1:2077?net=tcp&log=none").unwrap(),
+        Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
         Logger::new(LogLevel::None, false),
     )
     .unwrap();
@@ -93,6 +95,56 @@ async fn tls_tcp_pool_waits_beyond_handshake_timeout_then_relays() {
 }
 
 #[tokio::test]
+async fn tls_tcp_relays_through_socks5_connect() {
+    let (socks_addr, socks_task) = spawn_test_socks5_tcp(TestSocksAuth::None, "target.test").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let portal = Portal::new(
+        Url::parse(&format!(
+            "portal://secret@127.0.0.1:2077?log=none&net=tcp&socks={socks_addr}"
+        ))
+        .unwrap(),
+        Logger::new(LogLevel::None, false),
+    )
+    .unwrap();
+    let portal_inner = portal.inner.clone();
+    let shutdown = CancellationToken::new();
+    let child_shutdown = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let admission = portal_inner
+            .unauthenticated_admission
+            .try_acquire(peer.ip())
+            .unwrap();
+        handle_tcp_incoming(portal_inner, stream, peer, admission, child_shutdown).await;
+    });
+
+    let mut tls = connect_test_tls(listen_addr).await;
+    let mut request = write_auth_frame(
+        portal.inner.credentials.key,
+        &portal.inner.credentials.protocol_spec,
+        [21; 32],
+    );
+    request.extend_from_slice(
+        &write_request_frame("target.test:443", &portal.inner.credentials.protocol_spec).unwrap(),
+    );
+    request.extend_from_slice(b"ping");
+    tls.write_all(&request).await.unwrap();
+
+    let mut response = [0u8; 4];
+    timeout(Duration::from_secs(3), tls.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response, b"pong");
+
+    let _ = tls.shutdown().await;
+    shutdown.cancel();
+    socks_task.await.unwrap();
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn tls_tcp_uot_relays_udp_and_counts_logical_udp() {
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
@@ -106,7 +158,7 @@ async fn tls_tcp_uot_relays_udp_and_counts_logical_udp() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
     let portal = Portal::new(
-        Url::parse("portal://secret@127.0.0.1:2077?net=tcp&log=none").unwrap(),
+        Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
         Logger::new(LogLevel::None, false),
     )
     .unwrap();
@@ -154,11 +206,65 @@ async fn tls_tcp_uot_relays_udp_and_counts_logical_udp() {
 }
 
 #[tokio::test]
+async fn tls_tcp_uot_relays_through_authenticated_socks5_udp() {
+    let (socks_addr, socks_task) =
+        spawn_test_socks5_udp(TestSocksAuth::Password("user", "pass"), "dns.test").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let portal = Portal::new(
+        Url::parse(&format!(
+            "portal://secret@127.0.0.1:2077?log=none&net=tcp&socks=user:pass@{socks_addr}"
+        ))
+        .unwrap(),
+        Logger::new(LogLevel::None, false),
+    )
+    .unwrap();
+    let portal_inner = portal.inner.clone();
+    let shutdown = CancellationToken::new();
+    let child_shutdown = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let admission = portal_inner
+            .unauthenticated_admission
+            .try_acquire(peer.ip())
+            .unwrap();
+        handle_tcp_incoming(portal_inner, stream, peer, admission, child_shutdown).await;
+    });
+
+    let mut tls = connect_test_tls(listen_addr).await;
+    let mut bootstrap = write_auth_frame(
+        portal.inner.credentials.key,
+        &portal.inner.credentials.protocol_spec,
+        [22; 32],
+    );
+    bootstrap.extend_from_slice(
+        &write_request_frame(UOT_MAGIC_TARGET, &portal.inner.credentials.protocol_spec).unwrap(),
+    );
+    bootstrap.extend_from_slice(&write_uot_setup_frame("dns.test:53").unwrap());
+    bootstrap.extend_from_slice(&write_uot_packet_frame(b"ping").unwrap());
+    tls.write_all(&bootstrap).await.unwrap();
+
+    let response = timeout(Duration::from_secs(3), read_uot_packet(&mut tls))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, b"pong");
+    assert_eq!(portal.inner.stats.udp_rx.load(Ordering::Relaxed), 4);
+    assert_eq!(portal.inner.stats.udp_tx.load(Ordering::Relaxed), 4);
+
+    let _ = tls.shutdown().await;
+    shutdown.cancel();
+    socks_task.await.unwrap();
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn tls_tcp_auth_failure_waits_for_deadline_without_application_response() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
     let portal = Portal::new(
-        Url::parse("portal://secret@127.0.0.1:2077?net=tcp&log=none").unwrap(),
+        Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
         Logger::new(LogLevel::None, false),
     )
     .unwrap();
@@ -202,7 +308,7 @@ async fn tls_tcp_pool_ttl_closes_unused_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
     let portal = Portal::new(
-        Url::parse("portal://secret@127.0.0.1:2077?net=tcp&log=none").unwrap(),
+        Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
         Logger::new(LogLevel::None, false),
     )
     .unwrap();

@@ -15,6 +15,8 @@ fn help_text_documents_usage_and_configuration_surface() {
         "portal://<shared-key>@<listen-host>:<listen-port>",
         "tls=1|2",
         "net=mix|tcp|udp",
+        "socks=<proxy>",
+        "UDP ASSOCIATE",
         "rate=<mbps>",
         "etar=<mbps>",
         "UDP-over-TCP (UoT)",
@@ -32,7 +34,7 @@ fn help_text_documents_usage_and_configuration_surface() {
 
 #[test]
 fn parse_command_url_accepts_empty_listen_host() {
-    let parsed = parse_command_url("portal://secret@:2077?dial=::1&log=none").unwrap();
+    let parsed = parse_command_url("portal://secret@:2077?log=none&dial=::1").unwrap();
 
     assert_eq!(parsed.url.scheme(), "portal");
     assert_eq!(parsed.url.username(), "secret");

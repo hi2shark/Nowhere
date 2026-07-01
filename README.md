@@ -60,7 +60,7 @@ The default `tls=1` creates an ephemeral self-signed certificate. Long-lived
 deployments should use `tls=2` with a PEM certificate and private key:
 
 ```bash
-nowhere 'portal://change-me@:2077?spec=nightfall&tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem'
+nowhere 'portal://change-me@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem&spec=nightfall'
 ```
 
 ## Ecosystem

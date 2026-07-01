@@ -11,7 +11,8 @@ use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -96,11 +97,20 @@ pub(super) async fn connect_test_quic() -> (
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    let portal = Portal::new(
-        Url::parse("portal://secret@127.0.0.1:0?net=udp&log=none").unwrap(),
-        Logger::new(LogLevel::None, false),
-    )
-    .unwrap();
+    connect_test_quic_with_url("portal://secret@127.0.0.1:0?log=none&net=udp").await
+}
+
+pub(super) async fn connect_test_quic_with_url(
+    url: &str,
+) -> (
+    Portal,
+    quinn::Endpoint,
+    quinn::Endpoint,
+    Connection,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let portal = Portal::new(Url::parse(url).unwrap(), Logger::new(LogLevel::None, false)).unwrap();
     let server_endpoint = portal.listen_endpoints().unwrap().pop().unwrap();
     let listen_addr = server_endpoint.local_addr().unwrap();
     let shutdown = CancellationToken::new();
@@ -142,6 +152,181 @@ pub(super) async fn connect_test_quic() -> (
         shutdown,
         server_task,
     )
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TestSocksAuth<'a> {
+    None,
+    Password(&'a str, &'a str),
+}
+
+pub(super) async fn spawn_test_socks5_tcp(
+    auth: TestSocksAuth<'static>,
+    expected_target: &'static str,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut control, _) = listener.accept().await.unwrap();
+        accept_test_socks_auth(&mut control, auth).await;
+        let (command, target, _) = read_test_socks_command(&mut control).await;
+        assert_eq!(command, 1);
+        assert_eq!(target, expected_target);
+        write_test_socks_reply(&mut control, SocketAddr::from(([127, 0, 0, 1], 50000))).await;
+        let mut payload = [0u8; 4];
+        control.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        control.write_all(b"pong").await.unwrap();
+    });
+    (endpoint, task)
+}
+
+pub(super) async fn spawn_test_socks5_udp(
+    auth: TestSocksAuth<'static>,
+    expected_target: &'static str,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut control, _) = listener.accept().await.unwrap();
+        accept_test_socks_auth(&mut control, auth).await;
+        let (command, _, _) = read_test_socks_command(&mut control).await;
+        assert_eq!(command, 3);
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        write_test_socks_reply(&mut control, relay.local_addr().unwrap()).await;
+
+        let mut packet = [0u8; 1024];
+        let (size, peer) = relay.recv_from(&mut packet).await.unwrap();
+        let (target, _, header_len) = decode_test_socks_address(&packet, 3);
+        assert_eq!(target, expected_target);
+        assert_eq!(&packet[header_len..size], b"ping");
+        let mut response = packet[..header_len].to_vec();
+        response.extend_from_slice(b"pong");
+        relay.send_to(&response, peer).await.unwrap();
+
+        let mut eof = [0u8; 1];
+        let _ = control.read(&mut eof).await;
+    });
+    (endpoint, task)
+}
+
+async fn accept_test_socks_auth(stream: &mut TcpStream, auth: TestSocksAuth<'_>) {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0], 5);
+    assert_eq!(header[1], 1);
+    let mut method = [0u8; 1];
+    stream.read_exact(&mut method).await.unwrap();
+    let expected_method = match auth {
+        TestSocksAuth::None => 0,
+        TestSocksAuth::Password(_, _) => 2,
+    };
+    assert_eq!(method[0], expected_method);
+    stream.write_all(&[5, expected_method]).await.unwrap();
+
+    if let TestSocksAuth::Password(expected_user, expected_password) = auth {
+        let version = stream.read_u8().await.unwrap();
+        let user_len = stream.read_u8().await.unwrap() as usize;
+        let mut user = vec![0u8; user_len];
+        stream.read_exact(&mut user).await.unwrap();
+        let password_len = stream.read_u8().await.unwrap() as usize;
+        let mut password = vec![0u8; password_len];
+        stream.read_exact(&mut password).await.unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(user, expected_user.as_bytes());
+        assert_eq!(password, expected_password.as_bytes());
+        stream.write_all(&[1, 0]).await.unwrap();
+    }
+}
+
+async fn read_test_socks_command(stream: &mut TcpStream) -> (u8, String, u16) {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0], 5);
+    assert_eq!(header[2], 0);
+    let (host, port, _) = read_test_socks_address(stream, header[3]).await;
+    (header[1], host, port)
+}
+
+async fn read_test_socks_address(stream: &mut TcpStream, address_type: u8) -> (String, u16, usize) {
+    match address_type {
+        1 => {
+            let mut value = [0u8; 6];
+            stream.read_exact(&mut value).await.unwrap();
+            (
+                format!("{}.{}.{}.{}", value[0], value[1], value[2], value[3]),
+                u16::from_be_bytes([value[4], value[5]]),
+                10,
+            )
+        }
+        3 => {
+            let length = stream.read_u8().await.unwrap() as usize;
+            let mut host = vec![0u8; length];
+            stream.read_exact(&mut host).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            (String::from_utf8(host).unwrap(), port, 7 + length)
+        }
+        4 => {
+            let mut value = [0u8; 18];
+            stream.read_exact(&mut value).await.unwrap();
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&value[..16]);
+            (
+                std::net::Ipv6Addr::from(ip).to_string(),
+                u16::from_be_bytes([value[16], value[17]]),
+                22,
+            )
+        }
+        other => panic!("unexpected address type: {other}"),
+    }
+}
+
+fn decode_test_socks_address(packet: &[u8], offset: usize) -> (String, u16, usize) {
+    let address_type = packet[offset];
+    let mut cursor = offset + 1;
+    let (host, port) = match address_type {
+        1 => {
+            let host = format!(
+                "{}.{}.{}.{}",
+                packet[cursor],
+                packet[cursor + 1],
+                packet[cursor + 2],
+                packet[cursor + 3]
+            );
+            cursor += 4;
+            let port = u16::from_be_bytes([packet[cursor], packet[cursor + 1]]);
+            cursor += 2;
+            (host, port)
+        }
+        3 => {
+            let length = packet[cursor] as usize;
+            cursor += 1;
+            let host = String::from_utf8(packet[cursor..cursor + length].to_vec()).unwrap();
+            cursor += length;
+            let port = u16::from_be_bytes([packet[cursor], packet[cursor + 1]]);
+            cursor += 2;
+            (host, port)
+        }
+        other => panic!("unexpected address type: {other}"),
+    };
+    (host, port, cursor)
+}
+
+async fn write_test_socks_reply(stream: &mut TcpStream, address: SocketAddr) {
+    let mut response = vec![5, 0, 0];
+    match address {
+        SocketAddr::V4(address) => {
+            response.push(1);
+            response.extend_from_slice(&address.ip().octets());
+            response.extend_from_slice(&address.port().to_be_bytes());
+        }
+        SocketAddr::V6(address) => {
+            response.push(4);
+            response.extend_from_slice(&address.ip().octets());
+            response.extend_from_slice(&address.port().to_be_bytes());
+        }
+    }
+    stream.write_all(&response).await.unwrap();
 }
 
 pub(super) async fn stop_test_quic(
