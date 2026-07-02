@@ -37,10 +37,6 @@ Required URL parts:
   listen-port      TCP and/or UDP listen port.
   Password credentials are not supported.
 
-Unsupported URL forms:
-  password         Password credentials are not supported.
-  tls=0            tls=0 is not supported.
-
 Listen host:
   empty            Bind IPv4 and IPv6 wildcard sockets.
   0.0.0.0          Bind IPv4 wildcard only.
