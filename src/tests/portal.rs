@@ -86,6 +86,13 @@ fn network_mode_accepts_supported_values_and_defaults_to_mix() {
 }
 
 #[test]
+fn network_mode_checkpoint_values_match_listener_modes() {
+    assert_eq!(NetworkMode::Mix.checkpoint_value(), 0);
+    assert_eq!(NetworkMode::Tcp.checkpoint_value(), 1);
+    assert_eq!(NetworkMode::Udp.checkpoint_value(), 2);
+}
+
+#[test]
 fn network_mode_rejects_unknown_values() {
     let error = Portal::new(
         Url::parse("portal://secret@127.0.0.1:2077?net=auto").unwrap(),

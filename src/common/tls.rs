@@ -14,7 +14,9 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::crypto::ring;
 use url::Url;
 
-use self::tls_cert::{ReloadingCertResolver, new_self_signed_cert, query_value};
+use self::tls_cert::{
+    ReloadingCertResolver, certificate_sha256, new_self_signed_cert, query_value,
+};
 use super::Logger;
 
 /// TLS mode selected by the `tls` URL query parameter.
@@ -67,20 +69,26 @@ pub fn new_server_configs(
         .context("common::tls::new_server_configs: failed to configure TLS versions")?
         .with_no_client_auth();
 
-    let mut server_crypto = match mode {
+    let (mut server_crypto, cert_sha256) = match mode {
         TLSMode::SelfSigned => {
             let (certs, key) = new_self_signed_cert()
                 .context("common::tls::new_server_configs: failed to create self-signed config")?;
-            server_builder
+            let cert_sha256 = certificate_sha256(&certs[0]);
+            let server_crypto = server_builder
                 .with_single_cert(certs, key)
-                .context("common::tls::new_server_configs: failed to parse key pair")?
+                .context("common::tls::new_server_configs: failed to parse key pair")?;
+            (server_crypto, cert_sha256)
         }
         TLSMode::CATrusted => {
             let crt_file = query_value(parsed_url, "crt").unwrap_or_default();
             let key_file = query_value(parsed_url, "key").unwrap_or_default();
-            let resolver = ReloadingCertResolver::new(crt_file, key_file, provider, logger)
-                .context("common::tls::new_server_configs: failed to load certificate")?;
-            server_builder.with_cert_resolver(Arc::new(resolver))
+            let (resolver, cert_sha256) =
+                ReloadingCertResolver::new(crt_file, key_file, provider, logger.clone())
+                    .context("common::tls::new_server_configs: failed to load certificate")?;
+            (
+                server_builder.with_cert_resolver(Arc::new(resolver)),
+                cert_sha256,
+            )
         }
         TLSMode::None => unreachable!(),
     };
@@ -90,6 +98,7 @@ pub fn new_server_configs(
     server_crypto.alpn_protocols = vec![alpn.as_bytes().to_vec()];
     let quic_crypto = QuicServerConfig::try_from(server_crypto.clone())
         .map_err(|e| anyhow!("common::tls::new_server_configs: QUIC TLS config failed: {e}"))?;
+    logger.event(format_args!("CERT_SHA256|{cert_sha256}"));
     Ok((
         mode,
         Arc::new(server_crypto),

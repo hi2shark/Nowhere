@@ -505,8 +505,9 @@ CHECK_POINT|MODE=0|PING=0ms|POOL=<n>|TCPS=<n>|UDPS=<n>|TCPRX=<bytes>|TCPTX=<byte
 
 `POOL` is the number of authenticated TLS/TCP connections waiting for their
 first request frame. TLS handshakes, authentication in progress, active TCP or
-UoT relays, and QUIC connections are not included. `MODE` and `PING` remain
-fixed to the values shown in v1.
+UoT relays, and QUIC connections are not included. `MODE` is `0` for `net=mix`,
+`1` for `net=tcp`, and `2` for `net=udp`. `PING` remains fixed to the value
+shown in v1.
 
 `NOW_REPORT_INTERVAL` controls only this local telemetry schedule. It does not
 control QUIC keepalive traffic.

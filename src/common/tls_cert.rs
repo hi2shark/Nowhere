@@ -3,6 +3,7 @@
 
 //! Certificate loading, hot reloading, and self-signed certificate helpers.
 
+use std::fmt::Write;
 use std::fs;
 use std::io::BufReader;
 use std::sync::{Arc, RwLock};
@@ -13,6 +14,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::common::{Logger, reload_interval};
@@ -30,6 +32,15 @@ pub(super) fn new_self_signed_cert()
         .context("common::tls::new_self_signed_cert: failed to create certificate")?;
     let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     Ok((vec![cert.cert.into()], key.into()))
+}
+
+pub(super) fn certificate_sha256(cert: &CertificateDer<'_>) -> String {
+    let digest = Sha256::digest(cert.as_ref());
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(fingerprint, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    fingerprint
 }
 
 #[derive(Debug)]
@@ -53,18 +64,22 @@ impl ReloadingCertResolver {
         key_file: String,
         provider: Arc<CryptoProvider>,
         logger: Logger,
-    ) -> Result<Self> {
+    ) -> Result<(Self, String)> {
         let cert = Arc::new(load_certified_key(&crt_file, &key_file, &provider)?);
-        Ok(Self {
-            crt_file,
-            key_file,
-            provider,
-            cached: RwLock::new(CachedCert {
-                cert,
-                last_reload: Instant::now(),
-            }),
-            logger,
-        })
+        let fingerprint = certificate_sha256(&cert.cert[0]);
+        Ok((
+            Self {
+                crt_file,
+                key_file,
+                provider,
+                cached: RwLock::new(CachedCert {
+                    cert,
+                    last_reload: Instant::now(),
+                }),
+                logger,
+            },
+            fingerprint,
+        ))
     }
 }
 

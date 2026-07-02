@@ -115,7 +115,7 @@ events. The fields appear on the instance resource as follows:
 
 | EVENT field | OpenCtrl field | Meaning for Nowhere |
 | --- | --- | --- |
-| `MODE` | `mode` | Fixed at `0` in v1. |
+| `MODE` | `mode` | Listener mode: `0` for mix, `1` for TCP, or `2` for UDP. |
 | `PING` | `ping` | Fixed at `0ms` in v1. |
 | `POOL` | `pool` | Authenticated TLS/TCP connections waiting for a first request. |
 | `TCPS` | `tcps` | Active TCP relay streams. |
