@@ -22,6 +22,18 @@ pub fn env_int(name: &str, default_value: i32) -> i32 {
         .unwrap_or(default_value)
 }
 
+/// Reads a positive `usize`, reporting whether a present value was invalid.
+pub(crate) fn env_positive_usize(name: &str, default_value: usize) -> (usize, bool) {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(value) if value > 0 => (value, false),
+            _ => (default_value, true),
+        },
+        Err(std::env::VarError::NotPresent) => (default_value, false),
+        Err(std::env::VarError::NotUnicode(_)) => (default_value, true),
+    }
+}
+
 /// Reads a duration from the environment using humantime syntax.
 pub fn env_duration(name: &str, default_value: Duration) -> Duration {
     std::env::var(name)

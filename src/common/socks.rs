@@ -14,7 +14,6 @@ mod udp;
 
 pub(crate) use config::SocksConfig;
 pub(crate) use outbound::OutboundDialer;
-pub(crate) use udp::OutboundUdpSocket;
 
 #[cfg(test)]
 use protocol::{

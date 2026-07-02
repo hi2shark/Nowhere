@@ -13,6 +13,7 @@ mod util;
 pub use crypto::{
     Credentials, Key, read_auth_frame, read_auth_stream, validate_auth_frame, write_auth_frame,
 };
+pub(crate) use datagram::decode_udp_datagram_parts;
 pub use datagram::{
     DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, append_frame_payload,
     decode_udp_datagram, encode_udp_datagram, new_udp_datagram_header,

@@ -13,12 +13,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::oneshot;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::common::{LogLevel, Logger};
-use crate::portal::Portal;
+use crate::portal::{Portal, UdpFlowLimits};
 
 use super::super::*;
 
@@ -110,7 +111,25 @@ pub(super) async fn connect_test_quic_with_url(
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    let portal = Portal::new(Url::parse(url).unwrap(), Logger::new(LogLevel::None, false)).unwrap();
+    connect_test_quic_with_url_and_limits(url, None).await
+}
+
+pub(super) async fn connect_test_quic_with_url_and_limits(
+    url: &str,
+    limits: Option<UdpFlowLimits>,
+) -> (
+    Portal,
+    quinn::Endpoint,
+    quinn::Endpoint,
+    Connection,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut portal =
+        Portal::new(Url::parse(url).unwrap(), Logger::new(LogLevel::None, false)).unwrap();
+    if let Some(limits) = limits {
+        Arc::get_mut(&mut portal.inner).unwrap().udp_flow_limits = limits;
+    }
     let server_endpoint = portal.listen_endpoints().unwrap().pop().unwrap();
     let listen_addr = server_endpoint.local_addr().unwrap();
     let shutdown = CancellationToken::new();
@@ -206,6 +225,64 @@ pub(super) async fn spawn_test_socks5_udp(
 
         let mut eof = [0u8; 1];
         let _ = control.read(&mut eof).await;
+    });
+    (endpoint, task)
+}
+
+/// Serves two UDP ASSOCIATE flows: the first echoes two packets while the
+/// second stalls before returning its relay address.
+pub(super) async fn spawn_test_socks5_udp_isolation() -> (
+    SocketAddr,
+    oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let (stalled_tx, stalled_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut fast_control, _) = listener.accept().await.unwrap();
+        let fast_task = tokio::spawn(async move {
+            accept_test_socks_auth(&mut fast_control, TestSocksAuth::None).await;
+            let (command, _, _) = read_test_socks_command(&mut fast_control).await;
+            assert_eq!(command, 3);
+            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            write_test_socks_reply(&mut fast_control, relay.local_addr().unwrap()).await;
+
+            let mut packet = [0u8; 1024];
+            for expected in [b"one".as_slice(), b"two".as_slice()] {
+                let (size, peer) = relay.recv_from(&mut packet).await.unwrap();
+                let (target, _, header_len) = decode_test_socks_address(&packet, 3);
+                assert_eq!(target, "fast.test");
+                assert_eq!(&packet[header_len..size], expected);
+                relay.send_to(&packet[..size], peer).await.unwrap();
+            }
+
+            let mut eof = [0u8; 1];
+            let _ = fast_control.read(&mut eof).await;
+        });
+
+        let (mut slow_control, _) = listener.accept().await.unwrap();
+        accept_test_socks_auth(&mut slow_control, TestSocksAuth::None).await;
+        let (command, _, _) = read_test_socks_command(&mut slow_control).await;
+        assert_eq!(command, 3);
+        let _ = stalled_tx.send(());
+
+        let mut eof = [0u8; 1];
+        let _ = slow_control.read(&mut eof).await;
+        fast_task.await.unwrap();
+    });
+    (endpoint, stalled_rx, task)
+}
+
+pub(super) async fn spawn_test_socks5_udp_reject() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut control, _) = listener.accept().await.unwrap();
+        accept_test_socks_auth(&mut control, TestSocksAuth::None).await;
+        let (command, _, _) = read_test_socks_command(&mut control).await;
+        assert_eq!(command, 3);
+        control.write_all(&[5, 1, 0, 1]).await.unwrap();
     });
     (endpoint, task)
 }

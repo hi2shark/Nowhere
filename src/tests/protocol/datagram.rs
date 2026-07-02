@@ -32,6 +32,12 @@ fn udp_datagram_wire_format_uses_derived_order() {
     assert_eq!(flow, 0x0102030405060708);
     assert_eq!(target, "x.test:53");
     assert_eq!(payload, b"abc");
+
+    let decoded = decode_udp_datagram_parts(&frame, &spec).unwrap();
+    assert_eq!(decoded.frame_type, ty);
+    assert_eq!(decoded.flow_id, flow);
+    assert_eq!(decoded.target_addr, target);
+    assert_eq!(&frame[decoded.payload_offset..], payload);
 }
 
 #[test]

@@ -3,22 +3,70 @@
 
 //! QUIC portal connection tests.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+use crate::portal::{
+    DEFAULT_QUIC_MAX_UDP_FLOWS, DEFAULT_QUIC_UDP_QUEUE_BYTES, Portal, UdpFlowLimits,
+};
 use crate::protocol::{
-    DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram, new_udp_datagram_header,
-    write_auth_frame,
+    DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram,
+    new_udp_datagram_header, write_auth_frame,
 };
 
 use super::super::*;
 use super::support::{
-    TestSocksAuth, connect_test_quic, connect_test_quic_with_url, spawn_test_socks5_udp,
-    stop_test_quic,
+    TestSocksAuth, connect_test_quic, connect_test_quic_with_url,
+    connect_test_quic_with_url_and_limits, spawn_test_socks5_udp, spawn_test_socks5_udp_isolation,
+    spawn_test_socks5_udp_reject, stop_test_quic,
 };
+
+async fn authenticate_test_connection(portal: &Portal, connection: &quinn::Connection) {
+    let (mut auth_send, _auth_recv) = connection.open_bi().await.unwrap();
+    let auth = write_auth_frame(
+        portal.inner.credentials.key,
+        &portal.inner.credentials.protocol_spec,
+        [31; 32],
+    );
+    auth_send.write_all(&auth).await.unwrap();
+    auth_send.finish().unwrap();
+    timeout(Duration::from_secs(2), connection.open_bi())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+fn test_udp_datagram(
+    portal: &Portal,
+    frame_type: u8,
+    flow_id: u64,
+    target: &str,
+    payload: &[u8],
+) -> Bytes {
+    let mut frame = new_udp_datagram_header(
+        frame_type,
+        flow_id,
+        target,
+        &portal.inner.credentials.protocol_spec,
+    )
+    .unwrap();
+    frame.extend_from_slice(payload);
+    Bytes::from(frame)
+}
+
+async fn wait_for_udp_active(portal: &Portal, expected: i32) {
+    timeout(Duration::from_secs(1), async {
+        while portal.inner.stats.udp_active.load(Ordering::Relaxed) != expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
 
 #[tokio::test]
 async fn quic_pre_auth_stream_limit_is_raised_and_early_datagram_is_preserved() {
@@ -112,6 +160,220 @@ async fn quic_datagram_relays_through_socks5_udp_associate() {
     connection.close(VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
     socks_task.await.unwrap();
+    wait_for_udp_active(&portal, 0).await;
+}
+
+#[tokio::test]
+async fn stalled_udp_dial_does_not_block_an_existing_flow() {
+    let (socks_addr, stalled, socks_task) = spawn_test_socks5_udp_isolation().await;
+    let url = format!("portal://secret@127.0.0.1:0?log=none&net=udp&socks={socks_addr}");
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic_with_url(&url).await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            1,
+            "fast.test:53",
+            b"one",
+        ))
+        .unwrap();
+    let first = timeout(Duration::from_secs(2), connection.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, _, _, payload) =
+        decode_udp_datagram(&first, &portal.inner.credentials.protocol_spec).unwrap();
+    assert_eq!(payload, b"one");
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            2,
+            "slow.test:53",
+            b"blocked",
+        ))
+        .unwrap();
+    timeout(Duration::from_secs(2), stalled)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let started = Instant::now();
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            1,
+            "fast.test:53",
+            b"two",
+        ))
+        .unwrap();
+    let second = timeout(Duration::from_millis(500), connection.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, flow_id, _, payload) =
+        decode_udp_datagram(&second, &portal.inner.credentials.protocol_spec).unwrap();
+    assert_eq!(flow_id, 1);
+    assert_eq!(payload, b"two");
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+    socks_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_flow_limit_is_released_by_close_frame() {
+    let first_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first_target.local_addr().unwrap().to_string();
+    let second_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second_addr = second_target.local_addr().unwrap().to_string();
+    let limits = UdpFlowLimits {
+        max_flows: 1,
+        queue_bytes: DEFAULT_QUIC_UDP_QUEUE_BYTES,
+    };
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic_with_url_and_limits(
+            "portal://secret@127.0.0.1:0?log=none&net=udp",
+            Some(limits),
+        )
+        .await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            10,
+            &first_addr,
+            b"first",
+        ))
+        .unwrap();
+    let mut received = [0u8; 16];
+    let (size, _) = timeout(
+        Duration::from_secs(2),
+        first_target.recv_from(&mut received),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&received[..size], b"first");
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            11,
+            &second_addr,
+            b"limited",
+        ))
+        .unwrap();
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            second_target.recv_from(&mut received)
+        )
+        .await
+        .is_err()
+    );
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_CLOSE,
+            10,
+            &first_addr,
+            b"",
+        ))
+        .unwrap();
+    wait_for_udp_active(&portal, 0).await;
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            11,
+            &second_addr,
+            b"accepted",
+        ))
+        .unwrap();
+    let (size, _) = timeout(
+        Duration::from_secs(2),
+        second_target.recv_from(&mut received),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&received[..size], b"accepted");
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn udp_queue_budget_is_checked_before_flow_creation() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let limits = UdpFlowLimits {
+        max_flows: DEFAULT_QUIC_MAX_UDP_FLOWS,
+        queue_bytes: 1,
+    };
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic_with_url_and_limits(
+            "portal://secret@127.0.0.1:0?log=none&net=udp",
+            Some(limits),
+        )
+        .await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            20,
+            &target_addr,
+            b"dropped",
+        ))
+        .unwrap();
+    let mut received = [0u8; 16];
+    assert!(
+        timeout(Duration::from_millis(200), target.recv_from(&mut received))
+            .await
+            .is_err()
+    );
+    assert_eq!(portal.inner.stats.udp_active.load(Ordering::Relaxed), 0);
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn udp_dial_failure_releases_flow_accounting() {
+    let (socks_addr, socks_task) = spawn_test_socks5_udp_reject().await;
+    let url = format!("portal://secret@127.0.0.1:0?log=none&net=udp&socks={socks_addr}");
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic_with_url(&url).await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    connection
+        .send_datagram(test_udp_datagram(
+            &portal,
+            DATAGRAM_UDP_REQUEST,
+            30,
+            "rejected.test:53",
+            b"request",
+        ))
+        .unwrap();
+    socks_task.await.unwrap();
+    wait_for_udp_active(&portal, 0).await;
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
 }
 
 #[tokio::test]

@@ -105,6 +105,10 @@ The Portal:
   of connection-level receive credit;
 - raises the bidirectional-stream limit to `NOW_QUIC_MAX_STREAMS` after
   authentication;
+- dispatches each DATAGRAM UDP flow to an independent bounded worker so target
+  dialing and rate-limit waits do not block unrelated flows;
+- drops new DATAGRAM requests when the per-flow queue, per-connection byte
+  budget, or per-connection flow limit is full;
 - raises the connection-level receive credit to 32 MiB after authentication;
 - uses 16 MiB per-stream receive credit;
 - permits up to 32 MiB of unacknowledged stream data per connection;
@@ -168,6 +172,8 @@ authentication succeeds or fails.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams after authentication. |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
+| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |
@@ -180,7 +186,9 @@ authentication succeeds or fails.
 | `NOW_RELOAD_INTERVAL` | `3600s` | Minimum interval between PEM reload attempts. |
 
 Duration values accept forms such as `500ms`, `15s`, and `2m`. Invalid values
-use the defaults above. Integer controls must be non-negative.
+use the defaults above. `NOW_QUIC_MAX_UDP_FLOWS` and
+`NOW_QUIC_UDP_QUEUE_BYTES` must be positive; zero or invalid values use their
+defaults and emit a warning. Other integer controls must be non-negative.
 
 `NOW_SERVICE_COOLDOWN` also exists in the runtime defaults and currently
 defaults to `3s`; it is reserved for service-side retry paths.
