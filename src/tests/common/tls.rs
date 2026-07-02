@@ -7,6 +7,15 @@ use super::*;
 use crate::common::{LogLevel, Logger};
 
 #[test]
+fn certificate_sha256_uses_lowercase_hex() {
+    let cert = rustls::pki_types::CertificateDer::from(b"abc".to_vec());
+    assert_eq!(
+        certificate_sha256(&cert),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
 fn server_tls_config_explicitly_disables_early_data() {
     let (_, tls, _quic) = new_server_configs(
         &Url::parse("portal://secret@127.0.0.1:2077?tls=1").unwrap(),

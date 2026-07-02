@@ -71,8 +71,9 @@ CHECK_POINT|MODE=0|PING=0ms|POOL=<n>|TCPS=<n>|UDPS=<n>|TCPRX=<bytes>|TCPTX=<byte
 | `UDPRX` | Client-to-target UDP payload bytes. |
 | `UDPTX` | Target-to-client UDP payload bytes. |
 
-`MODE` and `PING` remain fixed in v1. `NOW_REPORT_INTERVAL` controls only local
-record emission; it does not send transport keepalive packets.
+`MODE` is `0` for `net=mix`, `1` for `net=tcp`, and `2` for `net=udp`. `PING`
+remains fixed in v1. `NOW_REPORT_INTERVAL` controls only local record emission;
+it does not send transport keepalive packets.
 
 ## Rate Limits
 

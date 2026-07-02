@@ -42,6 +42,15 @@ impl NetworkMode {
     pub(super) fn listens_udp(self) -> bool {
         matches!(self, Self::Mix | Self::Udp)
     }
+
+    /// Returns the numeric mode reported in checkpoint events.
+    pub(super) fn checkpoint_value(self) -> u8 {
+        match self {
+            Self::Mix => 0,
+            Self::Tcp => 1,
+            Self::Udp => 2,
+        }
+    }
 }
 
 impl fmt::Display for NetworkMode {
