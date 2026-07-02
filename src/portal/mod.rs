@@ -21,6 +21,15 @@ use crate::transport::{Buffers, RateLimiter, Stats};
 
 pub(crate) use self::mode::NetworkMode;
 
+const DEFAULT_QUIC_MAX_UDP_FLOWS: usize = 256;
+const DEFAULT_QUIC_UDP_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct UdpFlowLimits {
+    max_flows: usize,
+    queue_bytes: usize,
+}
+
 /// Portal server configured from a `portal://` URL.
 #[derive(Clone)]
 pub struct Portal {
@@ -42,6 +51,7 @@ struct PortalInner {
     pool_active: AtomicU64,
     buffers: Buffers,
     rate_limiter: Option<Arc<RateLimiter>>,
+    udp_flow_limits: UdpFlowLimits,
     tls_server_config: Arc<rustls::ServerConfig>,
     quic_server_config: quinn::ServerConfig,
     unauthenticated_admission: Arc<admission::UnauthenticatedAdmission>,

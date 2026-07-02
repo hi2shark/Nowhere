@@ -17,6 +17,14 @@ pub const DATAGRAM_UDP_CLOSE: u8 = 3;
 
 const DATAGRAM_HEADER_FIXED_LEN: usize = 1 + 1 + 8 + 2;
 
+/// Owned header fields plus the offset of the borrowed payload.
+pub(crate) struct DecodedUdpDatagram {
+    pub(crate) frame_type: u8,
+    pub(crate) flow_id: u64,
+    pub(crate) target_addr: String,
+    pub(crate) payload_offset: usize,
+}
+
 /// Encodes a UDP datagram frame with payload.
 pub fn encode_udp_datagram(
     frame_type: u8,
@@ -100,6 +108,20 @@ pub fn decode_udp_datagram<'a>(
     buf: &'a [u8],
     protocol_spec: &EffectiveProtocolSpec,
 ) -> Result<(u8, u64, String, &'a [u8])> {
+    let decoded = decode_udp_datagram_parts(buf, protocol_spec)?;
+    Ok((
+        decoded.frame_type,
+        decoded.flow_id,
+        decoded.target_addr,
+        &buf[decoded.payload_offset..],
+    ))
+}
+
+/// Decodes the owned header fields while leaving payload ownership to the caller.
+pub(crate) fn decode_udp_datagram_parts(
+    buf: &[u8],
+    protocol_spec: &EffectiveProtocolSpec,
+) -> Result<DecodedUdpDatagram> {
     if buf.len() < DATAGRAM_HEADER_FIXED_LEN {
         bail!("protocol::datagram::decode_udp_datagram: frame too short");
     }
@@ -179,7 +201,12 @@ pub fn decode_udp_datagram<'a>(
         anyhow::anyhow!("protocol::datagram::decode_udp_datagram: missing target")
     })?;
 
-    Ok((frame_type, flow_id, target_addr, &buf[offset..]))
+    Ok(DecodedUdpDatagram {
+        frame_type,
+        flow_id,
+        target_addr,
+        payload_offset: offset,
+    })
 }
 
 /// Reuses an output allocation by replacing it with `header || payload`.

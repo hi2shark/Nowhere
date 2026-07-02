@@ -21,6 +21,8 @@ fn help_text_documents_usage_and_configuration_surface() {
         "etar=<mbps>",
         "UDP-over-TCP (UoT)",
         "NOW_QUIC_MAX_STREAMS",
+        "NOW_QUIC_MAX_UDP_FLOWS",
+        "NOW_QUIC_UDP_QUEUE_BYTES",
         "NOW_HANDSHAKE_TIMEOUT",
         "Password credentials are not supported.",
         "tls=0 is not supported.",

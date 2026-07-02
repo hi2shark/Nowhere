@@ -8,16 +8,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::udp_dial_timeout;
 use crate::protocol::{
-    DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram,
+    DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram_parts,
     new_udp_datagram_header,
 };
 
 use super::PortalSession;
-use super::flow::{PortalUdpFlow, UdpFlowKey};
+use super::flow::{PortalUdpFlow, QueuedDatagram, UdpFlowKey};
 
 impl PortalSession {
     /// Consumes pending and live QUIC datagrams for this authenticated session.
@@ -48,26 +48,35 @@ impl PortalSession {
     }
 
     async fn handle_datagram(self: &Arc<Self>, data: Bytes) {
-        let (frame_type, flow_id, target_addr, payload) =
-            match decode_udp_datagram(&data, &self.portal.credentials.protocol_spec) {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    self.portal.logger.debug(format_args!(
-                        "portal::conn::datagram_loop: failed to decode datagram: {err}"
-                    ));
-                    return;
-                }
-            };
+        let decoded = match decode_udp_datagram_parts(&data, &self.portal.credentials.protocol_spec)
+        {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                self.portal.logger.debug(format_args!(
+                    "portal::conn::datagram_loop: failed to decode datagram: {err}"
+                ));
+                return;
+            }
+        };
 
-        if frame_type == DATAGRAM_UDP_CLOSE {
-            self.close_udp_flow(flow_id, target_addr).await;
+        if decoded.frame_type == DATAGRAM_UDP_CLOSE {
+            self.close_udp_flow(decoded.flow_id, decoded.target_addr)
+                .await;
             return;
         }
-        if frame_type != DATAGRAM_UDP_REQUEST {
+        if decoded.frame_type != DATAGRAM_UDP_REQUEST {
             return;
         }
 
-        self.handle_udp_request(flow_id, target_addr, payload).await;
+        let retained_bytes = data.len();
+        let payload = data.slice(decoded.payload_offset..);
+        self.handle_udp_request(
+            decoded.flow_id,
+            decoded.target_addr,
+            payload,
+            retained_bytes,
+        )
+        .await;
     }
 
     async fn close_udp_flow(&self, flow_id: u64, target_addr: String) {
@@ -82,87 +91,85 @@ impl PortalSession {
         self: &Arc<Self>,
         flow_id: u64,
         target_addr: String,
-        payload: &[u8],
+        payload: Bytes,
+        retained_bytes: usize,
     ) {
-        let flow = match self.get_udp_flow(flow_id, &target_addr).await {
-            Ok(flow) => flow,
+        let Some(budget) = self.try_reserve_udp_queue(retained_bytes) else {
+            self.warn_udp_drop("connection queue byte limit reached");
+            return;
+        };
+        let flow = match self.get_or_create_udp_flow(flow_id, target_addr).await {
+            Ok(Some(flow)) => flow,
+            Ok(None) => {
+                self.warn_udp_drop("per-connection flow limit reached");
+                return;
+            }
             Err(err) => {
                 self.portal.logger.error(format_args!(
-                    "portal::conn::handle_udp_request: failed to open UDP flow: {err}"
+                    "portal::conn::handle_udp_request: failed to create UDP flow: {err}"
                 ));
                 return;
             }
         };
-        flow.touch().await;
-
-        if let Some(limiter) = &self.portal.rate_limiter {
-            limiter.wait_read(payload.len() as i64).await;
-        }
-
-        match flow.send_to_target(payload).await {
-            Ok(n) => {
-                self.portal
-                    .stats
-                    .udp_rx
-                    .fetch_add(n as u64, Ordering::Relaxed);
-            }
-            Err(err) => {
-                self.portal.logger.error(format_args!(
-                    "portal::conn::handle_udp_request: failed to write target: {err}"
-                ));
-                flow.close().await;
-            }
+        if !flow.enqueue(QueuedDatagram::new(payload, budget)) {
+            self.warn_udp_drop("per-flow datagram queue is full");
         }
     }
 
-    async fn get_udp_flow(
+    async fn get_or_create_udp_flow(
         self: &Arc<Self>,
         flow_id: u64,
-        target_addr: &str,
-    ) -> anyhow::Result<Arc<PortalUdpFlow>> {
+        target_addr: String,
+    ) -> anyhow::Result<Option<Arc<PortalUdpFlow>>> {
         let key = UdpFlowKey::new(flow_id, target_addr);
-
-        // Reuse an open flow for repeated datagrams with the same client flow ID
-        // and target; closed flows are replaced below.
-        if let Some(flow) = self.udp_flows.lock().await.get(&key).cloned()
-            && !flow.is_closed()
-        {
-            return Ok(flow);
+        let mut guard = self.udp_flows.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
         }
-
-        let socket = self
-            .portal
-            .outbound
-            .dial_udp(target_addr, udp_dial_timeout())
-            .await?;
+        if let Some(flow) = guard.get(&key).cloned() {
+            if !flow.is_closed() {
+                return Ok(Some(flow));
+            }
+            guard.remove(&key);
+        }
+        if guard.len() >= self.portal.udp_flow_limits.max_flows {
+            return Ok(None);
+        }
         let response_header = new_udp_datagram_header(
             DATAGRAM_UDP_RESPONSE,
             flow_id,
-            target_addr,
+            key.target(),
             &self.portal.credentials.protocol_spec,
         )
         .map_err(|e| {
-            anyhow::anyhow!("portal::conn::get_udp_flow: failed to build response header: {e}")
+            anyhow::anyhow!(
+                "portal::conn::get_or_create_udp_flow: failed to build response header: {e}"
+            )
         })?;
-        let flow = Arc::new(PortalUdpFlow::new(
-            Arc::downgrade(self),
-            key.clone(),
-            socket,
-            response_header,
-        ));
-
-        let mut guard = self.udp_flows.lock().await;
-        if let Some(existing) = guard.get(&key).cloned() {
-            // Another task may have inserted the flow while this task was
-            // dialing. Prefer the existing entry to keep ownership singular.
-            return Ok(existing);
-        }
+        let (flow, receiver) = PortalUdpFlow::new(Arc::downgrade(self), key.clone());
+        let flow = Arc::new(flow);
         guard.insert(key, flow.clone());
+        self.portal.stats.add_session(true);
         drop(guard);
 
-        self.portal.stats.add_session(true);
-        tokio::spawn(flow.clone().read_loop());
-        tokio::spawn(flow.clone().idle_loop());
-        Ok(flow)
+        tokio::spawn(flow.clone().run(receiver, response_header));
+        Ok(Some(flow))
+    }
+
+    fn try_reserve_udp_queue(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let permits = u32::try_from(bytes).ok()?;
+        self.udp_queue_budget
+            .clone()
+            .try_acquire_many_owned(permits)
+            .ok()
+    }
+
+    fn warn_udp_drop(&self, reason: &str) {
+        if !self.udp_overload_logged.swap(true, Ordering::AcqRel) {
+            self.portal.logger.warn(format_args!(
+                "portal::conn::datagram_loop: dropping UDP datagrams for {}: {reason}",
+                self.conn.remote_address()
+            ));
+        }
     }
 }

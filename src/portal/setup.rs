@@ -7,18 +7,22 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::Result;
+use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::common::{
-    DEFAULT_RATE_LIMIT, Logger, OutboundDialer, SocksConfig, bind_udp_addrs, init_dialer_ip,
-    new_server_configs, query_int, rate_limit_bytes_per_second, tcp_data_buf_size,
+    DEFAULT_RATE_LIMIT, Logger, OutboundDialer, SocksConfig, bind_udp_addrs, env_positive_usize,
+    init_dialer_ip, new_server_configs, query_int, rate_limit_bytes_per_second, tcp_data_buf_size,
     udp_data_buf_size,
 };
 use crate::protocol::Credentials;
 use crate::transport::{Buffers, RateLimiter, Stats};
 
 use super::listener::{configure_transport, format_endpoint_addr};
-use super::{NetworkMode, Portal, PortalInner, admission};
+use super::{
+    DEFAULT_QUIC_MAX_UDP_FLOWS, DEFAULT_QUIC_UDP_QUEUE_BYTES, NetworkMode, Portal, PortalInner,
+    UdpFlowLimits, admission,
+};
 
 impl Portal {
     /// Builds a portal using the listen host encoded in the URL.
@@ -86,6 +90,20 @@ impl Portal {
         let read_bps = rate_limit_bytes_per_second(rate_limit) as i64;
         let write_bps = rate_limit_bytes_per_second(etar_limit) as i64;
         let rate_limiter = RateLimiter::new(read_bps, write_bps).map(Arc::new);
+        let udp_flow_limits = UdpFlowLimits {
+            max_flows: read_positive_env(
+                "NOW_QUIC_MAX_UDP_FLOWS",
+                DEFAULT_QUIC_MAX_UDP_FLOWS,
+                u32::MAX as usize,
+                &logger,
+            ),
+            queue_bytes: read_positive_env(
+                "NOW_QUIC_UDP_QUEUE_BYTES",
+                DEFAULT_QUIC_UDP_QUEUE_BYTES,
+                Semaphore::MAX_PERMITS.min(u32::MAX as usize),
+                &logger,
+            ),
+        };
 
         Ok(Self {
             inner: Arc::new(PortalInner {
@@ -103,10 +121,22 @@ impl Portal {
                 pool_active: AtomicU64::new(0),
                 buffers: Buffers::new(tcp_data_buf_size(), udp_data_buf_size()),
                 rate_limiter,
+                udp_flow_limits,
                 tls_server_config,
                 quic_server_config,
                 unauthenticated_admission: Arc::new(admission::UnauthenticatedAdmission::new()),
             }),
         })
     }
+}
+
+fn read_positive_env(name: &str, default_value: usize, max_value: usize, logger: &Logger) -> usize {
+    let (value, invalid) = env_positive_usize(name, default_value);
+    if invalid || value > max_value {
+        logger.warn(format_args!(
+            "portal::new: invalid {name}; using default {default_value}"
+        ));
+        return default_value;
+    }
+    value
 }

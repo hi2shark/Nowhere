@@ -35,6 +35,7 @@ Examples:
 Required URL parts:
   shared-key       Non-empty URL username. Percent-encode reserved characters.
   listen-port      TCP and/or UDP listen port.
+  Password credentials are not supported.
 
 Unsupported URL forms:
   password         Password credentials are not supported.
@@ -49,6 +50,7 @@ Listen host:
 URL parameters:
   log=<level>      none, debug, info, warn, error, event. Default: info.
   tls=1|2          TLS mode. 1 for RAM certificate; 2 for PEM files. Default: 1.
+                   tls=0 is not supported.
   crt=<path>       PEM certificate chain for tls=2.
   key=<path>       PEM private key for tls=2.
   net=mix|tcp|udp  Listener mode. Default: mix.
@@ -71,6 +73,8 @@ SOCKS5 outbound:
 
 Environment:
   NOW_QUIC_MAX_STREAMS     Maximum authenticated QUIC streams.
+  NOW_QUIC_MAX_UDP_FLOWS   Maximum DATAGRAM UDP flows per QUIC connection.
+  NOW_QUIC_UDP_QUEUE_BYTES Maximum queued DATAGRAM bytes per QUIC connection.
   NOW_TCP_DATA_BUF_SIZE    TCP relay buffer size.
   NOW_UDP_DATA_BUF_SIZE    UDP target receive buffer size.
   NOW_TCP_DIAL_TIMEOUT     TCP target dial timeout.

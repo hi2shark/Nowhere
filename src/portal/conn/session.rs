@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use quinn::{Connection, RecvStream, SendStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
 use crate::common::handshake_timeout;
@@ -28,16 +28,21 @@ pub(super) struct PortalSession {
     portal: Arc<PortalInner>,
     conn: Connection,
     udp_flows: Mutex<HashMap<UdpFlowKey, Arc<PortalUdpFlow>>>,
+    udp_queue_budget: Arc<Semaphore>,
+    udp_overload_logged: AtomicBool,
     closed: AtomicBool,
 }
 
 impl PortalSession {
     /// Creates session state for one authenticated QUIC connection.
     pub(super) fn new(portal: Arc<PortalInner>, conn: Connection) -> Self {
+        let udp_queue_budget = Arc::new(Semaphore::new(portal.udp_flow_limits.queue_bytes));
         Self {
             portal,
             conn,
             udp_flows: Mutex::new(HashMap::new()),
+            udp_queue_budget,
+            udp_overload_logged: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
     }

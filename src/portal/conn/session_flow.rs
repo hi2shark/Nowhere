@@ -8,14 +8,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
-use tokio::sync::Mutex;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{OutboundUdpSocket, UDP_FRAME_SCRATCH_SIZE, udp_idle_timeout};
+use crate::common::{UDP_FRAME_SCRATCH_SIZE, udp_dial_timeout, udp_idle_timeout};
 use crate::protocol::append_frame_payload;
 
 use super::PortalSession;
+
+const UDP_FLOW_QUEUE_DATAGRAMS: usize = 64;
 
 /// Key that scopes a UDP flow to both client flow ID and target address.
 #[derive(Clone, Debug, Eq)]
@@ -32,6 +34,10 @@ impl UdpFlowKey {
             target: target.into(),
         }
     }
+
+    pub(super) fn target(&self) -> &str {
+        &self.target
+    }
 }
 
 impl PartialEq for UdpFlowKey {
@@ -47,34 +53,47 @@ impl Hash for UdpFlowKey {
     }
 }
 
-/// Target UDP socket and response state for one proxied UDP flow.
+/// One queued client datagram and its share of the connection memory budget.
+pub(super) struct QueuedDatagram {
+    payload: Bytes,
+    _budget: OwnedSemaphorePermit,
+}
+
+impl QueuedDatagram {
+    pub(super) fn new(payload: Bytes, budget: OwnedSemaphorePermit) -> Self {
+        Self {
+            payload,
+            _budget: budget,
+        }
+    }
+}
+
+/// Queue and cancellation state for one proxied UDP flow.
 pub(super) struct PortalUdpFlow {
     session: Weak<PortalSession>,
     key: UdpFlowKey,
-    socket: Arc<OutboundUdpSocket>,
-    response_header: Vec<u8>,
+    sender: mpsc::Sender<QueuedDatagram>,
     closed: AtomicBool,
-    last_used: Mutex<Instant>,
     cancel: CancellationToken,
 }
 
 impl PortalUdpFlow {
-    /// Creates a UDP flow around a connected target socket.
+    /// Creates a pending UDP flow before target dialing begins.
     pub(super) fn new(
         session: Weak<PortalSession>,
         key: UdpFlowKey,
-        socket: OutboundUdpSocket,
-        response_header: Vec<u8>,
-    ) -> Self {
-        Self {
-            session,
-            key,
-            socket: Arc::new(socket),
-            response_header,
-            closed: AtomicBool::new(false),
-            last_used: Mutex::new(Instant::now()),
-            cancel: CancellationToken::new(),
-        }
+    ) -> (Self, mpsc::Receiver<QueuedDatagram>) {
+        let (sender, receiver) = mpsc::channel(UDP_FLOW_QUEUE_DATAGRAMS);
+        (
+            Self {
+                session,
+                key,
+                sender,
+                closed: AtomicBool::new(false),
+                cancel: CancellationToken::new(),
+            },
+            receiver,
+        )
     }
 
     /// Returns whether this flow has begun closing.
@@ -82,84 +101,117 @@ impl PortalUdpFlow {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Sends one client payload to the target UDP socket.
-    pub(super) async fn send_to_target(&self, payload: &[u8]) -> anyhow::Result<usize> {
-        self.socket.send(payload).await
+    /// Enqueues without waiting; overload drops the new datagram.
+    pub(super) fn enqueue(&self, datagram: QueuedDatagram) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        self.sender.try_send(datagram).is_ok()
     }
 
-    /// Reads target responses and sends them back as QUIC DATAGRAM frames.
-    pub(super) async fn read_loop(self: Arc<Self>) {
+    /// Dials the target, then owns both directions and idle expiry for this flow.
+    pub(super) async fn run(
+        self: Arc<Self>,
+        mut receiver: mpsc::Receiver<QueuedDatagram>,
+        response_header: Vec<u8>,
+    ) {
         let Some(session) = self.session.upgrade() else {
             return;
         };
-        let mut buf = session.portal.buffers.get_udp_buffer();
-        let mut frame_buf = Vec::with_capacity(UDP_FRAME_SCRATCH_SIZE);
-
-        loop {
-            let n = tokio::select! {
-                _ = self.cancel.cancelled() => return,
-                read = self.socket.recv(&mut buf) => match read {
-                    Ok(n) => n,
+        let socket = tokio::select! {
+            _ = self.cancel.cancelled() => return,
+            result = session.portal.outbound.dial_udp(self.key.target(), udp_dial_timeout()) => {
+                match result {
+                    Ok(socket) => socket,
                     Err(err) => {
-                        if !self.closed.load(Ordering::Acquire) {
-                            session.portal.logger.debug(format_args!("portal::conn::udp_read_loop: failed to read target socket: {err}"));
-                        }
+                        session.portal.logger.error(format_args!(
+                            "portal::conn::udp_flow: failed to dial target {}: {err}",
+                            self.key.target()
+                        ));
                         self.close().await;
                         return;
                     }
                 }
-            };
-            if n == 0 {
-                continue;
             }
+        };
+        let mut buf = session.portal.buffers.get_udp_buffer();
+        let mut frame_buf = Vec::with_capacity(UDP_FRAME_SCRATCH_SIZE);
+        let mut last_used = Instant::now();
 
-            self.touch().await;
-            session
-                .portal
-                .stats
-                .udp_tx
-                .fetch_add(n as u64, Ordering::Relaxed);
-            frame_buf.clear();
-            append_frame_payload(&mut frame_buf, &self.response_header, &buf[..n]);
-            if let Some(limiter) = &session.portal.rate_limiter {
-                limiter.wait_write(n as i64).await;
-            }
-            if let Err(err) = session
-                .conn
-                .send_datagram(Bytes::copy_from_slice(&frame_buf))
-            {
-                session.portal.logger.debug(format_args!(
-                    "portal::conn::send_response: failed to send datagram: {err}"
-                ));
-            }
-        }
-    }
-
-    /// Closes the flow after the configured UDP idle timeout.
-    pub(super) async fn idle_loop(self: Arc<Self>) {
         loop {
-            let deadline = {
-                let last = *self.last_used.lock().await;
-                last + udp_idle_timeout()
-            };
+            let deadline = last_used + udp_idle_timeout();
             tokio::select! {
-                _ = self.cancel.cancelled() => return,
-                _ = tokio::time::sleep_until(deadline) => {}
-            }
-            let expired = {
-                let last = *self.last_used.lock().await;
-                Instant::now().duration_since(last) >= udp_idle_timeout()
-            };
-            if expired {
-                self.close().await;
-                return;
+                _ = self.cancel.cancelled() => break,
+                datagram = receiver.recv() => {
+                    let Some(datagram) = datagram else {
+                        break;
+                    };
+                    last_used = Instant::now();
+                    if let Some(limiter) = &session.portal.rate_limiter {
+                        limiter.wait_read(datagram.payload.len() as i64).await;
+                    }
+                    if self.is_closed() {
+                        break;
+                    }
+                    match socket.send(&datagram.payload).await {
+                        Ok(n) => {
+                            session.portal.stats.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            session.portal.logger.error(format_args!(
+                                "portal::conn::udp_flow: failed to write target {}: {err}",
+                                self.key.target()
+                            ));
+                            break;
+                        }
+                    }
+                }
+                read = socket.recv(&mut buf) => {
+                    let n = match read {
+                        Ok(n) => n,
+                        Err(err) => {
+                            if !self.is_closed() {
+                                session.portal.logger.debug(format_args!(
+                                    "portal::conn::udp_flow: failed to read target {}: {err}",
+                                    self.key.target()
+                                ));
+                            }
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        continue;
+                    }
+                    last_used = Instant::now();
+                    frame_buf.clear();
+                    append_frame_payload(&mut frame_buf, &response_header, &buf[..n]);
+                    if let Some(limiter) = &session.portal.rate_limiter {
+                        limiter.wait_write(n as i64).await;
+                    }
+                    if self.is_closed() {
+                        break;
+                    }
+                    match session.conn.send_datagram(Bytes::copy_from_slice(&frame_buf)) {
+                        Ok(()) => {
+                            session.portal.stats.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            session.portal.logger.debug(format_args!(
+                                "portal::conn::udp_flow: failed to send response: {err}"
+                            ));
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    session.portal.logger.debug(format_args!(
+                        "portal::conn::udp_flow: flow expired: {}",
+                        self.key.target()
+                    ));
+                    break;
+                }
             }
         }
-    }
-
-    /// Updates the last-used timestamp for traffic in either direction.
-    pub(super) async fn touch(&self) {
-        *self.last_used.lock().await = Instant::now();
+        self.close().await;
     }
 
     /// Closes the flow, removes it from the session map, and updates counters.
@@ -181,3 +233,7 @@ impl PortalUdpFlow {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/portal/conn/session_flow.rs"]
+mod tests;

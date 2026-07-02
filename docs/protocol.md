@@ -414,6 +414,12 @@ Different targets with the same flow ID are distinct flows. The response uses
 the request's flow ID and target. The Portal closes an inactive flow after
 `NOW_UDP_IDLE_TIMEOUT`.
 
+The reference Portal dispatches each flow independently. Target dialing,
+rate-limit waits, and target socket I/O for one flow do not block DATAGRAM
+dispatch to other flows. Each flow queues at most 64 client datagrams. New
+requests are dropped when that queue, the per-connection queued-byte budget, or
+the per-connection flow limit is full; already accepted requests remain FIFO.
+
 Malformed datagrams, unsupported versions, unknown types, and response frames
 received by the Portal are not forwarded. A close frame for an unknown flow has
 no effect.
@@ -520,6 +526,8 @@ the v1 derivation or frame formats.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams. |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
+| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |
@@ -532,7 +540,9 @@ the v1 derivation or frame formats.
 | `NOW_RELOAD_INTERVAL` | `3600s` | Minimum interval between PEM reload attempts. |
 
 Duration values accept human-readable forms supported by the Portal, such as
-`500ms`, `15s`, or `2m`. Invalid values use the listed defaults. Integer values
+`500ms`, `15s`, or `2m`. Invalid values use the listed defaults.
+`NOW_QUIC_MAX_UDP_FLOWS` and `NOW_QUIC_UDP_QUEUE_BYTES` must be positive; zero
+or invalid values use their defaults and emit a warning. Other integer values
 must be non-negative; invalid or negative values use the listed defaults.
 
 ## 13. Interoperability Requirements
