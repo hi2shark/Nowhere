@@ -63,6 +63,12 @@ traffic type.
 | QUIC/UDP (`net=udp`) | One TCP relay per bidirectional stream | Multiplexed QUIC DATAGRAM flows |
 | Both (`net=mix`) | Both paths above | Both paths above |
 
+An upgraded client independently selects its outer upload and download
+carriers with `up=tcp|udp` and `down=tcp|udp`. `TCP/UDP` and `UDP/TCP` require
+the Portal listener mode `net=mix`; each flow remains pinned to its selected
+carriers for its lifetime. All links are client-initiated and paired by
+authenticated session and flow IDs, never by source IP.
+
 UoT has no separate Portal setting. A compatible client selects it inside an
 authenticated TLS/TCP connection by using the reserved UoT request target and
 then sending length-prefixed UDP packets. See the

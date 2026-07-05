@@ -14,6 +14,7 @@ use quinn::{Connection, Incoming, VarInt};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{quic_max_streams, rate_limit_bytes_per_second};
+use crate::protocol::Carrier;
 
 use self::auth::{
     AuthenticationOutcome, authenticate_connection, authentication_deadline,
@@ -81,6 +82,20 @@ async fn handle_connection(
     conn.set_max_concurrent_bi_streams(VarInt::from_u32(quic_max_streams()));
     drop(admission);
     let session = authenticated.session;
+    let _link_guard =
+        match portal
+            .pairing
+            .register_link(session.session_id, Carrier::Udp, portal.stats.clone())
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                conn.close(VarInt::from_u32(1), b"duplicate session");
+                portal.logger.error(format_args!(
+                    "portal::conn::handle_connection: failed to register link: {err}"
+                ));
+                return;
+            }
+        };
 
     let etar_bps = rate_limit_bytes_per_second(portal.etar_limit);
     if etar_bps > 0 {

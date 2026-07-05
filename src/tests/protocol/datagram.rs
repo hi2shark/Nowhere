@@ -73,6 +73,49 @@ fn append_frame_payload_replaces_previous_contents() {
     assert_eq!(dst, [1, 2, 3, 4]);
 }
 
+#[test]
+fn compact_udp_open_data_and_data_round_trip() {
+    assert_eq!(
+        encode_udp_open_data(7, Carrier::Tcp, "a.test:53", b"q").unwrap(),
+        b"\x01\x11\0\0\0\0\0\0\0\x07\x01\0\x09a.test:53q"
+    );
+    assert_eq!(
+        encode_udp_compact(DATAGRAM_UDP_DATA, 7, b"r").unwrap(),
+        b"\x01\x13\0\0\0\0\0\0\0\x07r"
+    );
+    let open = encode_udp_open_data(9, Carrier::Tcp, "dns.test:53", b"query").unwrap();
+    match decode_udp_compact(&open).unwrap() {
+        CompactUdpFrame::OpenData {
+            flow_id,
+            downlink,
+            target,
+            payload,
+        } => {
+            assert_eq!(flow_id, 9);
+            assert_eq!(downlink, Carrier::Tcp);
+            assert_eq!(target, "dns.test:53");
+            assert_eq!(payload, b"query");
+        }
+        _ => panic!("unexpected compact frame"),
+    }
+
+    let data = encode_udp_compact(DATAGRAM_UDP_DATA, 9, b"next").unwrap();
+    match decode_udp_compact(&data).unwrap() {
+        CompactUdpFrame::Data { flow_id, payload } => {
+            assert_eq!(flow_id, 9);
+            assert_eq!(payload, b"next");
+        }
+        _ => panic!("unexpected compact frame"),
+    }
+}
+
+#[test]
+fn compact_udp_rejects_invalid_control_payload_and_zero_flow() {
+    assert!(encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, 1, b"bad").is_err());
+    assert!(encode_udp_open_data(0, Carrier::Udp, "dns.test:53", b"x").is_err());
+    assert!(decode_udp_compact(&[1, DATAGRAM_UDP_DATA, 0, 0]).is_err());
+}
+
 fn field_offset(frame: &[u8], spec: &EffectiveProtocolSpec, target: UdpFrameElement) -> usize {
     let mut offset = 0;
     for element in spec.frame_layout.udp {

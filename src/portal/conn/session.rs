@@ -12,12 +12,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
+use tokio::sync::mpsc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
 use crate::common::handshake_timeout;
-use crate::protocol::read_request;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
+
+use crate::protocol::{
+    Carrier, FLOW_FRAME_MAGIC, FlowKind, FlowRole, SessionId, read_flow_header, read_request,
+};
 
 use self::flow::{PortalUdpFlow, UdpFlowKey};
 use super::relay::relay_tcp_target;
@@ -27,20 +34,40 @@ use crate::portal::PortalInner;
 pub(super) struct PortalSession {
     portal: Arc<PortalInner>,
     conn: Connection,
+    pub(super) session_id: SessionId,
     udp_flows: Mutex<HashMap<UdpFlowKey, Arc<PortalUdpFlow>>>,
+    compact_udp_flows: Mutex<HashMap<u64, CompactUdpState>>,
     udp_queue_budget: Arc<Semaphore>,
     udp_overload_logged: AtomicBool,
     closed: AtomicBool,
 }
 
+pub(super) struct CompactUdpState {
+    pub(super) target: String,
+    pub(super) downlink: Carrier,
+    pub(super) sender: mpsc::Sender<Bytes>,
+}
+
 impl PortalSession {
+    fn link_path(&self) -> crate::portal::pairing::LinkPath {
+        crate::portal::pairing::LinkPath {
+            peer: self.conn.remote_address().to_string(),
+            local: self.conn.local_ip().map_or_else(
+                || self.portal.endpoint_addr.clone(),
+                |ip| std::net::SocketAddr::new(ip, self.portal.listen_port).to_string(),
+            ),
+        }
+    }
+
     /// Creates session state for one authenticated QUIC connection.
-    pub(super) fn new(portal: Arc<PortalInner>, conn: Connection) -> Self {
+    pub(super) fn new(portal: Arc<PortalInner>, conn: Connection, session_id: SessionId) -> Self {
         let udp_queue_budget = Arc::new(Semaphore::new(portal.udp_flow_limits.queue_bytes));
         Self {
             portal,
             conn,
+            session_id,
             udp_flows: Mutex::new(HashMap::new()),
+            compact_udp_flows: Mutex::new(HashMap::new()),
             udp_queue_budget,
             udp_overload_logged: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -48,12 +75,16 @@ impl PortalSession {
     }
 
     /// Handles a bidirectional QUIC stream carrying one TCP target request.
-    pub(super) async fn handle_stream(self: Arc<Self>, mut send: SendStream, mut recv: RecvStream) {
+    pub(super) async fn handle_stream(self: Arc<Self>, mut send: SendStream, recv: RecvStream) {
         let portal = &self.portal;
-        let target_addr = match timeout(
-            handshake_timeout(),
-            read_request(&mut recv, &portal.credentials.protocol_spec),
-        )
+        let mut recv = BufReader::new(recv);
+        let mut flow_header = None;
+        let target_addr = match timeout(handshake_timeout(), async {
+            if recv.fill_buf().await?.first() == Some(&FLOW_FRAME_MAGIC) {
+                flow_header = Some(read_flow_header(&mut recv).await?);
+            }
+            read_request(&mut recv, &portal.credentials.protocol_spec).await
+        })
         .await
         {
             Ok(Ok(addr)) => addr,
@@ -71,6 +102,89 @@ impl PortalSession {
             }
         };
 
+        if let Some(header) = flow_header {
+            let valid_ingress = match header.role {
+                FlowRole::Open => header.uplink == Carrier::Udp,
+                FlowRole::Attach => header.downlink == Carrier::Udp,
+            };
+            if !valid_ingress || header.uplink == header.downlink {
+                portal.logger.error(format_args!(
+                    "portal::conn::handle_stream: invalid asymmetric flow header"
+                ));
+                return;
+            }
+            match header.kind {
+                FlowKind::Tcp => {
+                    let result = match header.role {
+                        FlowRole::Open => {
+                            portal
+                                .pairing
+                                .submit_tcp(
+                                    self.session_id,
+                                    header,
+                                    target_addr,
+                                    self.link_path(),
+                                    Some(Box::pin(recv)),
+                                    None,
+                                )
+                                .await
+                        }
+                        FlowRole::Attach => {
+                            portal
+                                .pairing
+                                .submit_tcp(
+                                    self.session_id,
+                                    header,
+                                    target_addr,
+                                    self.link_path(),
+                                    None,
+                                    Some(Box::pin(send)),
+                                )
+                                .await
+                        }
+                    };
+                    match result {
+                        Ok(Some(paired)) => {
+                            tokio::spawn(super::relay::relay_paired_tcp(portal.clone(), paired));
+                        }
+                        Ok(None) => {}
+                        Err(err) => portal.logger.error(format_args!(
+                            "portal::conn::handle_stream: failed to pair TCP flow: {err}"
+                        )),
+                    }
+                }
+                FlowKind::Udp => {
+                    if header.role != FlowRole::Attach {
+                        portal.logger.error(format_args!(
+                            "portal::conn::handle_stream: UDP uplink must use DATAGRAM"
+                        ));
+                        return;
+                    }
+                    let result = portal
+                        .pairing
+                        .submit_udp(
+                            self.session_id,
+                            header,
+                            target_addr,
+                            self.link_path(),
+                            None,
+                            Some(crate::portal::pairing::UdpDown::Quic(self.conn.clone())),
+                        )
+                        .await;
+                    match result {
+                        Ok(Some(paired)) => {
+                            tokio::spawn(super::relay::relay_paired_udp(portal.clone(), paired));
+                        }
+                        Ok(None) => {}
+                        Err(err) => portal.logger.error(format_args!(
+                            "portal::conn::handle_stream: failed to pair UDP flow: {err}"
+                        )),
+                    }
+                }
+            }
+            return;
+        }
+
         let peer = self.conn.remote_address();
         let local = self.conn.local_ip().map_or_else(
             || portal.endpoint_addr.clone(),
@@ -83,6 +197,7 @@ impl PortalSession {
             target_addr,
             peer.to_string(),
             local,
+            Carrier::Udp,
         )
         .await;
     }
@@ -99,5 +214,6 @@ impl PortalSession {
         for flow in flows {
             flow.close().await;
         }
+        self.compact_udp_flows.lock().await.clear();
     }
 }

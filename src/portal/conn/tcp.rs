@@ -16,7 +16,10 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::handshake_timeout;
-use crate::protocol::{is_uot_magic_target, read_auth_frame, read_request};
+use crate::protocol::{
+    Carrier, FLOW_FRAME_MAGIC, FlowKind, FlowRole, is_uot_magic_target, read_auth_frame,
+    read_flow_header, read_request,
+};
 
 use super::auth::{authentication_deadline, wait_for_auth_deadline};
 use super::relay::{relay_tcp_target, relay_udp_over_tcp_target};
@@ -78,8 +81,11 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
         ),
         ) => result,
     };
-    match auth {
-        Ok(Ok(())) => drop(admission),
+    let session_id = match auth {
+        Ok(Ok(session_id)) => {
+            drop(admission);
+            session_id
+        }
         Ok(Err(err)) => {
             if !wait_for_auth_deadline(auth_deadline, &shutdown).await {
                 return;
@@ -99,7 +105,21 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
             ));
             return;
         }
-    }
+    };
+    let mut link_guard = Some(
+        match portal
+            .pairing
+            .register_link(session_id, Carrier::Tcp, portal.stats.clone())
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                portal.logger.error(format_args!(
+                    "portal::conn::handle_tcp_incoming: failed to register link: {err}"
+                ));
+                return;
+            }
+        },
+    );
 
     if let Err(err) = SockRef::from(tls_stream.get_ref().0).set_keepalive(true) {
         portal.logger.error(format_args!(
@@ -111,6 +131,7 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     let mut recv = BufReader::new(recv);
 
     let pool_guard = PoolGuard::new(&portal.pool_active);
+    let mut flow_header = None;
     let target_addr = match tokio::select! {
         result = timeout(pool_ttl, async {
             // A pooled client may hold an authenticated TCP connection open
@@ -121,6 +142,9 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(err) => return Err(err.into()),
+            }
+            if recv.fill_buf().await?.first() == Some(&FLOW_FRAME_MAGIC) {
+                flow_header = Some(read_flow_header(&mut recv).await?);
             }
             read_request(&mut recv, &portal.credentials.protocol_spec)
                 .await
@@ -151,6 +175,125 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     };
     drop(pool_guard);
 
+    if let Some(header) = flow_header {
+        let valid_ingress = match header.role {
+            FlowRole::Open => header.uplink == Carrier::Tcp,
+            FlowRole::Attach => header.downlink == Carrier::Tcp,
+        };
+        if !valid_ingress || header.uplink == header.downlink {
+            portal.logger.error(format_args!(
+                "portal::conn::handle_tcp_incoming: invalid asymmetric flow header"
+            ));
+            return;
+        }
+        let pairing = portal.pairing.clone();
+        match header.kind {
+            FlowKind::Tcp => {
+                let result = match header.role {
+                    FlowRole::Open => {
+                        pairing
+                            .submit_tcp(
+                                session_id,
+                                header,
+                                target_addr,
+                                crate::portal::pairing::LinkPath {
+                                    peer: peer.to_string(),
+                                    local: local.clone(),
+                                },
+                                Some(crate::portal::pairing::guarded_reader(
+                                    recv,
+                                    link_guard.take().expect("TCP link guard"),
+                                )),
+                                None,
+                            )
+                            .await
+                    }
+                    FlowRole::Attach => {
+                        pairing
+                            .submit_tcp(
+                                session_id,
+                                header,
+                                target_addr,
+                                crate::portal::pairing::LinkPath {
+                                    peer: peer.to_string(),
+                                    local: local.clone(),
+                                },
+                                None,
+                                Some(crate::portal::pairing::guarded_writer(
+                                    send,
+                                    link_guard.take().expect("TCP link guard"),
+                                )),
+                            )
+                            .await
+                    }
+                };
+                match result {
+                    Ok(Some(paired)) => {
+                        tokio::spawn(super::relay::relay_paired_tcp(portal, paired));
+                    }
+                    Ok(None) => {}
+                    Err(err) => portal.logger.error(format_args!(
+                        "portal::conn::handle_tcp_incoming: failed to pair TCP flow: {err}"
+                    )),
+                }
+            }
+            FlowKind::Udp => {
+                let result = match header.role {
+                    FlowRole::Open => {
+                        pairing
+                            .submit_udp(
+                                session_id,
+                                header,
+                                target_addr,
+                                crate::portal::pairing::LinkPath {
+                                    peer: peer.to_string(),
+                                    local: local.clone(),
+                                },
+                                Some(crate::portal::pairing::UdpUp::Tcp(
+                                    crate::portal::pairing::guarded_reader(
+                                        recv,
+                                        link_guard.take().expect("TCP link guard"),
+                                    ),
+                                )),
+                                None,
+                            )
+                            .await
+                    }
+                    FlowRole::Attach => {
+                        pairing
+                            .submit_udp(
+                                session_id,
+                                header,
+                                target_addr,
+                                crate::portal::pairing::LinkPath {
+                                    peer: peer.to_string(),
+                                    local: local.clone(),
+                                },
+                                None,
+                                Some(crate::portal::pairing::UdpDown::Tcp(
+                                    crate::portal::pairing::guarded_writer(
+                                        send,
+                                        link_guard.take().expect("TCP link guard"),
+                                    ),
+                                )),
+                            )
+                            .await
+                    }
+                };
+                match result {
+                    Ok(Some(paired)) => {
+                        tokio::spawn(super::relay::relay_paired_udp(portal, paired));
+                    }
+                    Ok(None) => {}
+                    Err(err) => portal.logger.error(format_args!(
+                        "portal::conn::handle_tcp_incoming: failed to pair UDP flow: {err}"
+                    )),
+                }
+            }
+        }
+        return;
+    }
+
     let peer = peer.to_string();
     if is_uot_magic_target(&target_addr) {
         tokio::select! {
@@ -173,6 +316,7 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                 target_addr,
                 peer,
                 local,
+                Carrier::Tcp,
             ) => {}
         }
     }

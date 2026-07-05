@@ -173,6 +173,26 @@ pub(super) async fn connect_test_quic_with_url_and_limits(
     )
 }
 
+pub(super) async fn connect_test_quic_to(listen_addr: SocketAddr) -> (quinn::Endpoint, Connection) {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut rustls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertificate))
+        .with_no_client_auth();
+    rustls_config.alpn_protocols = vec![b"now/1".to_vec()];
+    let quic_crypto = QuicClientConfig::try_from(rustls_config).unwrap();
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
+    let connection = endpoint
+        .connect(listen_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    (endpoint, connection)
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum TestSocksAuth<'a> {
     None,

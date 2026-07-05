@@ -14,6 +14,8 @@ use super::spec::{
     auth_frame_len, auth_message_prefix, auth_padding_bytes, decode_username,
 };
 
+use super::{SESSION_ID_LEN, SessionId};
+
 /// Fixed-size authentication key derived from the shared URL username.
 pub type Key = [u8; 32];
 
@@ -52,7 +54,7 @@ pub async fn read_auth_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     key: Key,
     protocol_spec: &EffectiveProtocolSpec,
-) -> Result<()> {
+) -> Result<SessionId> {
     let msg = read_auth_bytes(reader, protocol_spec)
         .await
         .context("protocol::crypto::read_auth_frame: failed to read auth")?;
@@ -65,7 +67,7 @@ pub async fn read_auth_stream<R: AsyncRead + Unpin>(
     reader: &mut R,
     key: Key,
     protocol_spec: &EffectiveProtocolSpec,
-) -> Result<()> {
+) -> Result<SessionId> {
     let msg = read_auth_bytes(reader, protocol_spec)
         .await
         .context("protocol::crypto::read_auth_stream: failed to read auth")?;
@@ -95,15 +97,23 @@ pub fn validate_auth_frame(
     msg: &[u8],
     key: Key,
     protocol_spec: &EffectiveProtocolSpec,
-) -> Result<()> {
+) -> Result<SessionId> {
     let expected_len = auth_frame_len(protocol_spec);
     if msg.len() != expected_len {
         bail!("protocol::crypto::validate_auth_frame: invalid authentication frame");
     }
     let parts = split_auth_frame(msg, protocol_spec);
     let padding = &parts.padding[1..];
+    let session_id: SessionId = msg[msg.len() - SESSION_ID_LEN..]
+        .try_into()
+        .expect("validated auth frame length");
     let expected_padding = auth_padding_bytes(protocol_spec, parts.nonce);
-    let payload = auth_payload(parts.nonce, protocol_spec.auth_padding_len, padding);
+    let payload = auth_payload(
+        parts.nonce,
+        protocol_spec.auth_padding_len,
+        padding,
+        &session_id,
+    );
     let expected = auth_tag(key, protocol_spec, &payload);
 
     // Collapse all field mismatches into one branch so local logs do not
@@ -116,7 +126,7 @@ pub fn validate_auth_frame(
     if diff != 0 {
         bail!("protocol::crypto::validate_auth_frame: invalid authentication frame");
     }
-    Ok(())
+    Ok(session_id)
 }
 
 /// Encodes a complete auth frame using the spec-derived field order.
@@ -125,11 +135,26 @@ pub fn write_auth_frame(
     protocol_spec: &EffectiveProtocolSpec,
     nonce: [u8; AUTH_NONCE_LEN],
 ) -> Vec<u8> {
+    write_session_auth_frame(key, protocol_spec, nonce, [0; SESSION_ID_LEN])
+}
+
+/// Encodes an auth frame bound to a client-generated logical session ID.
+pub fn write_session_auth_frame(
+    key: Key,
+    protocol_spec: &EffectiveProtocolSpec,
+    nonce: [u8; AUTH_NONCE_LEN],
+    session_id: SessionId,
+) -> Vec<u8> {
     let padding = auth_padding_bytes(protocol_spec, &nonce);
     let mut padding_block = Vec::with_capacity(1 + padding.len());
     padding_block.push(protocol_spec.auth_padding_len);
     padding_block.extend_from_slice(&padding);
-    let payload = auth_payload(&nonce, protocol_spec.auth_padding_len, &padding);
+    let payload = auth_payload(
+        &nonce,
+        protocol_spec.auth_padding_len,
+        &padding,
+        &session_id,
+    );
     let tag = auth_tag(key, protocol_spec, &payload);
 
     let mut msg = Vec::with_capacity(auth_frame_len(protocol_spec));
@@ -141,6 +166,7 @@ pub fn write_auth_frame(
             AuthFrameElement::Tag => msg.extend_from_slice(&tag),
         }
     }
+    msg.extend_from_slice(&session_id);
     msg
 }
 
@@ -173,7 +199,7 @@ fn split_auth_frame<'a>(
         }
     }
 
-    debug_assert_eq!(offset, msg.len());
+    debug_assert_eq!(offset + SESSION_ID_LEN, msg.len());
     AuthFrameParts {
         magic: magic.expect("auth frame order includes magic"),
         nonce: nonce.expect("auth frame order includes nonce"),
@@ -191,11 +217,12 @@ fn auth_field_len(element: AuthFrameElement, protocol_spec: &EffectiveProtocolSp
     }
 }
 
-fn auth_payload(nonce: &[u8], pad_len: u8, padding: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(nonce.len() + 1 + padding.len());
+fn auth_payload(nonce: &[u8], pad_len: u8, padding: &[u8], session_id: &SessionId) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(nonce.len() + 1 + padding.len() + session_id.len());
     payload.extend_from_slice(nonce);
     payload.push(pad_len);
     payload.extend_from_slice(padding);
+    payload.extend_from_slice(session_id);
     payload
 }
 

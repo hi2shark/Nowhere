@@ -75,6 +75,8 @@ Environment:
   NOW_QUIC_MAX_STREAMS     Maximum authenticated QUIC streams.
   NOW_QUIC_MAX_UDP_FLOWS   Maximum DATAGRAM UDP flows per QUIC connection.
   NOW_QUIC_UDP_QUEUE_BYTES Maximum queued DATAGRAM bytes per QUIC connection.
+  NOW_MAX_PENDING_FLOW_PAIRS Maximum unmatched asymmetric flow halves per session.
+  NOW_FLOW_PAIR_TIMEOUT     Timeout for matching asymmetric flow halves.
   NOW_TCP_DATA_BUF_SIZE    TCP relay buffer size.
   NOW_UDP_DATA_BUF_SIZE    UDP target receive buffer size.
   NOW_TCP_DIAL_TIMEOUT     TCP target dial timeout.
@@ -82,7 +84,7 @@ Environment:
   NOW_TCP_READ_TIMEOUT     TCP half-close grace timeout.
   NOW_UDP_IDLE_TIMEOUT     QUIC and DATAGRAM/UoT flow idle timeout.
   NOW_HANDSHAKE_TIMEOUT    Base authentication deadline before jitter.
-  NOW_REPORT_INTERVAL      Local CHECK_POINT event interval.
+  NOW_REPORT_INTERVAL      Local CHECK_POINT and LINK_STATUS event interval.
   NOW_SHUTDOWN_TIMEOUT     Graceful shutdown wait.
   NOW_RELOAD_INTERVAL      Minimum PEM certificate reload interval.";
 
