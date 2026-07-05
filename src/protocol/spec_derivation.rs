@@ -11,6 +11,7 @@ use super::{
     AUTH_MAGIC_LEN, AUTH_NONCE_LEN, AUTH_PADDING_BYTES_LABEL, AUTH_TAG_LEN, EffectiveProtocolSpec,
     TCP_PADDING_BYTES_LABEL,
 };
+use crate::protocol::flow::SESSION_ID_LEN;
 
 pub(super) fn hkdf_extract(salt: &[u8], input: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC accepts any key length");
@@ -52,7 +53,12 @@ pub(in crate::protocol) fn auth_message_prefix(spec: &EffectiveProtocolSpec) -> 
 }
 
 pub(in crate::protocol) fn auth_frame_len(spec: &EffectiveProtocolSpec) -> usize {
-    AUTH_MAGIC_LEN + AUTH_NONCE_LEN + 1 + spec.auth_padding_len as usize + AUTH_TAG_LEN
+    AUTH_MAGIC_LEN
+        + AUTH_NONCE_LEN
+        + 1
+        + spec.auth_padding_len as usize
+        + AUTH_TAG_LEN
+        + SESSION_ID_LEN
 }
 
 pub(in crate::protocol) fn auth_padding_bytes(

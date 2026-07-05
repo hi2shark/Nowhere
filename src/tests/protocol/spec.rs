@@ -4,6 +4,7 @@
 //! Protocol-spec derivation tests.
 
 use super::*;
+use crate::protocol::SESSION_ID_LEN;
 
 #[test]
 fn default_spec_matches_explicit_auto() {
@@ -99,7 +100,12 @@ fn auth_padding_is_spec_derived_and_nonce_bound() {
     assert!((1..=255).contains(&usize::from(a.auth_padding_len)));
     assert_eq!(
         auth_frame_len(&a),
-        AUTH_MAGIC_LEN + AUTH_NONCE_LEN + 1 + a.auth_padding_len as usize + AUTH_TAG_LEN
+        AUTH_MAGIC_LEN
+            + AUTH_NONCE_LEN
+            + 1
+            + a.auth_padding_len as usize
+            + AUTH_TAG_LEN
+            + SESSION_ID_LEN
     );
     assert_eq!(
         auth_padding_bytes(&a, &[7; AUTH_NONCE_LEN]).len(),

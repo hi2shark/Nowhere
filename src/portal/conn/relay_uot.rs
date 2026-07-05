@@ -11,9 +11,13 @@ use tokio::time::{Instant, timeout};
 
 use crate::common::{handshake_timeout, udp_dial_timeout, udp_idle_timeout};
 use crate::portal::PortalInner;
-use crate::protocol::{read_uot_packet, read_uot_setup_target, write_uot_packet_frame};
+use crate::portal::pairing::PairedUdp;
+use crate::protocol::{
+    Carrier, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_DATA, DATAGRAM_UDP_OPEN_ACK, encode_udp_compact,
+    read_uot_packet, read_uot_setup_target, write_uot_packet_frame,
+};
 
-use super::SessionGuard;
+use super::{SessionGuard, paired_exchange_path, symmetric_exchange_path};
 
 /// Relays UDP packets through a length-prefixed TCP stream after UoT setup.
 pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
@@ -60,7 +64,8 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
     portal.logger.info(format_args!(
-        "portal::conn::relay_udp_over_tcp_target: exchange starting: {peer} <-> {local} <-> {target_local} <-> {target_addr}"
+        "portal::conn::relay_udp_over_tcp_target: exchange starting: {}",
+        symmetric_exchange_path(Carrier::Tcp, &peer, &local, &target_local, &target_addr)
     ));
 
     portal.stats.add_session(true);
@@ -90,7 +95,8 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
                 }
                 match socket.send(&payload).await {
                     Ok(n) => {
-                        portal.stats.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                    portal.stats.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                    portal.stats.up_tcp.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     Err(err) => {
                         portal.logger.error(format_args!(
@@ -130,6 +136,7 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
                     break;
                 }
                 portal.stats.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
+                portal.stats.down_tcp.fetch_add(n as u64, Ordering::Relaxed);
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 portal.logger.debug(format_args!(
@@ -139,4 +146,171 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
             }
         }
     }
+}
+
+/// Relays one UDP flow through independently selected upload and download carriers.
+pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired: PairedUdp) {
+    let PairedUdp {
+        flow_id,
+        target: target_addr,
+        mut uplink,
+        mut downlink,
+        uplink_carrier,
+        downlink_carrier,
+        uplink_path,
+        downlink_path,
+    } = paired;
+    let socket = match portal
+        .outbound
+        .dial_udp(&target_addr, udp_dial_timeout())
+        .await
+    {
+        Ok(socket) => socket,
+        Err(err) => {
+            portal.logger.error(format_args!(
+                "portal::conn::relay_paired_udp: failed to dial target {target_addr}: {err}"
+            ));
+            return;
+        }
+    };
+    let target_local = socket
+        .local_addr()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    portal.logger.info(format_args!(
+        "portal::conn::relay_paired_udp: exchange starting: {}",
+        paired_exchange_path(
+            uplink_carrier,
+            &uplink_path,
+            &target_local,
+            &target_addr,
+            downlink_carrier,
+            &downlink_path,
+        )
+    ));
+    portal.stats.add_session(true);
+    let _done = SessionGuard::new(portal.clone(), true);
+    if let Err(err) = send_udp_ack(&mut downlink, flow_id).await {
+        portal.logger.debug(format_args!(
+            "portal::conn::relay_paired_udp: failed to send ACK: {err}"
+        ));
+        return;
+    }
+    let mut target_buf = portal.buffers.get_udp_buffer();
+    let mut last_used = Instant::now();
+    loop {
+        let idle_deadline = last_used + udp_idle_timeout();
+        tokio::select! {
+            packet = read_paired_udp(&mut uplink) => {
+                let payload = match packet {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => break,
+                    Err(err) => {
+                        portal.logger.debug(format_args!("portal::conn::relay_paired_udp: uplink closed: {err}"));
+                        break;
+                    }
+                };
+                if payload.is_empty() { continue; }
+                last_used = Instant::now();
+                if let Some(limiter) = &portal.rate_limiter {
+                    limiter.wait_read(payload.len() as i64).await;
+                }
+                match socket.send(&payload).await {
+                    Ok(n) => {
+                        portal.stats.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                        match uplink_carrier {
+                            Carrier::Tcp => &portal.stats.up_tcp,
+                            Carrier::Udp => &portal.stats.up_udp,
+                        }.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => break,
+                }
+            }
+            read = socket.recv(&mut target_buf) => {
+                let n = match read { Ok(n) => n, Err(_) => break };
+                if n == 0 { continue; }
+                last_used = Instant::now();
+                if let Some(limiter) = &portal.rate_limiter {
+                    limiter.wait_write(n as i64).await;
+                }
+                if send_paired_udp(&mut downlink, flow_id, &target_buf[..n]).await.is_err() {
+                    break;
+                }
+                portal.stats.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
+                match downlink_carrier {
+                    Carrier::Tcp => &portal.stats.down_tcp,
+                    Carrier::Udp => &portal.stats.down_udp,
+                }.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => break,
+        }
+    }
+    if let Err(err) = send_udp_close(&mut downlink, flow_id).await {
+        portal.logger.debug(format_args!(
+            "portal::conn::relay_paired_udp: failed to send CLOSE: {err}"
+        ));
+    }
+    portal.logger.info(format_args!(
+        "portal::conn::relay_paired_udp: exchange complete"
+    ));
+}
+
+async fn read_paired_udp(
+    uplink: &mut crate::portal::pairing::UdpUp,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match uplink {
+        crate::portal::pairing::UdpUp::Tcp(reader) => read_uot_packet(reader).await,
+        crate::portal::pairing::UdpUp::Quic(receiver) => {
+            Ok(receiver.recv().await.map(|bytes| bytes.to_vec()))
+        }
+    }
+}
+
+async fn send_udp_ack(
+    downlink: &mut crate::portal::pairing::UdpDown,
+    flow_id: u64,
+) -> anyhow::Result<()> {
+    match downlink {
+        crate::portal::pairing::UdpDown::Tcp(writer) => {
+            writer.write_all(&[0, 0]).await?;
+        }
+        crate::portal::pairing::UdpDown::Quic(conn) => {
+            let frame = encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])?;
+            conn.send_datagram(bytes::Bytes::from(frame))?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_paired_udp(
+    downlink: &mut crate::portal::pairing::UdpDown,
+    flow_id: u64,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    match downlink {
+        crate::portal::pairing::UdpDown::Tcp(writer) => {
+            writer.write_all(&write_uot_packet_frame(payload)?).await?;
+        }
+        crate::portal::pairing::UdpDown::Quic(conn) => {
+            let frame = encode_udp_compact(DATAGRAM_UDP_DATA, flow_id, payload)?;
+            conn.send_datagram(bytes::Bytes::from(frame))?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_udp_close(
+    downlink: &mut crate::portal::pairing::UdpDown,
+    flow_id: u64,
+) -> anyhow::Result<()> {
+    match downlink {
+        crate::portal::pairing::UdpDown::Tcp(writer) => {
+            writer.write_all(&[0, 0]).await?;
+        }
+        crate::portal::pairing::UdpDown::Quic(conn) => {
+            let frame = encode_udp_compact(DATAGRAM_UDP_CLOSE, flow_id, &[])?;
+            conn.send_datagram(bytes::Bytes::from(frame))?;
+        }
+    }
+    Ok(())
 }

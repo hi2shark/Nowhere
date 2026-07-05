@@ -11,6 +11,7 @@ use tokio::time::timeout;
 
 use crate::common::tcp_read_timeout;
 use crate::portal::PortalInner;
+use crate::protocol::Carrier;
 
 /// Relays both directions until one side closes or either direction errors.
 pub(super) async fn relay_stream<R, W>(
@@ -20,6 +21,7 @@ pub(super) async fn relay_stream<R, W>(
     target_conn: tokio::net::TcpStream,
     mut buffer1: Vec<u8>,
     mut buffer2: Vec<u8>,
+    carriers: Option<(Carrier, Carrier)>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -35,6 +37,13 @@ where
                 return Ok::<(), anyhow::Error>(());
             }
             portal.stats.tcp_rx.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some((uplink, _)) = carriers {
+                match uplink {
+                    Carrier::Tcp => &portal.stats.up_tcp,
+                    Carrier::Udp => &portal.stats.up_udp,
+                }
+                .fetch_add(n as u64, Ordering::Relaxed);
+            }
             if let Some(limiter) = &portal.rate_limiter {
                 limiter.wait_read(n as i64).await;
             }
@@ -54,6 +63,13 @@ where
             }
             client_write.write_all(&buffer2[..n]).await?;
             portal.stats.tcp_tx.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some((_, downlink)) = carriers {
+                match downlink {
+                    Carrier::Tcp => &portal.stats.down_tcp,
+                    Carrier::Udp => &portal.stats.down_udp,
+                }
+                .fetch_add(n as u64, Ordering::Relaxed);
+            }
         }
     };
 

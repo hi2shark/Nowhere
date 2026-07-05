@@ -230,9 +230,11 @@ After the QUIC handshake:
    stream.
 2. The client writes exactly one v1 authentication frame and finishes its send
    side.
-3. After successful authentication, each additional bidirectional stream may
-   carry one TCP relay.
-4. UDP relay traffic may use QUIC DATAGRAM frames for the lifetime of the
+3. The authentication frame binds the connection to a client-generated
+   128-bit logical session ID.
+4. After successful authentication, each additional bidirectional stream may
+   carry one TCP relay or one half of an asymmetric flow.
+5. UDP relay traffic may use QUIC DATAGRAM frames for the lifetime of the
    authenticated connection.
 
 The Portal samples one absolute authentication deadline after the QUIC or TLS
@@ -260,16 +262,20 @@ For TLS/TCP, each proxy flow uses a new connection:
 
 There is no authentication response, post-relay connection reuse, or
 multiplexing on the TCP transport. A pooled connection is consumed by its first
-request and carries exactly one TCP relay or one UoT flow. Each accepted TCP
-connection is stateless with respect to every other connection. The Portal
-closes an authenticated connection that does not send its request frame within
-40 seconds.
+request and carries exactly one TCP relay or one UoT flow. Connections sharing
+an authenticated session ID may form one asymmetric flow. The Portal never
+associates them by source IP, so TCP and QUIC may arrive through different
+interfaces or NAT mappings. An authenticated connection that sends no request
+frame is closed after 40 seconds.
 
-The reference client starts one warm connection on a cold pool. Consuming a
-warm connection starts up to two replacements without allowing idle plus
-in-progress connections to exceed the configured pool limit. Each unconsumed
-slot expires 30 seconds after it is created; expiration does not trigger a
-replacement.
+For a `tcp/tcp` client with TLS preconnection enabled, the reference client
+starts one warm connection on a cold pool. Consuming a warm connection starts up to two
+replacements without allowing idle plus in-progress connections to exceed the
+configured pool limit. Each unconsumed slot expires 30 seconds after it is
+created; expiration does not trigger a replacement. A client pool value of `0`
+disables this warm pool and opens TLS/TCP lanes on demand. Any carrier matrix
+containing UDP disables the warm pool; both QUIC and TLS/TCP halves are then
+created lazily.
 
 ## 7. Authentication
 
@@ -279,8 +285,10 @@ The credential key is:
 auth_key = SHA-256(shared_key_bytes)
 ```
 
-The client supplies a 32-byte nonce. It SHOULD generate a fresh,
-cryptographically random nonce for each connection.
+The client supplies a 32-byte nonce and a 16-byte random `session_id`. It SHOULD
+generate a fresh, cryptographically random nonce for each connection and one
+session ID for each transport bundle; every QUIC session and TLS/TCP lane in
+that bundle carries the same session ID.
 
 ### 7.1 Padding and Tag
 
@@ -296,7 +304,7 @@ auth_padding = HKDF-Expand(
 auth_tag = HMAC-SHA256(
     auth_key,
     auth_info || auth_context || nonce ||
-    u8(auth_padding_len) || auth_padding
+    u8(auth_padding_len) || auth_padding || session_id
 )
 ```
 
@@ -304,8 +312,8 @@ auth_tag = HMAC-SHA256(
 
 ### 7.2 Frame
 
-The authentication frame contains these four elements in the derived
-authentication order:
+The authentication frame contains four elements in the derived authentication
+order followed by the fixed session ID:
 
 | Element | Encoding |
 | --- | --- |
@@ -313,11 +321,13 @@ authentication order:
 | `nonce` | 32 bytes |
 | `padding` | `auth_padding_len_u8 || auth_padding` |
 | `tag` | `auth_tag` (32 bytes) |
+| `session_id` | 16 bytes, appended after the shuffled elements |
 
-The complete frame length is `74..328` bytes. The receiver MUST verify the
+The complete frame length is `90..344` bytes. The receiver MUST verify the
 frame length, magic, declared padding length, deterministic padding bytes, and
-HMAC tag. It MUST also require end-of-stream immediately after the frame. Tag
-and padding comparisons SHOULD be constant-time.
+HMAC tag. A QUIC authentication stream MUST end immediately after the frame. A
+TLS/TCP lane reads exactly the authentication frame length and treats following
+bytes as its request frame. Tag and padding comparisons SHOULD be constant-time.
 
 Correct authentication proceeds immediately. A missing stream, truncated
 frame, EOF, missing FIN, trailing bytes, or invalid field, padding, or HMAC is
@@ -376,6 +386,22 @@ server. The Portal then relays bytes in both directions. When one direction
 reaches EOF, the other direction may continue for at most
 `NOW_TCP_READ_TIMEOUT`.
 
+### 8.3 Asymmetric Flow Envelope
+
+An asymmetric flow prepends this fixed envelope to the ordinary request frame
+on both client-created halves:
+
+```text
+magic_f1 || version_u8(1) || role_u8 || flow_id_u64 ||
+kind_u8 || uplink_u8 || downlink_u8
+```
+
+`role` is `1` for `FLOW_OPEN` and `2` for `FLOW_ATTACH`; `kind` is `1` for TCP
+and `2` for UDP; carriers use `1` for TLS/TCP and `2` for QUIC/UDP. The Portal
+keys pending halves by `(session_id, flow_id)`, requires identical metadata and
+target frames, and dials the target only after both halves arrive. Symmetric
+flows omit this envelope and retain their direct fast path.
+
 ## 9. UDP Relay
 
 UDP relay has two transport-specific forms:
@@ -388,7 +414,25 @@ UDP relay has two transport-specific forms:
 The forms share target validation, outbound UDP dialing, rate limits, idle
 timeouts, and UDP counters. Their wire frames are otherwise independent.
 
-### 9.1 QUIC DATAGRAM Header
+### 9.1 QUIC DATAGRAM Frames
+
+The upgraded client uses a fixed compact data plane:
+
+| Type | Value | Body |
+| --- | --- | --- |
+| `OPEN_DATA` | `0x11` | `flow_id_u64 || downlink_u8 || target_len_u16 || target || payload` |
+| `OPEN_ACK` | `0x12` | `flow_id_u64` |
+| `DATA` | `0x13` | `flow_id_u64 || payload` |
+| `CLOSE` | `0x14` | `flow_id_u64` |
+
+Every frame begins with `version_u8(1) || type_u8`. Before receiving
+`OPEN_ACK`, every client payload uses `OPEN_DATA`; after the ACK, the client
+uses target-free `DATA`. The Portal treats repeated open metadata idempotently
+and forwards the first payload without an additional RTT. Target-to-client
+DATAGRAMs always use compact `DATA`.
+
+The derived-order header below remains accepted for the existing symmetric
+implementation path but is not emitted by the upgraded reference client.
 
 Each QUIC DATAGRAM contains a derived-order header followed by an opaque
 payload.
@@ -518,6 +562,13 @@ shown in v1.
 `NOW_REPORT_INTERVAL` controls only this local telemetry schedule. It does not
 control QUIC keepalive traffic.
 
+The Portal also emits carrier-level absolute counters without changing
+`CHECK_POINT`:
+
+```text
+LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>
+```
+
 ## 12. Runtime Controls
 
 These environment variables control the reference Portal. They do not alter
@@ -528,6 +579,8 @@ the v1 derivation or frame formats.
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams. |
 | `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
 | `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
+| `NOW_MAX_PENDING_FLOW_PAIRS` | `1024` | Maximum unpaired asymmetric flow records per session. |
+| `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Lifetime of an unpaired flow half. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |

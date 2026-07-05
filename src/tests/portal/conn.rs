@@ -5,6 +5,8 @@
 
 #[path = "conn/admission.rs"]
 mod admission;
+#[path = "conn/asymmetric.rs"]
+mod asymmetric;
 #[path = "conn/quic.rs"]
 mod quic;
 #[path = "conn/support.rs"]

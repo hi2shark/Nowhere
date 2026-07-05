@@ -156,16 +156,20 @@ produce false health transitions.
 ## Anywhere Client
 
 [Anywhere](https://github.com/NodePassProject/Anywhere) is a supported native
-client for iOS, iPadOS, and tvOS. Its Nowhere implementation supports TCP relay
-and UDP traffic over either transport family:
+client for iOS, iPadOS, and tvOS. Its Nowhere implementation independently
+selects the upload and download carrier for TCP relay and UDP traffic:
 
-| Anywhere `net` | Portal listener | TCP traffic | UDP traffic |
-| --- | --- | --- | --- |
-| `udp` | QUIC/UDP | Bidirectional QUIC streams | QUIC DATAGRAM |
-| `tcp` | TLS/TCP | Dedicated authenticated connections | UoT connections |
+| Anywhere `up/down` | TCP traffic | UDP traffic |
+| --- | --- | --- |
+| `tcp/tcp` | One TLS connection | One UoT connection |
+| `tcp/udp` | TLS upload + QUIC stream download | UoT upload + QUIC DATAGRAM download |
+| `udp/tcp` | QUIC stream upload + TLS download | QUIC DATAGRAM upload + UoT download |
+| `udp/udp` | One QUIC stream | QUIC DATAGRAM |
 
-A Portal using `net=mix` accepts either client mode. A Portal restricted to
-`net=tcp` or `net=udp` requires the matching Anywhere mode.
+A Portal using `net=mix` accepts all four combinations. A Portal restricted to
+`net=tcp` or `net=udp` only accepts the corresponding symmetric combination.
+Asymmetric combinations are direct-only and are rejected when a proxy chain is
+configured.
 
 ### Pair Portal and Client URLs
 
@@ -178,13 +182,13 @@ portal://change-me@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pe
 Import a QUIC/UDP client configuration in Anywhere:
 
 ```text
-nowhere://change-me@relay.example.com:2077?net=udp&spec=nightfall&sni=relay.example.com&alpn=now%2F1#Edge
+nowhere://change-me@relay.example.com:2077?up=udp&down=udp&spec=nightfall&sni=relay.example.com&alpn=now%2F1#Edge
 ```
 
 Or select TLS/TCP with a warm connection pool:
 
 ```text
-nowhere://change-me@relay.example.com:2077?net=tcp&pool=5&spec=nightfall&sni=relay.example.com&alpn=now%2F1#Edge
+nowhere://change-me@relay.example.com:2077?up=tcp&down=tcp&pool=5&spec=nightfall&sni=relay.example.com&alpn=now%2F1#Edge
 ```
 
 The Portal and client must agree on the shared key, `spec`, and ALPN. The
@@ -197,13 +201,18 @@ host used by the server URL.
 | --- | --- | --- |
 | Shared key | URL username | URL username; must match exactly. |
 | Address | Listen host, which may be empty | Reachable server hostname or IP address. |
-| `net` | Enables `tcp`, `udp`, or `mix` listeners | Selects `tcp` or `udp` for this client. |
+| `net` | Enables `tcp`, `udp`, or `mix` listeners | Legacy import only; maps to matching `up` and `down`. |
+| `up`, `down` | Not used | Independently select `tcp` or `udp`; each defaults to `udp`. |
 | `spec` | Protocol-shape seed | Must resolve to the same value; both default to `auto`. |
 | `alpn` | TLS/QUIC ALPN | Must resolve to the same value; both default to `now/1`. |
 | `sni` | Not used | Certificate server name; defaults to the client host. |
-| `pool` | Not used | TLS/TCP warm-pool size `0..9`; valid only with `net=tcp`, defaults to `5`, and `0` disables it. |
+| `pool` | Not used | TLS/TCP standby target `0..9`; valid only for `tcp/tcp`, defaults to `5`, and is omitted for every matrix containing UDP. `0` disables TLS preconnection. |
 | `tls`, `crt`, query `key` | Select and configure the Portal certificate | Not exported; Anywhere always uses TLS and applies its trust policy. |
 | `dial`, `rate`, `etar`, `log` | Portal runtime controls | Not part of the client share link. |
+
+Anywhere exposes Preconnect only for `tcp/tcp`. Every matrix containing UDP is
+fully lazy: its QUIC session and any TLS/TCP half are established by the first
+flow that needs them.
 
 The shared key is the URL username. Do not confuse it with the Portal's query
 parameter named `key`, which is the PEM private-key path for `tls=2`.

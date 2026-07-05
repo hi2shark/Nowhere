@@ -62,15 +62,35 @@ fn auth_frame_round_trip_and_bad_key() {
 }
 
 #[test]
+fn auth_frame_returns_and_authenticates_session_id() {
+    let credentials =
+        Credentials::new(&Url::parse("portal://secret@127.0.0.1:443").unwrap()).unwrap();
+    let session_id = [0x5a; SESSION_ID_LEN];
+    let frame = write_session_auth_frame(
+        credentials.key,
+        &credentials.protocol_spec,
+        [7; AUTH_NONCE_LEN],
+        session_id,
+    );
+    assert_eq!(
+        validate_auth_frame(&frame, credentials.key, &credentials.protocol_spec).unwrap(),
+        session_id
+    );
+    let mut changed = frame;
+    *changed.last_mut().unwrap() ^= 1;
+    validate_auth_frame(&changed, credentials.key, &credentials.protocol_spec).unwrap_err();
+}
+
+#[test]
 fn auth_frame_fixed_nonce_vectors() {
     let cases = [
         (
             "portal://secret@127.0.0.1:443",
-            "33e07eceb833c31f41bea81b0c57a48d0745d1fc22df836733e99316d7ead83ed065c573fe8427ef058b0eb2d90a0707070707070707070707070707070707070707070707070707070707070707",
+            "9f5c48262539a0c11b36f1c68104707b5e8ed40b43095a4bbf116a0841d627bbd065c573fe8427ef058b0eb2d90a070707070707070707070707070707070707070707070707070707070707070700000000000000000000000000000000",
         ),
         (
             "portal://secret@127.0.0.1:443?spec=edge-a",
-            "7a3ac56073e9078855dd794539613930414449cff9b1bc4d9a7a417026654fd71e45f46ff130d7843823958bb0fc0e8eebd66a60e5fab1f83233cb5e4e8c4344dfe8d3da0bdf900707070707070707070707070707070707070707070707070707070707070707",
+            "4aac8618aec3963e460c00ef25b0b998a1fa9057caff3c7022cd7d4bcae1eaa61e45f46ff130d7843823958bb0fc0e8eebd66a60e5fab1f83233cb5e4e8c4344dfe8d3da0bdf90070707070707070707070707070707070707070707070707070707070707070700000000000000000000000000000000",
         ),
     ];
 
@@ -307,7 +327,12 @@ fn fixed_order_padded_auth_frame(
     nonce: [u8; AUTH_NONCE_LEN],
 ) -> Vec<u8> {
     let padding = auth_padding_bytes(protocol_spec, &nonce);
-    let payload = auth_payload(&nonce, protocol_spec.auth_padding_len, &padding);
+    let payload = auth_payload(
+        &nonce,
+        protocol_spec.auth_padding_len,
+        &padding,
+        &[0; SESSION_ID_LEN],
+    );
     let tag = auth_tag(key, protocol_spec, &payload);
 
     let mut frame = Vec::with_capacity(auth_frame_len(protocol_spec));

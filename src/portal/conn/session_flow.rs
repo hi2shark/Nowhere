@@ -156,6 +156,7 @@ impl PortalUdpFlow {
                     match socket.send(&datagram.payload).await {
                         Ok(n) => {
                             session.portal.stats.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
+                            session.portal.stats.up_udp.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Err(err) => {
                             session.portal.logger.error(format_args!(
@@ -194,6 +195,7 @@ impl PortalUdpFlow {
                     match session.conn.send_datagram(Bytes::copy_from_slice(&frame_buf)) {
                         Ok(()) => {
                             session.portal.stats.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
+                            session.portal.stats.down_udp.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Err(err) => {
                             session.portal.logger.debug(format_args!(

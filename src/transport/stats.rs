@@ -20,6 +20,20 @@ pub struct Stats {
     pub tcp_active: AtomicI32,
     /// Currently active UDP relay sessions.
     pub udp_active: AtomicI32,
+    /// Authenticated TLS/TCP carrier lanes.
+    pub link_tcp: AtomicU64,
+    /// Authenticated QUIC/UDP carrier sessions.
+    pub link_udp: AtomicU64,
+    /// Logical sessions with both carrier types ready.
+    pub link_pairs: AtomicU64,
+    /// Client-to-target payload bytes carried over TLS/TCP.
+    pub up_tcp: AtomicU64,
+    /// Client-to-target payload bytes carried over QUIC/UDP.
+    pub up_udp: AtomicU64,
+    /// Target-to-client payload bytes carried over TLS/TCP.
+    pub down_tcp: AtomicU64,
+    /// Target-to-client payload bytes carried over QUIC/UDP.
+    pub down_udp: AtomicU64,
 }
 
 impl Stats {
