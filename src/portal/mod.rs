@@ -8,6 +8,7 @@ mod conn;
 mod event;
 mod listener;
 mod mode;
+mod pairing;
 mod runtime;
 mod setup;
 
@@ -55,6 +56,7 @@ struct PortalInner {
     tls_server_config: Arc<rustls::ServerConfig>,
     quic_server_config: quinn::ServerConfig,
     unauthenticated_admission: Arc<admission::UnauthenticatedAdmission>,
+    pairing: Arc<pairing::PairingRegistry>,
 }
 
 #[cfg(test)]

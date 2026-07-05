@@ -21,9 +21,9 @@ for that deployment.
   and no profile registry or extra negotiation is required.
 - **TLS/TCP and QUIC/UDP on one port.** A Portal can listen on both transports at
   the same time, with TLS 1.3 and the same authentication model throughout.
-- **TCP and UDP over either transport.** TCP uses dedicated TLS connections or
-  QUIC streams; UDP uses UoT when only TCP is available or QUIC DATAGRAM when it
-  can use native UDP.
+- **Independent upload and download carriers.** A client pins each flow to any
+  TLS/TCP and QUIC/UDP direction pair. TCP uses dedicated TLS halves or QUIC
+  streams; UDP uses UoT or compact QUIC DATAGRAM frames.
 - **Observable and controllable by design.** EVENT checkpoints expose pools,
   active flows, and byte counters, while directional rate limits and runtime
   controls keep the service operator-friendly.
@@ -42,6 +42,8 @@ for that deployment.
 | UDP | Length-prefixed UDP-over-TCP | QUIC DATAGRAM |
 
 A single Portal URL can enable TLS/TCP, QUIC/UDP, or both on the same port.
+Asymmetric client profiles require both listeners and pair their client-created
+halves by authenticated session and flow IDs rather than source address.
 
 ## Quick Start
 

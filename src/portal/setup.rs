@@ -125,6 +125,7 @@ impl Portal {
                 tls_server_config,
                 quic_server_config,
                 unauthenticated_admission: Arc::new(admission::UnauthenticatedAdmission::new()),
+                pairing: Arc::new(super::pairing::PairingRegistry::new()),
             }),
         })
     }

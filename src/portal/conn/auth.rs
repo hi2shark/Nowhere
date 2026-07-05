@@ -85,9 +85,13 @@ pub(super) async fn authenticate_connection(
             result = &mut auth, if auth_pending => {
                 auth_pending = false;
                 match result {
-                    Ok(()) => {
+                    Ok(session_id) => {
                         return AuthenticationOutcome::Success(AuthenticatedConnection {
-                            session: Arc::new(PortalSession::new(portal.clone(), conn.clone())),
+                            session: Arc::new(PortalSession::new(
+                                portal.clone(),
+                                conn.clone(),
+                                session_id,
+                            )),
                             pending_datagrams,
                         });
                     }

@@ -75,6 +75,16 @@ CHECK_POINT|MODE=0|PING=0ms|POOL=<n>|TCPS=<n>|UDPS=<n>|TCPRX=<bytes>|TCPTX=<byte
 remains fixed in v1. `NOW_REPORT_INTERVAL` controls only local record emission;
 it does not send transport keepalive packets.
 
+Carrier health and routing counters are emitted separately:
+
+```text
+LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>
+```
+
+`TCP` counts authenticated TLS lanes, `UDP` authenticated QUIC sessions, and
+`PAIRS` logical sessions with both carriers ready. Directional byte fields
+count payload after Nowhere framing is removed.
+
 ## Rate Limits
 
 `rate` limits client-to-target traffic. `etar` limits target-to-client traffic.
@@ -174,6 +184,8 @@ authentication succeeds or fails.
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams after authentication. |
 | `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
 | `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
+| `NOW_MAX_PENDING_FLOW_PAIRS` | `1024` | Maximum pending asymmetric flow pairs per session. |
+| `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Timeout for an unmatched flow half. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |

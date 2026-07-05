@@ -5,6 +5,7 @@
 
 mod crypto;
 mod datagram;
+mod flow;
 mod request;
 mod spec;
 mod uot;
@@ -12,11 +13,18 @@ mod util;
 
 pub use crypto::{
     Credentials, Key, read_auth_frame, read_auth_stream, validate_auth_frame, write_auth_frame,
+    write_session_auth_frame,
 };
 pub(crate) use datagram::decode_udp_datagram_parts;
 pub use datagram::{
-    DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, append_frame_payload,
-    decode_udp_datagram, encode_udp_datagram, new_udp_datagram_header,
+    CompactUdpFrame, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_COMPACT_CLOSE, DATAGRAM_UDP_DATA,
+    DATAGRAM_UDP_OPEN_ACK, DATAGRAM_UDP_OPEN_DATA, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE,
+    append_frame_payload, decode_udp_compact, decode_udp_datagram, encode_udp_compact,
+    encode_udp_datagram, encode_udp_open_data, new_udp_datagram_header,
+};
+pub use flow::{
+    Carrier, FLOW_FRAME_MAGIC, FlowHeader, FlowKind, FlowRole, SESSION_ID_LEN, SessionId,
+    read_flow_header, write_flow_header,
 };
 pub use request::{read_request, write_request_frame};
 pub use spec::EffectiveProtocolSpec;
