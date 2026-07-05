@@ -13,8 +13,8 @@ use crate::common::{handshake_timeout, udp_dial_timeout, udp_idle_timeout};
 use crate::portal::PortalInner;
 use crate::portal::pairing::PairedUdp;
 use crate::protocol::{
-    Carrier, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_DATA, DATAGRAM_UDP_OPEN_ACK, encode_udp_compact,
-    read_uot_packet, read_uot_setup_target, write_uot_packet_frame,
+    Carrier, DATAGRAM_UDP_COMPACT_CLOSE, DATAGRAM_UDP_DATA, DATAGRAM_UDP_OPEN_ACK,
+    encode_udp_compact, read_uot_packet, read_uot_setup_target, write_uot_packet_frame,
 };
 
 use super::{SessionGuard, paired_exchange_path, symmetric_exchange_path};
@@ -159,6 +159,7 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
         downlink_carrier,
         uplink_path,
         downlink_path,
+        compact_ack,
     } = paired;
     let socket = match portal
         .outbound
@@ -190,12 +191,7 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
     ));
     portal.stats.add_session(true);
     let _done = SessionGuard::new(portal.clone(), true);
-    if let Err(err) = send_udp_ack(&mut downlink, flow_id).await {
-        portal.logger.debug(format_args!(
-            "portal::conn::relay_paired_udp: failed to send ACK: {err}"
-        ));
-        return;
-    }
+    let mut ack_sent = false;
     let mut target_buf = portal.buffers.get_udp_buffer();
     let mut last_used = Instant::now();
     loop {
@@ -217,6 +213,17 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
                 }
                 match socket.send(&payload).await {
                     Ok(n) => {
+                        if !ack_sent {
+                            if let Err(err) =
+                                send_udp_ack(&mut downlink, flow_id, compact_ack.as_ref()).await
+                            {
+                                portal.logger.debug(format_args!(
+                                    "portal::conn::relay_paired_udp: failed to send ACK: {err}"
+                                ));
+                                break;
+                            }
+                            ack_sent = true;
+                        }
                         portal.stats.udp_rx.fetch_add(n as u64, Ordering::Relaxed);
                         match uplink_carrier {
                             Carrier::Tcp => &portal.stats.up_tcp,
@@ -269,15 +276,23 @@ async fn read_paired_udp(
 async fn send_udp_ack(
     downlink: &mut crate::portal::pairing::UdpDown,
     flow_id: u64,
+    compact_ack: Option<&crate::portal::pairing::CompactAck>,
 ) -> anyhow::Result<()> {
     match downlink {
         crate::portal::pairing::UdpDown::Tcp(writer) => {
             writer.write_all(&[0, 0]).await?;
         }
         crate::portal::pairing::UdpDown::Quic(conn) => {
-            let frame = encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])?;
-            conn.send_datagram(bytes::Bytes::from(frame))?;
+            if compact_ack.is_none() {
+                let frame = encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])?;
+                conn.send_datagram(bytes::Bytes::from(frame))?;
+            }
         }
+    }
+    if let Some(ack) = compact_ack {
+        let frame = encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])?;
+        ack.conn.send_datagram(bytes::Bytes::from(frame))?;
+        ack.acked.store(true, Ordering::Release);
     }
     Ok(())
 }
@@ -308,7 +323,7 @@ async fn send_udp_close(
             writer.write_all(&[0, 0]).await?;
         }
         crate::portal::pairing::UdpDown::Quic(conn) => {
-            let frame = encode_udp_compact(DATAGRAM_UDP_CLOSE, flow_id, &[])?;
+            let frame = encode_udp_compact(DATAGRAM_UDP_COMPACT_CLOSE, flow_id, &[])?;
             conn.send_datagram(bytes::Bytes::from(frame))?;
         }
     }

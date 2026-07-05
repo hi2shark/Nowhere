@@ -10,7 +10,7 @@ mod flow;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
@@ -35,6 +35,7 @@ pub(super) struct PortalSession {
     portal: Arc<PortalInner>,
     conn: Connection,
     pub(super) session_id: SessionId,
+    quic_generation: AtomicU64,
     udp_flows: Mutex<HashMap<UdpFlowKey, Arc<PortalUdpFlow>>>,
     compact_udp_flows: Mutex<HashMap<u64, CompactUdpState>>,
     udp_queue_budget: Arc<Semaphore>,
@@ -46,6 +47,7 @@ pub(super) struct CompactUdpState {
     pub(super) target: String,
     pub(super) downlink: Carrier,
     pub(super) sender: mpsc::Sender<Bytes>,
+    pub(super) acked: Arc<AtomicBool>,
 }
 
 impl PortalSession {
@@ -66,12 +68,21 @@ impl PortalSession {
             portal,
             conn,
             session_id,
+            quic_generation: AtomicU64::new(0),
             udp_flows: Mutex::new(HashMap::new()),
             compact_udp_flows: Mutex::new(HashMap::new()),
             udp_queue_budget,
             udp_overload_logged: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
+    }
+
+    pub(super) fn set_quic_generation(&self, generation: u64) {
+        self.quic_generation.store(generation, Ordering::Release);
+    }
+
+    pub(super) fn quic_generation(&self) -> u64 {
+        self.quic_generation.load(Ordering::Acquire)
     }
 
     /// Handles a bidirectional QUIC stream carrying one TCP target request.
@@ -123,7 +134,10 @@ impl PortalSession {
                                     self.session_id,
                                     header,
                                     target_addr,
-                                    self.link_path(),
+                                    crate::portal::pairing::LinkHalf::quic(
+                                        self.link_path(),
+                                        self.quic_generation(),
+                                    ),
                                     Some(Box::pin(recv)),
                                     None,
                                 )
@@ -136,7 +150,10 @@ impl PortalSession {
                                     self.session_id,
                                     header,
                                     target_addr,
-                                    self.link_path(),
+                                    crate::portal::pairing::LinkHalf::quic(
+                                        self.link_path(),
+                                        self.quic_generation(),
+                                    ),
                                     None,
                                     Some(Box::pin(send)),
                                 )
@@ -166,9 +183,13 @@ impl PortalSession {
                             self.session_id,
                             header,
                             target_addr,
-                            self.link_path(),
-                            None,
-                            Some(crate::portal::pairing::UdpDown::Quic(self.conn.clone())),
+                            crate::portal::pairing::LinkHalf::quic(
+                                self.link_path(),
+                                self.quic_generation(),
+                            ),
+                            crate::portal::pairing::UdpHalf::Downlink(
+                                crate::portal::pairing::UdpDown::Quic(self.conn.clone()),
+                            ),
                         )
                         .await;
                     match result {

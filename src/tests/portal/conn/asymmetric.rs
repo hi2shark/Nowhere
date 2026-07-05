@@ -241,6 +241,14 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
     .unwrap();
     let ack = read_uot_packet(&mut tls).await.unwrap().unwrap();
     assert!(ack.is_empty());
+    let quic_ack = timeout(Duration::from_secs(3), quic.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode_udp_compact(&quic_ack).unwrap(),
+        CompactUdpFrame::OpenAck { flow_id: 11 }
+    ));
     assert_eq!(read_uot_packet(&mut tls).await.unwrap().unwrap(), b"pong");
     echo.await.unwrap();
 

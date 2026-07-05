@@ -13,9 +13,6 @@ use std::sync::Arc;
 use quinn::{Connection, Incoming, VarInt};
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{quic_max_streams, rate_limit_bytes_per_second};
-use crate::protocol::Carrier;
-
 use self::auth::{
     AuthenticationOutcome, authenticate_connection, authentication_deadline,
     authentication_failure_close,
@@ -34,6 +31,7 @@ use super::admission::UnauthenticatedGuard;
 use super::admission::{
     MAX_UNAUTHENTICATED_CONNECTIONS, MAX_UNAUTHENTICATED_PER_SOURCE, UnauthenticatedAdmission,
 };
+use crate::common::{quic_max_streams, rate_limit_bytes_per_second};
 
 pub(super) async fn handle_incoming(
     portal: Arc<PortalInner>,
@@ -82,20 +80,14 @@ async fn handle_connection(
     conn.set_max_concurrent_bi_streams(VarInt::from_u32(quic_max_streams()));
     drop(admission);
     let session = authenticated.session;
-    let _link_guard =
-        match portal
-            .pairing
-            .register_link(session.session_id, Carrier::Udp, portal.stats.clone())
-        {
-            Ok(guard) => guard,
-            Err(err) => {
-                conn.close(VarInt::from_u32(1), b"duplicate session");
-                portal.logger.error(format_args!(
-                    "portal::conn::handle_connection: failed to register link: {err}"
-                ));
-                return;
-            }
-        };
+    let link_replaced = CancellationToken::new();
+    let link_guard = portal.pairing.register_quic_link(
+        session.session_id,
+        portal.stats.clone(),
+        link_replaced.clone(),
+    );
+    session.set_quic_generation(link_guard.quic_generation());
+    let _link_guard = link_guard;
 
     let etar_bps = rate_limit_bytes_per_second(portal.etar_limit);
     if etar_bps > 0 {
@@ -113,6 +105,12 @@ async fn handle_connection(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = link_replaced.cancelled() => {
+                portal.logger.debug(format_args!(
+                    "portal::conn::handle_connection: authenticated QUIC carrier replaced"
+                ));
+                break;
+            },
             stream = conn.accept_bi() => {
                 match stream {
                     Ok((send, recv)) => {

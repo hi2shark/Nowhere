@@ -337,6 +337,12 @@ without an application response. Network closure is initiated before detailed
 failure information is written to the Portal's local log. Service shutdown
 cancels the delay.
 
+If a newly authenticated QUIC connection presents the `session_id` of an
+older active QUIC connection, the Portal replaces the older carrier. This
+permits recovery from a client-side path failure while the stale server-side
+connection is still waiting for its idle timeout. Existing flows on the older
+carrier are not migrated.
+
 The Portal applies a process-wide pre-authentication admission limit shared by
 TCP and QUIC: at most 256 connections in total and 32 per IPv4 `/32` or IPv6
 `/64`. A validated QUIC attempt above either limit is silently ignored; an
@@ -429,7 +435,10 @@ Every frame begins with `version_u8(1) || type_u8`. Before receiving
 `OPEN_ACK`, every client payload uses `OPEN_DATA`; after the ACK, the client
 uses target-free `DATA`. The Portal treats repeated open metadata idempotently
 and forwards the first payload without an additional RTT. Target-to-client
-DATAGRAMs always use compact `DATA`.
+DATAGRAMs always use compact `DATA`. If the Portal receives target-free `DATA`
+for an unknown or expired flow, it returns `CLOSE`; the client then clears its
+ACK state and uses `OPEN_DATA` for the next payload, or recreates an asymmetric
+flow, to restore the target metadata.
 
 The derived-order header below remains accepted for the existing symmetric
 implementation path but is not emitted by the upgraded reference client.
