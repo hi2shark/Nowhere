@@ -14,13 +14,14 @@ use crate::portal::{
     DEFAULT_QUIC_MAX_UDP_FLOWS, DEFAULT_QUIC_UDP_QUEUE_BYTES, Portal, UdpFlowLimits,
 };
 use crate::protocol::{
-    DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_datagram,
-    new_udp_datagram_header, write_auth_frame,
+    Carrier, CompactUdpFrame, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_COMPACT_CLOSE, DATAGRAM_UDP_DATA,
+    DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_compact, decode_udp_datagram,
+    encode_udp_compact, encode_udp_open_data, new_udp_datagram_header, write_auth_frame,
 };
 
 use super::super::*;
 use super::support::{
-    TestSocksAuth, connect_test_quic, connect_test_quic_with_url,
+    TestSocksAuth, connect_test_quic, connect_test_quic_to, connect_test_quic_with_url,
     connect_test_quic_with_url_and_limits, spawn_test_socks5_udp, spawn_test_socks5_udp_isolation,
     spawn_test_socks5_udp_reject, stop_test_quic,
 };
@@ -66,6 +67,74 @@ async fn wait_for_udp_active(portal: &Portal, expected: i32) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn unknown_compact_udp_data_requests_flow_reopen() {
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    let data = encode_udp_compact(DATAGRAM_UDP_DATA, 77, b"target-free").unwrap();
+    connection.send_datagram(Bytes::from(data)).unwrap();
+
+    let response = timeout(Duration::from_secs(2), connection.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode_udp_compact(&response).unwrap(),
+        CompactUdpFrame::Close { flow_id: 77 }
+    ));
+    assert_eq!(response[1], DATAGRAM_UDP_COMPACT_CLOSE);
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn repeated_open_data_resends_open_ack() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        let open = encode_udp_open_data(78, Carrier::Udp, &target_addr, payload).unwrap();
+        connection.send_datagram(Bytes::from(open)).unwrap();
+        let ack = timeout(Duration::from_secs(2), connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decode_udp_compact(&ack).unwrap(),
+            CompactUdpFrame::OpenAck { flow_id: 78 }
+        ));
+    }
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn authenticated_quic_reconnect_replaces_stale_carrier() {
+    let (portal, server_endpoint, client_endpoint, first, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &first).await;
+
+    let (second_endpoint, second) =
+        connect_test_quic_to(server_endpoint.local_addr().unwrap()).await;
+    authenticate_test_connection(&portal, &second).await;
+
+    timeout(Duration::from_secs(2), first.closed())
+        .await
+        .unwrap();
+    assert_eq!(portal.inner.stats.link_udp.load(Ordering::Relaxed), 1);
+
+    second.close(VarInt::from_u32(0), b"");
+    second_endpoint.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
 }
 
 #[tokio::test]

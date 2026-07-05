@@ -107,18 +107,9 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
         }
     };
     let mut link_guard = Some(
-        match portal
+        portal
             .pairing
-            .register_link(session_id, Carrier::Tcp, portal.stats.clone())
-        {
-            Ok(guard) => guard,
-            Err(err) => {
-                portal.logger.error(format_args!(
-                    "portal::conn::handle_tcp_incoming: failed to register link: {err}"
-                ));
-                return;
-            }
-        },
+            .register_tcp_link(session_id, portal.stats.clone()),
     );
 
     if let Err(err) = SockRef::from(tls_stream.get_ref().0).set_keepalive(true) {
@@ -196,10 +187,12 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                                 session_id,
                                 header,
                                 target_addr,
-                                crate::portal::pairing::LinkPath {
-                                    peer: peer.to_string(),
-                                    local: local.clone(),
-                                },
+                                crate::portal::pairing::LinkHalf::tcp(
+                                    crate::portal::pairing::LinkPath {
+                                        peer: peer.to_string(),
+                                        local: local.clone(),
+                                    },
+                                ),
                                 Some(crate::portal::pairing::guarded_reader(
                                     recv,
                                     link_guard.take().expect("TCP link guard"),
@@ -214,10 +207,12 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                                 session_id,
                                 header,
                                 target_addr,
-                                crate::portal::pairing::LinkPath {
-                                    peer: peer.to_string(),
-                                    local: local.clone(),
-                                },
+                                crate::portal::pairing::LinkHalf::tcp(
+                                    crate::portal::pairing::LinkPath {
+                                        peer: peer.to_string(),
+                                        local: local.clone(),
+                                    },
+                                ),
                                 None,
                                 Some(crate::portal::pairing::guarded_writer(
                                     send,
@@ -245,17 +240,21 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                                 session_id,
                                 header,
                                 target_addr,
-                                crate::portal::pairing::LinkPath {
-                                    peer: peer.to_string(),
-                                    local: local.clone(),
-                                },
-                                Some(crate::portal::pairing::UdpUp::Tcp(
-                                    crate::portal::pairing::guarded_reader(
-                                        recv,
-                                        link_guard.take().expect("TCP link guard"),
+                                crate::portal::pairing::LinkHalf::tcp(
+                                    crate::portal::pairing::LinkPath {
+                                        peer: peer.to_string(),
+                                        local: local.clone(),
+                                    },
+                                ),
+                                crate::portal::pairing::UdpHalf::Uplink {
+                                    uplink: crate::portal::pairing::UdpUp::Tcp(
+                                        crate::portal::pairing::guarded_reader(
+                                            recv,
+                                            link_guard.take().expect("TCP link guard"),
+                                        ),
                                     ),
-                                )),
-                                None,
+                                    compact_ack: None,
+                                },
                             )
                             .await
                     }
@@ -265,17 +264,20 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                                 session_id,
                                 header,
                                 target_addr,
-                                crate::portal::pairing::LinkPath {
-                                    peer: peer.to_string(),
-                                    local: local.clone(),
-                                },
-                                None,
-                                Some(crate::portal::pairing::UdpDown::Tcp(
-                                    crate::portal::pairing::guarded_writer(
-                                        send,
-                                        link_guard.take().expect("TCP link guard"),
+                                crate::portal::pairing::LinkHalf::tcp(
+                                    crate::portal::pairing::LinkPath {
+                                        peer: peer.to_string(),
+                                        local: local.clone(),
+                                    },
+                                ),
+                                crate::portal::pairing::UdpHalf::Downlink(
+                                    crate::portal::pairing::UdpDown::Tcp(
+                                        crate::portal::pairing::guarded_writer(
+                                            send,
+                                            link_guard.take().expect("TCP link guard"),
+                                        ),
                                     ),
-                                )),
+                                ),
                             )
                             .await
                     }

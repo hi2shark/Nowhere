@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
@@ -12,9 +13,10 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
-    Carrier, CompactUdpFrame, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE,
-    FlowHeader, FlowKind, FlowRole, decode_udp_compact, decode_udp_datagram_parts,
-    encode_udp_compact, new_udp_datagram_header,
+    Carrier, CompactUdpFrame, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_COMPACT_CLOSE,
+    DATAGRAM_UDP_OPEN_ACK, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, FlowHeader, FlowKind,
+    FlowRole, decode_udp_compact, decode_udp_datagram_parts, encode_udp_compact,
+    new_udp_datagram_header,
 };
 
 use super::flow::{PortalUdpFlow, QueuedDatagram, UdpFlowKey};
@@ -112,11 +114,18 @@ impl PortalSession {
                         (
                             state.target == target && state.downlink == downlink,
                             state.sender.clone(),
+                            state.acked.load(Ordering::Acquire),
                         )
                     });
-                if let Some((valid, sender)) = existing {
+                if let Some((valid, sender, acked)) = existing {
                     if valid {
                         let _ = sender.try_send(payload);
+                        if acked
+                            && let Ok(frame) =
+                                encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])
+                        {
+                            let _ = self.conn.send_datagram(Bytes::from(frame));
+                        }
                     } else {
                         drop(sender);
                         self.reject_compact_flow(flow_id).await;
@@ -130,12 +139,14 @@ impl PortalSession {
                     return;
                 }
                 let (sender, receiver) = tokio::sync::mpsc::channel(64);
+                let acked = Arc::new(AtomicBool::new(false));
                 self.compact_udp_flows.lock().await.insert(
                     flow_id,
                     CompactUdpState {
                         target: target.clone(),
                         downlink,
                         sender: sender.clone(),
+                        acked: acked.clone(),
                     },
                 );
                 let _ = sender.try_send(payload);
@@ -159,6 +170,10 @@ impl PortalSession {
                         downlink_carrier: Carrier::Udp,
                         uplink_path: path.clone(),
                         downlink_path: path,
+                        compact_ack: Some(crate::portal::pairing::CompactAck {
+                            conn: self.conn.clone(),
+                            acked,
+                        }),
                     })
                 } else {
                     let header = FlowHeader {
@@ -175,9 +190,17 @@ impl PortalSession {
                             self.session_id,
                             header,
                             target,
-                            self.link_path(),
-                            Some(crate::portal::pairing::UdpUp::Quic(receiver)),
-                            None,
+                            crate::portal::pairing::LinkHalf::quic(
+                                self.link_path(),
+                                self.quic_generation(),
+                            ),
+                            crate::portal::pairing::UdpHalf::Uplink {
+                                uplink: crate::portal::pairing::UdpUp::Quic(receiver),
+                                compact_ack: Some(crate::portal::pairing::CompactAck {
+                                    conn: self.conn.clone(),
+                                    acked,
+                                }),
+                            },
                         )
                         .await
                     {
@@ -199,15 +222,17 @@ impl PortalSession {
                 }
             }
             CompactUdpFrame::Data { flow_id, payload } => {
-                if let Some(sender) = self
+                let sender = self
                     .compact_udp_flows
                     .lock()
                     .await
                     .get(&flow_id)
-                    .map(|s| s.sender.clone())
-                {
+                    .map(|s| s.sender.clone());
+                if let Some(sender) = sender {
                     let payload_offset = payload.as_ptr() as usize - data.as_ptr() as usize;
                     let _ = sender.try_send(data.slice(payload_offset..));
+                } else {
+                    self.reject_compact_flow(flow_id).await;
                 }
             }
             CompactUdpFrame::Close { flow_id } => {
@@ -227,7 +252,7 @@ impl PortalSession {
             .pairing
             .cancel_udp(self.session_id, flow_id)
             .await;
-        if let Ok(frame) = encode_udp_compact(DATAGRAM_UDP_CLOSE, flow_id, &[]) {
+        if let Ok(frame) = encode_udp_compact(DATAGRAM_UDP_COMPACT_CLOSE, flow_id, &[]) {
             let _ = self.conn.send_datagram(Bytes::from(frame));
         }
     }
