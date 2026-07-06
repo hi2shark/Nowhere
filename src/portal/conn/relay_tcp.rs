@@ -13,7 +13,7 @@ use crate::portal::PortalInner;
 use crate::portal::pairing::PairedTcp;
 use crate::protocol::Carrier;
 
-use super::stream::relay_stream;
+use super::stream::{relay_stream, RelaySummary};
 use super::{SessionGuard, paired_exchange_path, per_flow_limiter, symmetric_exchange_path};
 
 /// Dials a TCP target and relays bytes between the client stream and target.
@@ -89,11 +89,24 @@ pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
     )
     .await;
     match result {
-        Ok(()) => portal.logger.info(format_args!(
-            "portal::conn::relay_tcp_target: relay_end close_reason=EOF"
-        )),
+        Ok(RelaySummary {
+            client_to_target_bytes,
+            target_to_client_bytes,
+            first_eof,
+        }) => {
+            let close_source = match first_eof {
+                "target" => "remote_eof",
+                "client" => "local_eof",
+                _ => "unknown",
+            };
+            portal.logger.info(format_args!(
+                "portal::conn::relay_tcp_target: relay_end close_reason=EOF close_source={close_source} first_eof={first_eof} c2t_bytes={client_to_target_bytes} t2c_bytes={target_to_client_bytes} target={target_addr}",
+            ));
+        }
         Err(err) => portal.logger.info(format_args!(
-            "portal::conn::relay_tcp_target: relay_end close_reason=error: {err}"
+            "portal::conn::relay_tcp_target: relay_end close_reason=error: {err} close_source=error target={target_addr}",
+            err = err,
+            target_addr = target_addr
         )),
     }
 }
@@ -172,11 +185,24 @@ pub(in crate::portal) async fn relay_paired_tcp(portal: Arc<PortalInner>, paired
     )
     .await;
     match result {
-        Ok(()) => portal.logger.info(format_args!(
-            "portal::conn::relay_paired_tcp: relay_end close_reason=EOF"
-        )),
+        Ok(RelaySummary {
+            client_to_target_bytes,
+            target_to_client_bytes,
+            first_eof,
+        }) => {
+            let close_source = match first_eof {
+                "target" => "remote_eof",
+                "client" => "local_eof",
+                _ => "unknown",
+            };
+            portal.logger.info(format_args!(
+                "portal::conn::relay_paired_tcp: relay_end close_reason=EOF close_source={close_source} first_eof={first_eof} c2t_bytes={client_to_target_bytes} t2c_bytes={target_to_client_bytes} target={target_addr}",
+            ));
+        }
         Err(err) => portal.logger.info(format_args!(
-            "portal::conn::relay_paired_tcp: relay_end close_reason=error: {err}"
+            "portal::conn::relay_paired_tcp: relay_end close_reason=error: {err} close_source=error target={target_addr}",
+            err = err,
+            target_addr = target_addr
         )),
     }
 }
