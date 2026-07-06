@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::common::tcp_read_timeout;
+
 use crate::portal::PortalInner;
 use crate::protocol::Carrier;
 use crate::transport::RateLimiter;
@@ -19,6 +19,13 @@ use crate::transport::RateLimiter;
 /// such slow operations are logged to avoid swamping the debug log on every
 /// loop iteration of a fast bulk transfer.
 const BLOCK_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// After one direction of a relay observes a clean EOF, the other direction is
+/// given this long to finish naturally. The old 30-second window was too short
+/// for high-RTT / slow single-flow downloads (e.g. speed.cloudflare.com over a
+/// ~200ms link), where the client half-closes the upload after sending the
+/// request and the response can take minutes to drain.
+const POST_EOF_DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-direction accounting returned to the caller so the `relay_end` summary
 /// can report how many bytes actually crossed each leg of the relay.
@@ -227,17 +234,30 @@ where
 
     match first {
         EitherDone::Client(Ok(())) => {
-            // After a clean half-close, give the other direction a short drain
-            // window so protocol trailers or final response bytes can pass.
-            timeout(tcp_read_timeout(), &mut target_to_client)
+            // After the client half-closes (upload EOF), give the download side a
+            // generous drain window. A hard 30s cap was killing long/slow
+            // downloads on high-RTT paths before the target could finish.
+            if timeout(POST_EOF_DRAIN_TIMEOUT, &mut target_to_client)
                 .await
-                .unwrap_or(Ok(()))?;
+                .is_err()
+            {
+                portal.logger.debug(format_args!(
+                    "portal::conn::relay_stream: post_eof_drain_timeout dir=target_to_client timeout_s={}",
+                    POST_EOF_DRAIN_TIMEOUT.as_secs()
+                ));
+            }
         }
         EitherDone::Target(Ok(())) => {
             // Symmetric drain window for target-initiated close.
-            timeout(tcp_read_timeout(), &mut client_to_target)
+            if timeout(POST_EOF_DRAIN_TIMEOUT, &mut client_to_target)
                 .await
-                .unwrap_or(Ok(()))?;
+                .is_err()
+            {
+                portal.logger.debug(format_args!(
+                    "portal::conn::relay_stream: post_eof_drain_timeout dir=client_to_target timeout_s={}",
+                    POST_EOF_DRAIN_TIMEOUT.as_secs()
+                ));
+            }
         }
         EitherDone::Client(Err(err)) | EitherDone::Target(Err(err)) => return Err(err),
     }
