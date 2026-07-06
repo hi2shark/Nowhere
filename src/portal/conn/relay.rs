@@ -12,14 +12,28 @@ mod uot;
 
 use std::sync::Arc;
 
+use crate::common::rate_limit_bytes_per_second;
 use crate::portal::PortalInner;
 use crate::portal::pairing::LinkPath;
 use crate::protocol::Carrier;
+use crate::transport::RateLimiter;
 
 pub(in crate::portal) use self::tcp::relay_paired_tcp;
 pub(super) use self::tcp::relay_tcp_target;
 pub(in crate::portal) use self::uot::relay_paired_udp;
 pub(super) use self::uot::relay_udp_over_tcp_target;
+
+/// Builds a fresh, per-flow rate limiter from the configured `rate`/`etar`.
+///
+/// Each relay session gets its own limiter so that concurrent flows do not
+/// contend on a single shared token bucket (which would make the aggregate
+/// multi-flow throughput collapse to roughly the single-flow ceiling). Both
+/// directions at zero yields `None` (unlimited), matching `RateLimiter::new`.
+pub(in crate::portal) fn per_flow_limiter(portal: &PortalInner) -> Option<RateLimiter> {
+    let read_bps = rate_limit_bytes_per_second(portal.rate_limit) as i64;
+    let write_bps = rate_limit_bytes_per_second(portal.etar_limit) as i64;
+    RateLimiter::new(read_bps, write_bps)
+}
 
 fn paired_exchange_path(
     uplink: Carrier,

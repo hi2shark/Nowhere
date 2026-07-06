@@ -137,6 +137,9 @@ impl PortalUdpFlow {
         let mut buf = session.portal.buffers.get_udp_buffer();
         let mut frame_buf = Vec::with_capacity(UDP_FRAME_SCRATCH_SIZE);
         let mut last_used = Instant::now();
+        // Per-flow limiter: each UDP flow gets its own bucket so concurrent flows
+        // do not contend on a process-wide limiter.
+        let limiter = super::super::relay::per_flow_limiter(&session.portal);
 
         loop {
             let deadline = last_used + udp_idle_timeout();
@@ -147,7 +150,7 @@ impl PortalUdpFlow {
                         break;
                     };
                     last_used = Instant::now();
-                    if let Some(limiter) = &session.portal.rate_limiter {
+                    if let Some(limiter) = &limiter {
                         limiter.wait_read(datagram.payload.len() as i64).await;
                     }
                     if self.is_closed() {
@@ -186,7 +189,7 @@ impl PortalUdpFlow {
                     last_used = Instant::now();
                     frame_buf.clear();
                     append_frame_payload(&mut frame_buf, &response_header, &buf[..n]);
-                    if let Some(limiter) = &session.portal.rate_limiter {
+                    if let Some(limiter) = &limiter {
                         limiter.wait_write(n as i64).await;
                     }
                     if self.is_closed() {

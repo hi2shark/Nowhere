@@ -88,7 +88,10 @@ count payload after Nowhere framing is removed.
 ## Rate Limits
 
 `rate` limits client-to-target traffic. `etar` limits target-to-client traffic.
-Both are process-wide limits shared across active TLS/TCP and QUIC sessions.
+Each relay session (TCP relay, paired TCP relay, UoT, paired UDP flow) gets its
+**own** token bucket built from the configured `rate`/`etar`, so concurrent
+flows do not contend on a single shared limiter — the aggregate throughput of N
+parallel flows scales as N × (per-flow ceiling), not the per-flow ceiling alone.
 For UoT, only UDP payload bytes are charged; the two-byte packet lengths and
 setup framing are not.
 
@@ -103,7 +106,62 @@ bytes_per_second = mbps * 125000
 ```
 
 Limits are enforced above the transport layer. They do not select or tune QUIC
-congestion control.
+congestion control. Leaving both unset (the default, `rate=0&etar=0`) disables
+the limiter entirely (unlimited).
+
+## Concurrent-Speedtest Troubleshooting
+
+When `net=tcp` (TLS/TCP carriers) shows multi-thread speedtest anomalies while
+single-thread or `VLESS+WS+TLS` work fine, use this procedure instead of
+guessing at the network stack.
+
+### 1. Enable debug logging
+
+- Server: run with debug log level. Watch `relay_*` events and the periodic
+  `CHECK_POINT|...|POOL=...|TCPS=...|TCPTX=...` and `LINK_STATUS|...` records.
+- Client (mihomo/meta-kernel-nowhere): set `log-level: debug` and grep for
+  `[Nowhere] [carrier]`. Each carrier prints its lifecycle:
+  `flow_start` → `dial_start` → `auth_ok` → `request_sent ... consumed=true`
+  → `relay_start` → `relay_end ... rx_bytes=... tx_bytes=... close_reason=...`.
+
+### 2. Confirm one carrier per flow
+
+In a multi-thread speedtest the client log must show a **distinct `carrier_id`**
+for every concurrent `flow_id`. Two active flows sharing one `carrier_id`, or a
+`consumed` carrier being borrowed again, is reported as
+`illegal transition ... consumed-carrier reuse ...` at WARN level — that is a
+bug, not a config issue.
+
+On the server, `CHECK_POINT`'s `TCPS` should rise markedly under multi-thread
+load (one TCP relay session per flow). If `TCPS` stays at single-thread levels
+the client is not opening independent carriers.
+
+### 3. Isolate the warm pool
+
+Set the client outbound option `pool: 0` (equivalent to disabling preconnect:
+every flow dials its own carrier). Re-run the multi-thread speedtest and
+compare with `pool: 5`. If `pool: 0` is healthy but `pool: 5` is not, the issue
+is in warm-pool state management; if both misbehave, look at per-flow carrier
+exclusivity or download-direction write backpressure (server
+`write_block_duration` / `read_block_duration` debug lines).
+
+### 4. Confirm rate/etar are not capping aggregate throughput
+
+`rate`/`etar` are now applied per flow, so they should not collapse multi-thread
+totals below single-thread. To rule them out entirely, run the server with
+**no** `rate`/`etar` query parameters (the default). If a configured `rate` or
+`etar` still correlates with the anomaly, double-check that each flow builds an
+independent limiter (the `relay_start limiter_per_flow=...` debug line shows the
+configured rates).
+
+### 5. Separate TCP relay from UoT (HTTP/3 / QUIC)
+
+Browsers may reach `speed.cloudflare.com` over HTTP/3 (UDP/443). In Chrome
+DevTools → Network, check the `Protocol` column for `h3`. If present, disable
+QUIC (`chrome://flags/#enable-quic`) and re-test:
+
+- recovers → investigate UoT (UDP-over-TCP) on the `net=tcp` matrix;
+- still broken → the problem is in plain TCP relay concurrency, not UoT.
 
 ## QUIC Runtime Behavior
 

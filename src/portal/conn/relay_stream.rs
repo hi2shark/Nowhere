@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
@@ -12,8 +13,18 @@ use tokio::time::timeout;
 use crate::common::tcp_read_timeout;
 use crate::portal::PortalInner;
 use crate::protocol::Carrier;
+use crate::transport::RateLimiter;
+
+/// A read/write is considered "blocked" once it takes longer than this; only
+/// such slow operations are logged to avoid swamping the debug log on every
+/// loop iteration of a fast bulk transfer.
+const BLOCK_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// Relays both directions until one side closes or either direction errors.
+///
+/// `limiter` is a per-flow limiter built by the caller (see `per_flow_limiter`).
+/// Each relay session owns its own bucket so concurrent flows do not contend on
+/// a shared limiter; passing `None` means unlimited in both directions.
 pub(super) async fn relay_stream<R, W>(
     portal: Arc<PortalInner>,
     client_read: &mut R,
@@ -22,6 +33,7 @@ pub(super) async fn relay_stream<R, W>(
     mut buffer1: Vec<u8>,
     mut buffer2: Vec<u8>,
     carriers: Option<(Carrier, Carrier)>,
+    limiter: Option<RateLimiter>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -31,7 +43,16 @@ where
 
     let client_to_target = async {
         loop {
+            let read_start = Instant::now();
             let n = client_read.read(&mut buffer1).await?;
+            let read_elapsed = read_start.elapsed();
+            if read_elapsed >= BLOCK_LOG_THRESHOLD {
+                portal.logger.debug(format_args!(
+                    "portal::conn::relay_stream: read_block_duration={}ms bytes={} dir=client_to_target",
+                    read_elapsed.as_millis(),
+                    n
+                ));
+            }
             if n == 0 {
                 target_write.shutdown().await?;
                 return Ok::<(), anyhow::Error>(());
@@ -44,24 +65,51 @@ where
                 }
                 .fetch_add(n as u64, Ordering::Relaxed);
             }
-            if let Some(limiter) = &portal.rate_limiter {
+            if let Some(limiter) = &limiter {
                 limiter.wait_read(n as i64).await;
             }
+            let write_start = Instant::now();
             target_write.write_all(&buffer1[..n]).await?;
+            let write_elapsed = write_start.elapsed();
+            if write_elapsed >= BLOCK_LOG_THRESHOLD {
+                portal.logger.debug(format_args!(
+                    "portal::conn::relay_stream: write_block_duration={}ms bytes={} dir=client_to_target",
+                    write_elapsed.as_millis(),
+                    n
+                ));
+            }
         }
     };
 
     let target_to_client = async {
         loop {
+            let read_start = Instant::now();
             let n = target_read.read(&mut buffer2).await?;
+            let read_elapsed = read_start.elapsed();
+            if read_elapsed >= BLOCK_LOG_THRESHOLD {
+                portal.logger.debug(format_args!(
+                    "portal::conn::relay_stream: read_block_duration={}ms bytes={} dir=target_to_client",
+                    read_elapsed.as_millis(),
+                    n
+                ));
+            }
             if n == 0 {
                 client_write.shutdown().await?;
                 return Ok::<(), anyhow::Error>(());
             }
-            if let Some(limiter) = &portal.rate_limiter {
+            if let Some(limiter) = &limiter {
                 limiter.wait_write(n as i64).await;
             }
+            let write_start = Instant::now();
             client_write.write_all(&buffer2[..n]).await?;
+            let write_elapsed = write_start.elapsed();
+            if write_elapsed >= BLOCK_LOG_THRESHOLD {
+                portal.logger.debug(format_args!(
+                    "portal::conn::relay_stream: write_block_duration={}ms bytes={} dir=target_to_client",
+                    write_elapsed.as_millis(),
+                    n
+                ));
+            }
             portal.stats.tcp_tx.fetch_add(n as u64, Ordering::Relaxed);
             if let Some((_, downlink)) = carriers {
                 match downlink {

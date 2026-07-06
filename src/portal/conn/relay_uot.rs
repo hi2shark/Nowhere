@@ -17,7 +17,7 @@ use crate::protocol::{
     encode_udp_compact, read_uot_packet, read_uot_setup_target, write_uot_packet_frame,
 };
 
-use super::{SessionGuard, paired_exchange_path, symmetric_exchange_path};
+use super::{SessionGuard, paired_exchange_path, per_flow_limiter, symmetric_exchange_path};
 
 /// Relays UDP packets through a length-prefixed TCP stream after UoT setup.
 pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
@@ -72,6 +72,9 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
     let _done = SessionGuard::new(portal.clone(), true);
     let mut target_buf = portal.buffers.get_udp_buffer();
     let mut last_used = Instant::now();
+    // Per-flow limiter: each UoT session gets its own bucket so concurrent flows
+    // do not contend on a process-wide limiter.
+    let limiter = per_flow_limiter(&portal);
 
     loop {
         // UoT is connection-oriented, so the idle timer is based on traffic in
@@ -90,7 +93,7 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
                     }
                 };
                 last_used = Instant::now();
-                if let Some(limiter) = &portal.rate_limiter {
+                if let Some(limiter) = &limiter {
                     limiter.wait_read(payload.len() as i64).await;
                 }
                 match socket.send(&payload).await {
@@ -117,7 +120,7 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
                     }
                 };
                 last_used = Instant::now();
-                if let Some(limiter) = &portal.rate_limiter {
+                if let Some(limiter) = &limiter {
                     limiter.wait_write(n as i64).await;
                 }
                 let frame = match write_uot_packet_frame(&target_buf[..n]) {
@@ -194,6 +197,8 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
     let mut ack_sent = false;
     let mut target_buf = portal.buffers.get_udp_buffer();
     let mut last_used = Instant::now();
+    // Per-flow limiter: each paired UDP flow gets its own bucket.
+    let limiter = per_flow_limiter(&portal);
     loop {
         let idle_deadline = last_used + udp_idle_timeout();
         tokio::select! {
@@ -208,7 +213,7 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
                 };
                 if payload.is_empty() { continue; }
                 last_used = Instant::now();
-                if let Some(limiter) = &portal.rate_limiter {
+                if let Some(limiter) = &limiter {
                     limiter.wait_read(payload.len() as i64).await;
                 }
                 match socket.send(&payload).await {
@@ -237,7 +242,7 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
                 let n = match read { Ok(n) => n, Err(_) => break };
                 if n == 0 { continue; }
                 last_used = Instant::now();
-                if let Some(limiter) = &portal.rate_limiter {
+                if let Some(limiter) = &limiter {
                     limiter.wait_write(n as i64).await;
                 }
                 if send_paired_udp(&mut downlink, flow_id, &target_buf[..n]).await.is_err() {

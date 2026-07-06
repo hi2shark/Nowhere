@@ -51,6 +51,10 @@ struct PortalInner {
     stats: Arc<Stats>,
     pool_active: AtomicU64,
     buffers: Buffers,
+    // NOTE: relay paths no longer read this shared limiter. Each relay session
+    // builds its own per-flow limiter via `per_flow_limiter` (see conn/relay.rs)
+    // so concurrent flows get independent token buckets. This field is retained
+    // for compatibility with setup/runtime and may be removed in a follow-up.
     rate_limiter: Option<Arc<RateLimiter>>,
     udp_flow_limits: UdpFlowLimits,
     tls_server_config: Arc<rustls::ServerConfig>,
