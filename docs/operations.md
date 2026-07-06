@@ -163,6 +163,32 @@ QUIC (`chrome://flags/#enable-quic`) and re-test:
 - recovers → investigate UoT (UDP-over-TCP) on the `net=tcp` matrix;
 - still broken → the problem is in plain TCP relay concurrency, not UoT.
 
+### 6. Downlink write back-pressure (Portal -> client)
+
+If aggregate throughput collapses (not just one site) and the server log shows
+repeated `write_block_duration=1000ms bytes=... dir=target_to_client` while
+`TCPTX` in `CHECK_POINT` grows far slower than `TCPRX`, the downlink write from
+the Portal to the client carrier is being back-pressured. The two most common
+causes:
+
+- **Pinned socket buffers.** Explicitly setting `SO_RCVBUF`/`SO_SNDBUF` disables
+  the kernel's TCP window autotuning and pins the buffer to a fixed size. On
+  OpenWrt/constrained systems the OS then clamps it (commonly ~425 KB), which
+  under high RTT caps per-flow throughput at roughly buffer/RTT. The mihomo /
+  meta-kernel-nowhere client therefore does **not** set socket buffers by
+  default — it leaves autotuning on. If you previously forced buffers, unset
+  `NOWHERE_TCP_SOCKET_BUFFER` (client env) to restore autotuning. The client
+  still applies `TCP_NODELAY` and inherits the kernel's keep-alive default.
+- **Oversized relay write unit.** The Portal relay reads a chunk then
+  `write_all`s it to the client carrier in one call. With a 256 KiB chunk every
+  write can block for a full window; the default is now 64 KiB
+  (`NOW_TCP_DATA_BUF_SIZE`) so each write is short. Override downward if you
+  still see large `write_block_duration` values.
+
+Confirmation: after these changes the client `[Nowhere] [carrier] socket_buffer
+... forced=false` line should reflect the kernel's own (autotuned) buffers, and
+the server's `write_block_duration` events should drop sharply.
+
 ## QUIC Runtime Behavior
 
 The Portal:
@@ -244,7 +270,7 @@ authentication succeeds or fails.
 | `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
 | `NOW_MAX_PENDING_FLOW_PAIRS` | `1024` | Maximum pending asymmetric flow pairs per session. |
 | `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Timeout for an unmatched flow half. |
-| `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
+| `NOW_TCP_DATA_BUF_SIZE` | `65536` | Buffer size for each TCP relay direction (read chunk + write_all unit). |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |
 | `NOW_UDP_DIAL_TIMEOUT` | `15s` | UDP target connection timeout. |

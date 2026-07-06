@@ -30,9 +30,11 @@ const BLOCK_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 /// The drain now ticks every `DRAIN_IDLE_TICK` and resets its idle budget
 /// whenever bytes keep flowing; it only gives up after `DRAIN_IDLE_TIMEOUT` of
 /// continuous silence. So a slow-but-steady download drains to completion, and
-/// a parked keep-alive connection is released promptly.
+/// a parked keep-alive connection is released promptly. 30s of total silence
+/// is the upper bound: long enough to ride out a slow-start stall on a high-RTT
+/// link, short enough that a parked keep-alive carrier does not linger.
 const DRAIN_IDLE_TICK: Duration = Duration::from_secs(5);
-const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-direction accounting returned to the caller so the `relay_end` summary
 /// can report how many bytes actually crossed each leg of the relay.

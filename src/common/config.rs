@@ -70,10 +70,14 @@ pub fn quic_max_streams() -> u32 {
 
 /// Per-direction TCP relay buffer size.
 pub fn tcp_data_buf_size() -> usize {
-    // Default raised from 32 KiB to 256 KiB so that high-BDP flows do not
-    // spend excessive time in small read/write syscalls. The value can still
-    // be overridden via the NOW_TCP_DATA_BUF_SIZE environment variable.
-    env_int("NOW_TCP_DATA_BUF_SIZE", 256 * 1024) as usize
+    // 64 KiB per direction. This is the size of each read from the source and
+    // each write_all to the sink in relay_stream. A too-large buffer (we
+    // previously used 256 KiB) makes every write_all potentially block for a
+    // full window's worth of bytes; on a back-pressured downlink that surfaced
+    // as repeated write_block_duration=1000ms bytes=262144 in the logs and
+    // collapsed aggregate throughput. 64 KiB keeps each write short while still
+    // amortizing syscall overhead. Override via NOW_TCP_DATA_BUF_SIZE.
+    env_int("NOW_TCP_DATA_BUF_SIZE", 64 * 1024) as usize
 }
 
 /// UDP relay receive buffer size.
