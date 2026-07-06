@@ -16,6 +16,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::handshake_timeout;
+use crate::common::tune_tcp_stream;
 use crate::protocol::{
     Carrier, FLOW_FRAME_MAGIC, FlowKind, FlowRole, is_uot_magic_target, read_auth_frame,
     read_flow_header, read_request,
@@ -53,6 +54,7 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
         .local_addr()
         .map(|address| address.to_string())
         .unwrap_or_else(|_| portal.endpoint_addr.clone());
+    tune_tcp_stream(&stream);
     let acceptor = TlsAcceptor::from(portal.tls_server_config.clone());
     let mut tls_stream = match timeout(handshake_timeout(), acceptor.accept(stream)).await {
         Ok(Ok(stream)) => stream,

@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use socket2::SockRef;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket, lookup_host};
 
 use super::DEFAULT_DIALER_IP;
@@ -64,6 +65,22 @@ pub async fn dial_tcp_from_local_ip(
     tokio::time::timeout(timeout, connect)
         .await
         .map_err(|_| anyhow!("common::util::dial_tcp_from_local_ip: dial timeout"))?
+}
+
+/// Target send/receive buffer size for TCP sockets. Large buffers are essential
+/// on high-BDP paths so that a single flow can keep the pipe full despite long
+/// RTTs. The OS caps this to its own configured maximum, so requesting 1 MiB is
+/// safe even on systems with smaller defaults.
+const TCP_SOCKET_BUFFER_SIZE: usize = 1 << 20;
+
+/// Applies best-effort TCP tuning to a connected stream: disables Nagle and
+/// requests large send/receive buffers. Errors are ignored because these are
+/// performance hints, not correctness requirements.
+pub fn tune_tcp_stream(stream: &TcpStream) {
+    let sock_ref = SockRef::from(stream);
+    let _ = sock_ref.set_recv_buffer_size(TCP_SOCKET_BUFFER_SIZE);
+    let _ = sock_ref.set_send_buffer_size(TCP_SOCKET_BUFFER_SIZE);
+    let _ = sock_ref.set_tcp_nodelay(true);
 }
 
 /// Opens a connected UDP socket, optionally binding it to a local IP first.
@@ -131,13 +148,17 @@ pub(super) async fn connect_tcp_addr(
         socket.bind(SocketAddr::new(ip, 0)).with_context(|| {
             format!("common::util::connect_tcp_addr: failed to bind local IP: {ip}")
         })?;
-        socket.connect(target).await.with_context(|| {
+        let stream = socket.connect(target).await.with_context(|| {
             format!("common::util::connect_tcp_addr: failed to dial from local IP: {ip}")
-        })
+        })?;
+        tune_tcp_stream(&stream);
+        Ok(stream)
     } else {
-        TcpStream::connect(target)
+        let stream = TcpStream::connect(target)
             .await
-            .with_context(|| "common::util::connect_tcp_addr: failed to dial target")
+            .with_context(|| "common::util::connect_tcp_addr: failed to dial target")?;
+        tune_tcp_stream(&stream);
+        Ok(stream)
     }
 }
 

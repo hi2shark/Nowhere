@@ -17,6 +17,6 @@ pub use config::{
     tcp_dial_timeout, tcp_read_timeout, udp_data_buf_size, udp_dial_timeout, udp_idle_timeout,
 };
 pub use logger::{LogLevel, Logger};
-pub use network::{bind_udp_addrs, dial_tcp_from_local_ip, dial_udp_from_local_ip};
+pub use network::{bind_udp_addrs, dial_tcp_from_local_ip, dial_udp_from_local_ip, tune_tcp_stream};
 pub(crate) use socks::{OutboundDialer, SocksConfig};
 pub use tls::{TLSMode, new_server_configs};
