@@ -80,7 +80,7 @@ Environment:
   NOW_TCP_READ_TIMEOUT     TCP half-close grace timeout.
   NOW_UDP_IDLE_TIMEOUT     QUIC and DATAGRAM/UoT flow idle timeout.
   NOW_HANDSHAKE_TIMEOUT    Base authentication deadline before jitter.
-  NOW_REPORT_INTERVAL      Local CHECK_POINT and LINK_STATUS event interval.
+  NOW_REPORT_INTERVAL      Local CHECK_POINT and LINK_STATUS report interval.
   NOW_SHUTDOWN_TIMEOUT     Graceful shutdown wait.
   NOW_RELOAD_INTERVAL      Minimum PEM certificate reload interval.";
 

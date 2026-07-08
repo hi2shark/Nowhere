@@ -25,7 +25,7 @@ pub(super) async fn event_loop(portal: Arc<PortalInner>, shutdown: CancellationT
             portal.stats.udp_rx.load(Ordering::Relaxed),
             portal.stats.udp_tx.load(Ordering::Relaxed),
         ));
-        portal.logger.event(format_args!(
+        portal.logger.debug(format_args!(
             "LINK_STATUS|TCP={}|UDP={}|PAIRS={}|UPTCP={}|UPUDP={}|DOWNTCP={}|DOWNUDP={}",
             portal.stats.link_tcp.load(Ordering::Relaxed),
             portal.stats.link_udp.load(Ordering::Relaxed),
