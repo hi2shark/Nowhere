@@ -75,7 +75,7 @@ CHECK_POINT|MODE=0|PING=0ms|POOL=<n>|TCPS=<n>|UDPS=<n>|TCPRX=<bytes>|TCPTX=<byte
 remains fixed in v1. `NOW_REPORT_INTERVAL` controls only local record emission;
 it does not send transport keepalive packets.
 
-Carrier health and routing counters are emitted separately:
+At debug log level, carrier health and routing counters are emitted separately:
 
 ```text
 LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>

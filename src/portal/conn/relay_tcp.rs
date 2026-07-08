@@ -13,7 +13,10 @@ use crate::portal::pairing::PairedTcp;
 use crate::protocol::Carrier;
 
 use super::stream::relay_stream;
-use super::{SessionGuard, paired_exchange_path, symmetric_exchange_path};
+use super::{
+    SessionGuard, TCP_EXCHANGE_COMPLETE, TCP_EXCHANGE_STARTING, paired_exchange_path,
+    symmetric_exchange_path,
+};
 
 /// Dials a TCP target and relays bytes between the client stream and target.
 pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
@@ -48,8 +51,9 @@ pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
         .local_addr()
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    portal.logger.info(format_args!(
-        "portal::conn::relay_tcp_target: exchange starting: {}",
+    portal.logger.debug(format_args!(
+        "portal::conn::relay_tcp_target: {}: {}",
+        TCP_EXCHANGE_STARTING,
         symmetric_exchange_path(carrier, &peer, &local, &target_local, &target_addr)
     ));
 
@@ -64,11 +68,13 @@ pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
     )
     .await;
     match result {
-        Ok(()) => portal.logger.info(format_args!(
-            "portal::conn::relay_tcp_target: exchange complete: relay_stream: EOF"
+        Ok(()) => portal.logger.debug(format_args!(
+            "portal::conn::relay_tcp_target: {}: relay_stream: EOF",
+            TCP_EXCHANGE_COMPLETE
         )),
-        Err(err) => portal.logger.info(format_args!(
-            "portal::conn::relay_tcp_target: exchange complete: relay_stream: {err}"
+        Err(err) => portal.logger.debug(format_args!(
+            "portal::conn::relay_tcp_target: {}: relay_stream: {err}",
+            TCP_EXCHANGE_COMPLETE
         )),
     }
 }
@@ -103,8 +109,9 @@ pub(in crate::portal) async fn relay_paired_tcp(portal: Arc<PortalInner>, paired
         .local_addr()
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    portal.logger.info(format_args!(
-        "portal::conn::relay_paired_tcp: exchange starting: {}",
+    portal.logger.debug(format_args!(
+        "portal::conn::relay_paired_tcp: {}: {}",
+        TCP_EXCHANGE_STARTING,
         paired_exchange_path(
             uplink,
             &uplink_path,
@@ -125,11 +132,13 @@ pub(in crate::portal) async fn relay_paired_tcp(portal: Arc<PortalInner>, paired
     )
     .await;
     match result {
-        Ok(()) => portal.logger.info(format_args!(
-            "portal::conn::relay_paired_tcp: exchange complete: relay_stream: EOF"
+        Ok(()) => portal.logger.debug(format_args!(
+            "portal::conn::relay_paired_tcp: {}: relay_stream: EOF",
+            TCP_EXCHANGE_COMPLETE
         )),
-        Err(err) => portal.logger.info(format_args!(
-            "portal::conn::relay_paired_tcp: exchange complete: {err}"
+        Err(err) => portal.logger.debug(format_args!(
+            "portal::conn::relay_paired_tcp: {}: {err}",
+            TCP_EXCHANGE_COMPLETE
         )),
     }
 }

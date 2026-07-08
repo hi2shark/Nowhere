@@ -571,8 +571,8 @@ shown in v1.
 `NOW_REPORT_INTERVAL` controls only this local telemetry schedule. It does not
 control QUIC keepalive traffic.
 
-The Portal also emits carrier-level absolute counters without changing
-`CHECK_POINT`:
+At debug log level, the Portal also emits carrier-level absolute counters
+without changing `CHECK_POINT`:
 
 ```text
 LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>

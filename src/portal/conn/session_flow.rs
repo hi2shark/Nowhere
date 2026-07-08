@@ -13,8 +13,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{UDP_FRAME_SCRATCH_SIZE, udp_dial_timeout, udp_idle_timeout};
-use crate::protocol::append_frame_payload;
+use crate::protocol::{Carrier, append_frame_payload};
 
+use super::super::relay::{UDP_TRANSFER_COMPLETE, UDP_TRANSFER_STARTING, symmetric_exchange_path};
 use super::PortalSession;
 
 const UDP_FLOW_QUEUE_DATAGRAMS: usize = 64;
@@ -134,24 +135,40 @@ impl PortalUdpFlow {
                 }
             }
         };
+        let target_local = socket
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let path = session.link_path();
+        session.portal.logger.debug(format_args!(
+            "portal::conn::udp_flow: {}: {}",
+            UDP_TRANSFER_STARTING,
+            symmetric_exchange_path(
+                Carrier::Udp,
+                &path.peer,
+                &path.local,
+                &target_local,
+                self.key.target(),
+            )
+        ));
         let mut buf = session.portal.buffers.get_udp_buffer();
         let mut frame_buf = Vec::with_capacity(UDP_FRAME_SCRATCH_SIZE);
         let mut last_used = Instant::now();
 
-        loop {
+        let complete_reason = loop {
             let deadline = last_used + udp_idle_timeout();
             tokio::select! {
-                _ = self.cancel.cancelled() => break,
+                _ = self.cancel.cancelled() => break "cancelled".to_string(),
                 datagram = receiver.recv() => {
                     let Some(datagram) = datagram else {
-                        break;
+                        break "request channel closed".to_string();
                     };
                     last_used = Instant::now();
                     if let Some(limiter) = &session.portal.rate_limiter {
                         limiter.wait_read(datagram.payload.len() as i64).await;
                     }
                     if self.is_closed() {
-                        break;
+                        break "closed".to_string();
                     }
                     match socket.send(&datagram.payload).await {
                         Ok(n) => {
@@ -163,7 +180,7 @@ impl PortalUdpFlow {
                                 "portal::conn::udp_flow: failed to write target {}: {err}",
                                 self.key.target()
                             ));
-                            break;
+                            break format!("target write error: {err}");
                         }
                     }
                 }
@@ -171,13 +188,10 @@ impl PortalUdpFlow {
                     let n = match read {
                         Ok(n) => n,
                         Err(err) => {
-                            if !self.is_closed() {
-                                session.portal.logger.debug(format_args!(
-                                    "portal::conn::udp_flow: failed to read target {}: {err}",
-                                    self.key.target()
-                                ));
+                            if self.is_closed() {
+                                break "closed".to_string();
                             }
-                            break;
+                            break format!("target read error: {err}");
                         }
                     };
                     if n == 0 {
@@ -190,7 +204,7 @@ impl PortalUdpFlow {
                         limiter.wait_write(n as i64).await;
                     }
                     if self.is_closed() {
-                        break;
+                        break "closed".to_string();
                     }
                     match session.conn.send_datagram(Bytes::copy_from_slice(&frame_buf)) {
                         Ok(()) => {
@@ -198,22 +212,20 @@ impl PortalUdpFlow {
                             session.portal.stats.down_udp.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Err(err) => {
-                            session.portal.logger.debug(format_args!(
-                                "portal::conn::udp_flow: failed to send response: {err}"
-                            ));
+                            break format!("client write error: {err}");
                         }
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    session.portal.logger.debug(format_args!(
-                        "portal::conn::udp_flow: flow expired: {}",
-                        self.key.target()
-                    ));
-                    break;
+                    break "idle timeout".to_string();
                 }
             }
-        }
+        };
         self.close().await;
+        session.portal.logger.debug(format_args!(
+            "portal::conn::udp_flow: {}: {complete_reason}",
+            UDP_TRANSFER_COMPLETE
+        ));
     }
 
     /// Closes the flow, removes it from the session map, and updates counters.
