@@ -86,6 +86,14 @@ impl Drop for SessionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use url::Url;
+
+    use crate::common::{LogLevel, Logger};
+    use crate::portal::Portal;
+
+    use self::stream::{RelayFirstEof, relay_stream};
 
     #[test]
     fn paired_path_contains_both_carriers_and_both_client_links() {
@@ -122,5 +130,57 @@ mod tests {
             ),
             "UP[UDP] 198.51.100.1:1000 -> 192.0.2.1:2077 -> 192.0.2.1:3000 -> target.test:443 | DOWN[UDP] target.test:443 -> 192.0.2.1:3000 -> 192.0.2.1:2077 -> 198.51.100.1:1000"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_reports_directional_summary_when_client_finishes_first() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (mut target, _) = target_listener.accept().await.unwrap();
+            let mut request = [0; 4];
+            target.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            target.write_all(b"pong").await.unwrap();
+            let _ = target.shutdown().await;
+        });
+
+        let portal = Portal::new(
+            Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
+            Logger::new(LogLevel::None, false),
+        )
+        .unwrap();
+        let target_conn = TcpStream::connect(target_addr).await.unwrap();
+        let (client, relay) = tokio::io::duplex(1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut relay_read, mut relay_write) = tokio::io::split(relay);
+
+        let relay_task = tokio::spawn(async move {
+            relay_stream(
+                portal.inner,
+                &mut relay_read,
+                &mut relay_write,
+                target_conn,
+                vec![0; 8],
+                vec![0; 8],
+                Some((Carrier::Tcp, Carrier::Tcp)),
+            )
+            .await
+            .unwrap()
+        });
+
+        client_write.write_all(b"ping").await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = [0; 4];
+        client_read.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+
+        let summary = relay_task.await.unwrap();
+        assert_eq!(summary.client_to_target_bytes, 4);
+        assert_eq!(summary.target_to_client_bytes, 4);
+        assert_eq!(summary.first_eof, RelayFirstEof::Client);
+
+        target_task.await.unwrap();
     }
 }
