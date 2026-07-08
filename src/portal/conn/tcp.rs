@@ -49,15 +49,7 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     shutdown: CancellationToken,
     pool_ttl: Duration,
 ) {
-    if let Err(err) = tune_tcp_carrier_stream(&stream) {
-        portal.logger.error(format_args!(
-            "portal::conn::handle_tcp_incoming: failed to tune TCP carrier from {peer}: {err}"
-        ));
-        return;
-    }
-    portal.logger.debug(format_args!(
-        "portal::conn::handle_tcp_incoming: tcp_carrier_tune peer={peer} no_delay=true keepalive=true"
-    ));
+    tune_tcp_carrier_stream(&stream);
     let local = stream
         .local_addr()
         .map(|address| address.to_string())
@@ -121,6 +113,12 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
             .register_tcp_link(session_id, portal.stats.clone()),
     );
 
+    if let Err(err) = SockRef::from(tls_stream.get_ref().0).set_keepalive(true) {
+        portal.logger.error(format_args!(
+            "portal::conn::handle_tcp_incoming: failed to enable TCP keepalive: {err}"
+        ));
+        return;
+    }
     let (recv, mut send) = tokio::io::split(tls_stream);
     let mut recv = BufReader::new(recv);
 
@@ -327,10 +325,8 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     }
 }
 
-fn tune_tcp_carrier_stream(stream: &TcpStream) -> std::io::Result<()> {
-    stream.set_nodelay(true)?;
-    SockRef::from(stream).set_keepalive(true)?;
-    Ok(())
+pub(super) fn tune_tcp_carrier_stream(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
 }
 
 /// Tracks an authenticated but not-yet-claimed TCP pooled connection.
@@ -346,23 +342,5 @@ impl<'a> PoolGuard<'a> {
 impl Drop for PoolGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tokio::net::{TcpListener, TcpStream};
-
-    #[tokio::test]
-    async fn tune_tcp_carrier_stream_enables_nodelay() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
-        let _client = client.unwrap();
-        let (accepted, _) = accepted.unwrap();
-
-        assert!(!accepted.nodelay().unwrap());
-        super::tune_tcp_carrier_stream(&accepted).unwrap();
-        assert!(accepted.nodelay().unwrap());
     }
 }

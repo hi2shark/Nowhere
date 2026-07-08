@@ -64,15 +64,11 @@ pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
     )
     .await;
     match result {
-        Ok(summary) => portal.logger.info(format_args!(
-            "portal::conn::relay_tcp_target: relay_end close_reason=EOF close_source={} c2t_bytes={} t2c_bytes={} target={}",
-            summary.first_eof.as_str(),
-            summary.client_to_target_bytes,
-            summary.target_to_client_bytes,
-            target_addr,
+        Ok(()) => portal.logger.info(format_args!(
+            "portal::conn::relay_tcp_target: exchange complete: relay_stream: EOF"
         )),
         Err(err) => portal.logger.info(format_args!(
-            "portal::conn::relay_tcp_target: relay_end close_reason=error error={err} target={target_addr}"
+            "portal::conn::relay_tcp_target: exchange complete: relay_stream: {err}"
         )),
     }
 }
@@ -129,26 +125,11 @@ pub(in crate::portal) async fn relay_paired_tcp(portal: Arc<PortalInner>, paired
     )
     .await;
     match result {
-        Ok(summary) => portal.logger.info(format_args!(
-            "portal::conn::relay_paired_tcp: relay_end close_reason=EOF close_source={} c2t_bytes={} t2c_bytes={} target={} uplink={} downlink={}",
-            summary.first_eof.as_str(),
-            summary.client_to_target_bytes,
-            summary.target_to_client_bytes,
-            target_addr,
-            carrier_label(uplink),
-            carrier_label(downlink),
+        Ok(()) => portal.logger.info(format_args!(
+            "portal::conn::relay_paired_tcp: exchange complete: relay_stream: EOF"
         )),
         Err(err) => portal.logger.info(format_args!(
-            "portal::conn::relay_paired_tcp: relay_end close_reason=error error={err} target={target_addr} uplink={} downlink={}",
-            carrier_label(uplink),
-            carrier_label(downlink),
+            "portal::conn::relay_paired_tcp: exchange complete: {err}"
         )),
-    }
-}
-
-fn carrier_label(carrier: Carrier) -> &'static str {
-    match carrier {
-        Carrier::Tcp => "tcp",
-        Carrier::Udp => "udp",
     }
 }
