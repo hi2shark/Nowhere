@@ -86,8 +86,11 @@ impl Drop for SessionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
     use url::Url;
 
     use crate::common::{LogLevel, Logger};
@@ -182,5 +185,97 @@ mod tests {
         assert_eq!(summary.first_eof, RelayFirstEof::Client);
 
         target_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_stream_flushes_target_to_client_writes_before_eof() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let (release_target, wait_release) = oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let (mut target, _) = target_listener.accept().await.unwrap();
+            target.write_all(b"chunk").await.unwrap();
+            let _ = wait_release.await;
+            let _ = target.shutdown().await;
+        });
+
+        let portal = Portal::new(
+            Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
+            Logger::new(LogLevel::None, false),
+        )
+        .unwrap();
+        let target_conn = TcpStream::connect(target_addr).await.unwrap();
+        let mut relay_read = tokio::io::empty();
+        let (flushed, wait_flushed) = oneshot::channel();
+        let mut client_write = FlushSignalWriter::new(flushed);
+
+        let relay_task = tokio::spawn(async move {
+            relay_stream(
+                portal.inner,
+                &mut relay_read,
+                &mut client_write,
+                target_conn,
+                vec![0; 8],
+                vec![0; 8],
+                Some((Carrier::Tcp, Carrier::Tcp)),
+            )
+            .await
+            .unwrap()
+        });
+
+        let flushed = tokio::time::timeout(std::time::Duration::from_millis(250), wait_flushed)
+            .await
+            .expect("relay did not flush target_to_client write before target EOF")
+            .unwrap();
+        assert_eq!(flushed, b"chunk");
+
+        let _ = release_target.send(());
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.target_to_client_bytes, 5);
+
+        target_task.await.unwrap();
+    }
+
+    struct FlushSignalWriter {
+        buffered: Vec<u8>,
+        flushed: Option<oneshot::Sender<Vec<u8>>>,
+    }
+
+    impl FlushSignalWriter {
+        fn new(flushed: oneshot::Sender<Vec<u8>>) -> Self {
+            Self {
+                buffered: Vec::new(),
+                flushed: Some(flushed),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushSignalWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.buffered.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(flushed) = self.flushed.take() {
+                let buffered = std::mem::take(&mut self.buffered);
+                let _ = flushed.send(buffered);
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 }

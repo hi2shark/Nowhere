@@ -82,6 +82,9 @@ where
             let started = Instant::now();
             target_write.write_all(&buffer1[..n]).await?;
             log_block_duration(&portal, "write", "client_to_target", started, n);
+            let started = Instant::now();
+            target_write.flush().await?;
+            log_block_duration(&portal, "flush", "client_to_target", started, n);
         }
     };
 
@@ -100,6 +103,9 @@ where
             let started = Instant::now();
             client_write.write_all(&buffer2[..n]).await?;
             log_block_duration(&portal, "write", "target_to_client", started, n);
+            let started = Instant::now();
+            client_write.flush().await?;
+            log_block_duration(&portal, "flush", "target_to_client", started, n);
             target_to_client_bytes.fetch_add(n as u64, Ordering::Relaxed);
             portal.stats.tcp_tx.fetch_add(n as u64, Ordering::Relaxed);
             if let Some((_, downlink)) = carriers {
