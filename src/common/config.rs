@@ -10,8 +10,6 @@ use std::time::Duration;
 pub const DEFAULT_DIALER_IP: &str = "auto";
 /// Default disabled Mbps limit for inbound and outbound relay directions.
 pub const DEFAULT_RATE_LIMIT: i32 = 0;
-/// Scratch capacity used while attaching UDP payloads to cached frame headers.
-pub const UDP_FRAME_SCRATCH_SIZE: usize = 2048;
 
 /// Reads a non-negative integer from the environment, falling back on invalid input.
 pub fn env_int(name: &str, default_value: i32) -> i32 {

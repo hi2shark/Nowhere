@@ -4,6 +4,7 @@
 //! UDP datagram frame encoding and decoding.
 
 use anyhow::{Result, bail};
+use bytes::{Bytes, BytesMut};
 
 use super::spec::{EffectiveProtocolSpec, PROXY_FRAME_VERSION, UdpFrameElement};
 use super::util::{TARGET_LEN_MAX, check_target_len, validate_target};
@@ -348,6 +349,14 @@ pub fn append_frame_payload(dst: &mut Vec<u8>, header: &[u8], payload: &[u8]) {
     dst.reserve(header.len() + payload.len());
     dst.extend_from_slice(header);
     dst.extend_from_slice(payload);
+}
+
+/// Builds `header || payload` directly in the owned buffer passed to QUIC.
+pub fn frame_payload_bytes(header: &[u8], payload: &[u8]) -> Bytes {
+    let mut frame = BytesMut::with_capacity(header.len() + payload.len());
+    frame.extend_from_slice(header);
+    frame.extend_from_slice(payload);
+    frame.freeze()
 }
 
 #[cfg(test)]

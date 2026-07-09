@@ -33,6 +33,15 @@ async fn packet_frame_round_trips_and_reports_eof() {
     assert_eq!(read_uot_packet(&mut reader).await.unwrap(), None);
 }
 
+#[tokio::test]
+async fn packet_writer_matches_encoded_frame() {
+    let mut out = Vec::new();
+
+    write_uot_packet(&mut out, b"abc").await.unwrap();
+
+    assert_eq!(out, write_uot_packet_frame(b"abc").unwrap());
+}
+
 #[test]
 fn rejects_invalid_setup_target() {
     assert!(write_uot_setup_frame("example.com").is_err());

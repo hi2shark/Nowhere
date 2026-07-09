@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Instant, timeout};
 
@@ -14,7 +15,7 @@ use crate::portal::PortalInner;
 use crate::portal::pairing::PairedUdp;
 use crate::protocol::{
     Carrier, DATAGRAM_UDP_COMPACT_CLOSE, DATAGRAM_UDP_DATA, DATAGRAM_UDP_OPEN_ACK,
-    encode_udp_compact, read_uot_packet, read_uot_setup_target, write_uot_packet_frame,
+    encode_udp_compact, read_uot_packet, read_uot_setup_target, write_uot_packet,
 };
 
 use super::{
@@ -114,16 +115,7 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
                 if let Some(limiter) = &portal.rate_limiter {
                     limiter.wait_write(n as i64).await;
                 }
-                let frame = match write_uot_packet_frame(&target_buf[..n]) {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        portal.logger.error(format_args!(
-                            "portal::conn::relay_udp_over_tcp_target: failed to frame response: {err}"
-                        ));
-                        break format!("response frame error: {err}");
-                    }
-                };
-                if let Err(err) = client_write.write_all(&frame).await {
+                if let Err(err) = write_uot_packet(client_write, &target_buf[..n]).await {
                     break format!("client write error: {err}");
                 }
                 portal.stats.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
@@ -255,12 +247,12 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
 
 async fn read_paired_udp(
     uplink: &mut crate::portal::pairing::UdpUp,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<Option<Bytes>> {
     match uplink {
-        crate::portal::pairing::UdpUp::Tcp(reader) => read_uot_packet(reader).await,
-        crate::portal::pairing::UdpUp::Quic(receiver) => {
-            Ok(receiver.recv().await.map(|bytes| bytes.to_vec()))
+        crate::portal::pairing::UdpUp::Tcp(reader) => {
+            Ok(read_uot_packet(reader).await?.map(Bytes::from))
         }
+        crate::portal::pairing::UdpUp::Quic(receiver) => Ok(receiver.recv().await),
     }
 }
 
@@ -295,7 +287,7 @@ async fn send_paired_udp(
 ) -> anyhow::Result<()> {
     match downlink {
         crate::portal::pairing::UdpDown::Tcp(writer) => {
-            writer.write_all(&write_uot_packet_frame(payload)?).await?;
+            write_uot_packet(writer, payload).await?;
         }
         crate::portal::pairing::UdpDown::Quic(conn) => {
             let frame = encode_udp_compact(DATAGRAM_UDP_DATA, flow_id, payload)?;

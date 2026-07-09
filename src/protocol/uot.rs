@@ -4,7 +4,8 @@
 //! UDP-over-TCP control and packet framing.
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use bytes::Buf;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::util::{TARGET_LEN_MAX, check_target_len, validate_target};
 
@@ -41,16 +42,29 @@ pub async fn read_uot_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Opt
 
 /// Encodes one length-prefixed UoT packet.
 pub fn write_uot_packet_frame(payload: &[u8]) -> Result<Vec<u8>> {
-    if payload.len() > u16::MAX as usize {
-        bail!(
-            "protocol::uot::write_uot_packet_frame: payload too large: {}",
-            payload.len()
-        );
-    }
+    check_uot_packet_len("protocol::uot::write_uot_packet_frame", payload.len())?;
     let mut frame = Vec::with_capacity(2 + payload.len());
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// Writes one length-prefixed UoT packet without first concatenating a frame.
+pub async fn write_uot_packet<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
+    check_uot_packet_len("protocol::uot::write_uot_packet", payload.len())?;
+    let length = (payload.len() as u16).to_be_bytes();
+    let mut frame = Buf::chain(&length[..], payload);
+    writer
+        .write_all_buf(&mut frame)
+        .await
+        .context("protocol::uot::write_uot_packet: failed to write frame")
+}
+
+fn check_uot_packet_len(context: &str, len: usize) -> Result<()> {
+    if len > u16::MAX as usize {
+        bail!("{context}: payload too large: {len}");
+    }
+    Ok(())
 }
 
 async fn read_target_frame<R: AsyncRead + Unpin>(context: &str, reader: &mut R) -> Result<String> {

@@ -12,8 +12,8 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{UDP_FRAME_SCRATCH_SIZE, udp_dial_timeout, udp_idle_timeout};
-use crate::protocol::{Carrier, append_frame_payload};
+use crate::common::{udp_dial_timeout, udp_idle_timeout};
+use crate::protocol::{Carrier, frame_payload_bytes};
 
 use super::super::relay::{UDP_TRANSFER_COMPLETE, UDP_TRANSFER_STARTING, symmetric_exchange_path};
 use super::PortalSession;
@@ -152,7 +152,6 @@ impl PortalUdpFlow {
             )
         ));
         let mut buf = session.portal.buffers.get_udp_buffer();
-        let mut frame_buf = Vec::with_capacity(UDP_FRAME_SCRATCH_SIZE);
         let mut last_used = Instant::now();
 
         let complete_reason = loop {
@@ -198,15 +197,14 @@ impl PortalUdpFlow {
                         continue;
                     }
                     last_used = Instant::now();
-                    frame_buf.clear();
-                    append_frame_payload(&mut frame_buf, &response_header, &buf[..n]);
+                    let frame = frame_payload_bytes(&response_header, &buf[..n]);
                     if let Some(limiter) = &session.portal.rate_limiter {
                         limiter.wait_write(n as i64).await;
                     }
                     if self.is_closed() {
                         break "closed".to_string();
                     }
-                    match session.conn.send_datagram(Bytes::copy_from_slice(&frame_buf)) {
+                    match session.conn.send_datagram(frame) {
                         Ok(()) => {
                             session.portal.stats.udp_tx.fetch_add(n as u64, Ordering::Relaxed);
                             session.portal.stats.down_udp.fetch_add(n as u64, Ordering::Relaxed);

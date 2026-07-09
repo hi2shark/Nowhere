@@ -74,6 +74,13 @@ fn append_frame_payload_replaces_previous_contents() {
 }
 
 #[test]
+fn frame_payload_bytes_matches_appended_payload() {
+    let frame = frame_payload_bytes(&[1, 2], &[3, 4]);
+
+    assert_eq!(frame.as_ref(), [1, 2, 3, 4]);
+}
+
+#[test]
 fn compact_udp_open_data_and_data_round_trip() {
     assert_eq!(
         encode_udp_open_data(7, Carrier::Tcp, "a.test:53", b"q").unwrap(),
