@@ -3,6 +3,7 @@
 
 //! TCP/TLS ingress handling and first-request pool behavior.
 
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,9 +63,18 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     let mut tls_stream = match timeout(handshake_timeout(), acceptor.accept(stream)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
-            portal.logger.error(format_args!(
-                "portal::conn::handle_tcp_incoming: TLS handshake failed: {err}"
-            ));
+            if matches!(
+                err.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+            ) {
+                portal.logger.debug(format_args!(
+                    "portal::conn::handle_tcp_incoming: TLS client disconnected before handshake completed: {err}"
+                ));
+            } else {
+                portal.logger.error(format_args!(
+                    "portal::conn::handle_tcp_incoming: TLS handshake failed: {err}"
+                ));
+            }
             return;
         }
         Err(_) => {
