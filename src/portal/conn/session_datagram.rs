@@ -119,7 +119,7 @@ impl PortalSession {
                     });
                 if let Some((valid, sender, acked)) = existing {
                     if valid {
-                        let _ = sender.try_send(payload);
+                        self.enqueue_compact(&sender, payload, data.len());
                         if acked
                             && let Ok(frame) =
                                 encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])
@@ -149,7 +149,10 @@ impl PortalSession {
                         acked: acked.clone(),
                     },
                 );
-                let _ = sender.try_send(payload);
+                if !self.enqueue_compact(&sender, payload, data.len()) {
+                    self.compact_udp_flows.lock().await.remove(&flow_id);
+                    return;
+                }
                 let weak_session = Arc::downgrade(self);
                 let receiver = crate::portal::pairing::QuicUdpReceiver::new(receiver, move || {
                     let Some(session) = weak_session.upgrade() else {
@@ -230,7 +233,7 @@ impl PortalSession {
                     .map(|s| s.sender.clone());
                 if let Some(sender) = sender {
                     let payload_offset = payload.as_ptr() as usize - data.as_ptr() as usize;
-                    let _ = sender.try_send(data.slice(payload_offset..));
+                    self.enqueue_compact(&sender, data.slice(payload_offset..), data.len());
                 } else {
                     self.reject_compact_flow(flow_id).await;
                 }
@@ -342,7 +345,31 @@ impl PortalSession {
             .ok()
     }
 
+    fn enqueue_compact(
+        &self,
+        sender: &tokio::sync::mpsc::Sender<QueuedDatagram>,
+        payload: Bytes,
+        retained_bytes: usize,
+    ) -> bool {
+        let Some(budget) = self.try_reserve_udp_queue(retained_bytes) else {
+            self.warn_udp_drop("connection queue byte limit reached");
+            return false;
+        };
+        if sender
+            .try_send(QueuedDatagram::new(payload, budget))
+            .is_err()
+        {
+            self.warn_udp_drop("per-flow datagram queue is full");
+            return false;
+        }
+        true
+    }
+
     fn warn_udp_drop(&self, reason: &str) {
+        self.portal
+            .stats
+            .udp_dropped
+            .fetch_add(1, Ordering::Relaxed);
         if !self.udp_overload_logged.swap(true, Ordering::AcqRel) {
             self.portal.logger.warn(format_args!(
                 "portal::conn::datagram_loop: dropping UDP datagrams for {}: {reason}",

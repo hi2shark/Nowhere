@@ -47,15 +47,17 @@ pub(in crate::portal::conn) async fn relay_tcp_target<R, W>(
             return;
         }
     };
-    let target_local = target_conn
-        .local_addr()
-        .map(|address| address.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    portal.logger.debug(format_args!(
-        "portal::conn::relay_tcp_target: {}: {}",
-        TCP_EXCHANGE_STARTING,
-        symmetric_exchange_path(carrier, &peer, &local, &target_local, &target_addr)
-    ));
+    if portal.logger.debug_enabled() {
+        let target_local = target_conn
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        portal.logger.debug(format_args!(
+            "portal::conn::relay_tcp_target: {}: {}",
+            TCP_EXCHANGE_STARTING,
+            symmetric_exchange_path(carrier, &peer, &local, &target_local, &target_addr)
+        ));
+    }
 
     let result = relay_stream(
         portal.clone(),
@@ -105,22 +107,24 @@ pub(in crate::portal) async fn relay_paired_tcp(portal: Arc<PortalInner>, paired
             return;
         }
     };
-    let target_local = target_conn
-        .local_addr()
-        .map(|address| address.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    portal.logger.debug(format_args!(
-        "portal::conn::relay_paired_tcp: {}: {}",
-        TCP_EXCHANGE_STARTING,
-        paired_exchange_path(
-            uplink,
-            &uplink_path,
-            &target_local,
-            &target_addr,
-            downlink,
-            &downlink_path,
-        )
-    ));
+    if portal.logger.debug_enabled() {
+        let target_local = target_conn
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        portal.logger.debug(format_args!(
+            "portal::conn::relay_paired_tcp: {}: {}",
+            TCP_EXCHANGE_STARTING,
+            paired_exchange_path(
+                uplink,
+                &uplink_path,
+                &target_local,
+                &target_addr,
+                downlink,
+                &downlink_path,
+            )
+        ));
+    }
     let result = relay_stream(
         portal.clone(),
         &mut client_read,

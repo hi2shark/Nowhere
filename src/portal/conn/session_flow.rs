@@ -55,13 +55,13 @@ impl Hash for UdpFlowKey {
 }
 
 /// One queued client datagram and its share of the connection memory budget.
-pub(super) struct QueuedDatagram {
-    payload: Bytes,
+pub(in crate::portal) struct QueuedDatagram {
+    pub(in crate::portal) payload: Bytes,
     _budget: OwnedSemaphorePermit,
 }
 
 impl QueuedDatagram {
-    pub(super) fn new(payload: Bytes, budget: OwnedSemaphorePermit) -> Self {
+    pub(in crate::portal) fn new(payload: Bytes, budget: OwnedSemaphorePermit) -> Self {
         Self {
             payload,
             _budget: budget,
@@ -135,22 +135,24 @@ impl PortalUdpFlow {
                 }
             }
         };
-        let target_local = socket
-            .local_addr()
-            .map(|address| address.to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string());
-        let path = session.link_path();
-        session.portal.logger.debug(format_args!(
-            "portal::conn::udp_flow: {}: {}",
-            UDP_TRANSFER_STARTING,
-            symmetric_exchange_path(
-                Carrier::Udp,
-                &path.peer,
-                &path.local,
-                &target_local,
-                self.key.target(),
-            )
-        ));
+        if session.portal.logger.debug_enabled() {
+            let target_local = socket
+                .local_addr()
+                .map(|address| address.to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let path = session.link_path();
+            session.portal.logger.debug(format_args!(
+                "portal::conn::udp_flow: {}: {}",
+                UDP_TRANSFER_STARTING,
+                symmetric_exchange_path(
+                    Carrier::Udp,
+                    &path.peer,
+                    &path.local,
+                    &target_local,
+                    self.key.target(),
+                )
+            ));
+        }
         let mut buf = session.portal.buffers.get_udp_buffer();
         let mut last_used = Instant::now();
 

@@ -58,6 +58,11 @@ impl Logger {
         self.level.store(log_level as i32, Ordering::Relaxed);
     }
 
+    /// Returns whether debug messages are enabled at the current threshold.
+    pub fn debug_enabled(&self) -> bool {
+        self.enabled(LogLevel::Debug)
+    }
+
     /// Emits a debug message when the current threshold allows it.
     pub fn debug(&self, args: fmt::Arguments<'_>) {
         self.do_log(LogLevel::Debug, args);
@@ -87,8 +92,7 @@ impl Logger {
     pub fn flush(&self) {}
 
     fn do_log(&self, log_level: LogLevel, args: fmt::Arguments<'_>) {
-        let current = self.level.load(Ordering::Relaxed);
-        if current == LogLevel::None as i32 || (log_level as i32) < current {
+        if !self.enabled(log_level) {
             return;
         }
 
@@ -107,4 +111,13 @@ impl Logger {
             print!("{line}");
         }
     }
+
+    fn enabled(&self, log_level: LogLevel) -> bool {
+        let current = self.level.load(Ordering::Relaxed);
+        current != LogLevel::None as i32 && (log_level as i32) >= current
+    }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/logger.rs"]
+mod tests;

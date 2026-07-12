@@ -63,15 +63,17 @@ pub(in crate::portal::conn) async fn relay_udp_over_tcp_target<R, W>(
             return;
         }
     };
-    let target_local = socket
-        .local_addr()
-        .map(|address| address.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    portal.logger.debug(format_args!(
-        "portal::conn::relay_udp_over_tcp_target: {}: {}",
-        UDP_TRANSFER_STARTING,
-        symmetric_exchange_path(Carrier::Tcp, &peer, &local, &target_local, &target_addr)
-    ));
+    if portal.logger.debug_enabled() {
+        let target_local = socket
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        portal.logger.debug(format_args!(
+            "portal::conn::relay_udp_over_tcp_target: {}: {}",
+            UDP_TRANSFER_STARTING,
+            symmetric_exchange_path(Carrier::Tcp, &peer, &local, &target_local, &target_addr)
+        ));
+    }
 
     portal.stats.add_session(true);
     let _done = SessionGuard::new(portal.clone(), true);
@@ -158,22 +160,24 @@ pub(in crate::portal) async fn relay_paired_udp(portal: Arc<PortalInner>, paired
             return;
         }
     };
-    let target_local = socket
-        .local_addr()
-        .map(|address| address.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    portal.logger.debug(format_args!(
-        "portal::conn::relay_paired_udp: {}: {}",
-        UDP_TRANSFER_STARTING,
-        paired_exchange_path(
-            uplink_carrier,
-            &uplink_path,
-            &target_local,
-            &target_addr,
-            downlink_carrier,
-            &downlink_path,
-        )
-    ));
+    if portal.logger.debug_enabled() {
+        let target_local = socket
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        portal.logger.debug(format_args!(
+            "portal::conn::relay_paired_udp: {}: {}",
+            UDP_TRANSFER_STARTING,
+            paired_exchange_path(
+                uplink_carrier,
+                &uplink_path,
+                &target_local,
+                &target_addr,
+                downlink_carrier,
+                &downlink_path,
+            )
+        ));
+    }
     portal.stats.add_session(true);
     let _done = SessionGuard::new(portal.clone(), true);
     let mut ack_sent = false;
