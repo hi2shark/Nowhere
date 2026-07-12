@@ -575,7 +575,7 @@ At debug log level, the Portal also emits carrier-level absolute counters
 without changing `CHECK_POINT`:
 
 ```text
-LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>
+LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>|UDPDROP=<datagrams>
 ```
 
 ## 12. Runtime Controls
@@ -588,7 +588,8 @@ the v1 derivation or frame formats.
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams. |
 | `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
 | `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
-| `NOW_MAX_PENDING_FLOW_PAIRS` | `1024` | Maximum unpaired asymmetric flow records per session. |
+| `NOW_TCP_IDLE_POOL_CONNS` | `4096` | Maximum authenticated TLS/TCP connections waiting for a first request. |
+| `NOW_MAX_PENDING_PAIRS` | `1024` | Maximum unpaired asymmetric flow records per session. |
 | `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Lifetime of an unpaired flow half. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
@@ -603,9 +604,10 @@ the v1 derivation or frame formats.
 
 Duration values accept human-readable forms supported by the Portal, such as
 `500ms`, `15s`, or `2m`. Invalid values use the listed defaults.
-`NOW_QUIC_MAX_UDP_FLOWS` and `NOW_QUIC_UDP_QUEUE_BYTES` must be positive; zero
-or invalid values use their defaults and emit a warning. Other integer values
-must be non-negative; invalid or negative values use the listed defaults.
+`NOW_QUIC_MAX_UDP_FLOWS`, `NOW_QUIC_UDP_QUEUE_BYTES`, and
+`NOW_TCP_IDLE_POOL_CONNS` must be positive; zero or invalid values use
+their defaults and emit a warning. Other integer values must be non-negative;
+invalid or negative values use the listed defaults.
 
 ## 13. Interoperability Requirements
 
