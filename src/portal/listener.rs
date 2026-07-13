@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{shutdown_timeout, udp_idle_timeout};
+use crate::common::udp_idle_timeout;
 
 use super::{PortalInner, conn};
 
@@ -59,7 +59,8 @@ pub(super) async fn accept_endpoint_loop(
                 };
                 let portal = portal.clone();
                 let child_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                let tasks = portal.flow_tasks.clone();
+                tasks.spawn(async move {
                     conn::handle_incoming(portal, incoming, admission, child_shutdown).await;
                 });
             }
@@ -101,17 +102,9 @@ pub(super) async fn accept_tcp_loop(
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    let drained = tokio::time::timeout(shutdown_timeout(), async {
-        while connections.join_next().await.is_some() {}
-    })
-    .await
-    .is_ok();
-    if drained {
-        return;
-    }
-    // After the configured drain window, abort remaining connection tasks so
-    // shutdown completion is bounded.
-    connections.abort_all();
+    // The portal runtime owns the single absolute shutdown deadline. If this
+    // loop is aborted at that deadline, dropping the JoinSet aborts any
+    // remaining connection tasks.
     while connections.join_next().await.is_some() {}
 }
 

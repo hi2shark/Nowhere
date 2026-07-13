@@ -94,8 +94,9 @@ ClientHello handling after `NOW_RELOAD_INTERVAL` has elapsed.
 ## Stop
 
 Send `SIGINT` with `Ctrl-C`. The Portal closes listeners, closes active
-connections, waits up to `NOW_SHUTDOWN_TIMEOUT` for QUIC endpoints to become
-idle, resets active rate limiters, flushes the logger, and exits.
+connections, waits up to `NOW_SHUTDOWN_TIMEOUT` for QUIC endpoints and live
+flow tasks to become idle, resets active rate limiters, flushes the logger, and
+exits.
 
 ## Next Steps
 

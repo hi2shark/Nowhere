@@ -132,7 +132,10 @@ impl Portal {
                 tls_server_config,
                 quic_server_config,
                 unauthenticated_admission: Arc::new(admission::UnauthenticatedAdmission::new()),
-                pairing: Arc::new(super::pairing::PairingRegistry::new()),
+                pairing: Arc::new(super::pairing::PairingRegistry::new(
+                    udp_flow_limits.max_flows,
+                )),
+                flow_tasks: Arc::new(super::tasks::FlowTaskTracker::default()),
             }),
         })
     }

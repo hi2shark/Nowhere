@@ -11,6 +11,7 @@ mod mode;
 mod pairing;
 mod runtime;
 mod setup;
+mod tasks;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,6 +61,7 @@ struct PortalInner {
     quic_server_config: quinn::ServerConfig,
     unauthenticated_admission: Arc<admission::UnauthenticatedAdmission>,
     pairing: Arc<pairing::PairingRegistry>,
+    flow_tasks: Arc<tasks::FlowTaskTracker>,
 }
 
 #[cfg(test)]

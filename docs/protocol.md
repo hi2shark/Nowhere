@@ -233,7 +233,7 @@ After the QUIC handshake:
 3. The authentication frame binds the connection to a client-generated
    128-bit logical session ID.
 4. After successful authentication, each additional bidirectional stream may
-   carry one TCP relay or one half of an asymmetric flow.
+   carry one TCP data lane or one UDP setup/control lane for a logical flow.
 5. UDP relay traffic may use QUIC DATAGRAM frames for the lifetime of the
    authenticated connection.
 
@@ -253,17 +253,18 @@ For TLS/TCP, each proxy flow uses a new connection:
 
 1. The client completes TLS 1.3.
 2. The client sends exactly one v1 authentication frame.
-3. The client sends one v1 TCP request frame immediately or after keeping the
+3. The client sends one logical-flow header immediately or after keeping the
    authenticated connection idle in a client-side warm pool.
-4. A normal target selects TCP relay and all remaining bytes are raw
-   client-to-target TCP payload. The reserved target
-   `uot.nowhere.invalid:0` selects UoT and the client continues with the setup
-   and packet frames defined in Section 9.2.
+4. `FLOW_OPEN` and `FLOW_DUPLEX` are followed by the ordinary target request.
+   `FLOW_ATTACH` is header-only.
+5. A TCP flow continues with raw stream bytes. A UDP flow continues with the
+   typed UoT frames defined in Section 9.2.
 
 There is no authentication response, post-relay connection reuse, or
 multiplexing on the TCP transport. A pooled connection is consumed by its first
-request and carries exactly one TCP relay or one UoT flow. Connections sharing
-an authenticated session ID may form one asymmetric flow. The Portal never
+request and carries exactly one TCP relay or one UoT flow half. Connections
+sharing an authenticated session ID may contribute carrier halves to multiple
+asymmetric flows distinguished by `flow_id`. The Portal never
 associates them by source IP, so TCP and QUIC may arrive through different
 interfaces or NAT mappings. An authenticated connection that sends no request
 frame is closed after 40 seconds.
@@ -352,8 +353,9 @@ released as soon as authentication succeeds or fails.
 ## 8. TCP Relay
 
 Each TCP relay uses either one new bidirectional QUIC stream or one dedicated
-TLS/TCP connection. In both cases the client writes the same request frame,
-followed immediately by raw client-to-target TCP bytes.
+TLS/TCP connection. In both cases the client writes the common logical-flow
+header and, when required by its role, the same target request frame. Raw TCP
+payload follows on the uplink half.
 
 ### 8.1 Request Padding
 
@@ -392,21 +394,48 @@ server. The Portal then relays bytes in both directions. When one direction
 reaches EOF, the other direction may continue for at most
 `NOW_TCP_READ_TIMEOUT`.
 
-### 8.3 Asymmetric Flow Envelope
+### 8.3 Logical Flow Envelope
 
-An asymmetric flow prepends this fixed envelope to the ordinary request frame
-on both client-created halves:
+Every TCP and UDP logical flow begins with this fixed 14-byte envelope:
 
 ```text
 magic_f1 || version_u8(1) || role_u8 || flow_id_u64 ||
 kind_u8 || uplink_u8 || downlink_u8
 ```
 
-`role` is `1` for `FLOW_OPEN` and `2` for `FLOW_ATTACH`; `kind` is `1` for TCP
-and `2` for UDP; carriers use `1` for TLS/TCP and `2` for QUIC/UDP. The Portal
-keys pending halves by `(session_id, flow_id)`, requires identical metadata and
-target frames, and dials the target only after both halves arrive. Symmetric
-flows omit this envelope and retain their direct fast path.
+| Field | Value |
+| --- | --- |
+| `magic_f1` | `0xf1` |
+| `version` | `1` |
+| `role` | `1` = `FLOW_OPEN`, `2` = `FLOW_ATTACH`, `3` = `FLOW_DUPLEX` |
+| `kind` | `1` = TCP, `2` = UDP |
+| `uplink`, `downlink` | `1` = TLS/TCP, `2` = QUIC/UDP |
+
+`flow_id` MUST be nonzero and is unique within the authenticated logical
+session across both TCP and UDP. `FLOW_DUPLEX` requires equal carriers and is
+used for a symmetric flow. `FLOW_OPEN` and `FLOW_ATTACH` require different
+carriers and form the uplink and downlink halves of an asymmetric flow.
+
+`FLOW_OPEN` and `FLOW_DUPLEX` are followed by the target request from Section
+8.2. `FLOW_ATTACH` is followed by no target. The Portal keys ownership and
+pending halves by `(session_id, flow_id)`, requires identical kind and carrier
+metadata, and dials the target only after the complete logical flow exists.
+The receiver MUST NOT guess a legacy data plane from payload bytes; a flow
+without this envelope is invalid.
+
+The selected downlink returns a setup result before application downlink data:
+
+```text
+magic_f2(0xf2) || version_u8(1) || status_u8 || code_u8
+```
+
+`status=1` means `READY` and requires `code=0`. `status=2` means `REJECT` and
+uses code `1` through `7` for `INVALID_REQUEST`, `METADATA_CONFLICT`,
+`PAIR_TIMEOUT`, `FLOW_LIMIT`, `DIAL_FAILED`, `SESSION_REPLACED`, and
+`INTERNAL_ERROR`, respectively. TCP flows use this four-byte result on both
+carriers. UDP over TLS/TCP uses the equivalent typed UoT result from Section
+9.2. An asymmetric uplink does not receive a separate result; the client MUST
+wait for its selected downlink before exposing the combined logical flow.
 
 ## 9. UDP Relay
 
@@ -414,8 +443,8 @@ UDP relay has two transport-specific forms:
 
 - QUIC DATAGRAM multiplexes flows by `flow_id` on one authenticated QUIC
   connection and fragments packets that exceed the current DATAGRAM limit.
-- UoT carries one target flow as typed packet frames on one authenticated
-  TLS/TCP connection.
+- UoT carries one logical-flow half, or one symmetric Duplex flow, as typed
+  packet frames on one authenticated TLS/TCP connection.
 
 The forms share target validation, outbound UDP dialing, rate limits, idle
 timeouts, and UDP counters. Their wire frames are otherwise independent.
@@ -430,15 +459,13 @@ magic[4]("NOWU") || type_u8 || flow_id_u64
 
 | Type | Value | Body |
 | --- | --- | --- |
-| `OPEN_DATA` | `1` | `downlink_u8 || target_len_u16 || target || fragment_header || fragment` |
-| `OPEN_ACK` | `2` | Empty |
-| `DATA` | `3` | `fragment_header || fragment` |
-| `CLOSE` | `4` | Empty |
+| `DATA` | `1` | `fragment_header || fragment` |
+| `CLOSE` | `2` | Empty |
 
 The fragment header is:
 
 ```text
-packet_id_u16 || fragment_id_u8 || fragment_count_u8 || total_len_u16
+packet_id_u32 || fragment_id_u8 || fragment_count_u8 || total_len_u16
 ```
 
 `fragment_id` is zero-based and less than `fragment_count`, which is from 1
@@ -448,17 +475,19 @@ through 255. `total_len` is the original UDP payload length from 0 through
 
 The sender MUST split a packet so every encoded frame fits the connection's
 current maximum QUIC DATAGRAM size. All fragments of a packet use the same
-packet ID, count, total length, and, for `OPEN_DATA`, identical target and
-downlink metadata. The receiver reassembles the complete UDP packet before
-writing one datagram to the target or delivering one datagram to the client.
-Partial packets are bounded by the connection byte budget, a 64-slot cap, and a
-10-second lifetime.
+nonzero packet ID, count, and total length. The receiver reassembles the
+complete UDP packet before writing one datagram to the target or delivering one
+datagram to the client. Partial packets are bounded by the connection byte
+budget, a 64-slot cap, and a 10-second lifetime.
 
-Before receiving `OPEN_ACK`, each client packet uses `OPEN_DATA`; after the ACK,
-the client may use target-free `DATA`. Repeated matching `OPEN_DATA` is
-idempotent. If the Portal receives `DATA` for an unknown or expired flow, it
-returns `CLOSE`, and the client restores the flow with a later `OPEN_DATA`.
-Conflicting metadata for an existing flow is rejected.
+QUIC DATAGRAM never opens a flow and never carries a target. Before DATA, the
+client opens a reliable bidirectional control stream containing the logical
+flow header and any role-required target request, then finishes its send side.
+The selected downlink receives the four-byte flow result on that control
+stream. After `READY`, the control stream is no longer part of the data plane;
+DATA and CLOSE use DATAGRAM only. DATA for an unknown flow is ignored; it is
+never interpreted as setup and never blocks the receive loop on a response
+DATAGRAM.
 
 The Portal uses backpressured DATAGRAM submission so a newer frame cannot
 silently evict an older unsent frame from the local QUIC queue. If the path MTU
@@ -472,8 +501,9 @@ The Portal closes an inactive flow after `NOW_UDP_IDLE_TIMEOUT`.
 The reference Portal dispatches each flow independently. Target dialing,
 rate-limit waits, and target socket I/O for one flow do not block DATAGRAM
 dispatch to other flows. Each flow queues at most 64 client datagrams. New
-requests are dropped when that queue, the per-connection queued-byte budget, or
-the per-connection flow limit is full; already accepted requests remain FIFO.
+requests are dropped when that queue or the per-QUIC-connection queued-byte
+budget is full; already accepted requests remain FIFO. New UDP flow setup is
+rejected when the authenticated logical session's shared flow limit is full.
 
 Malformed frames, invalid fragment metadata, conflicting duplicate fragments,
 and unknown types are not forwarded. The former derived-order UDP format and
@@ -481,30 +511,17 @@ the earlier compact `0x11..0x14` format are not accepted.
 
 ### 9.2 UDP-over-TCP (UoT)
 
-UoT is available only on an authenticated TLS/TCP connection. It is selected
-by sending the ordinary spec-derived TCP request frame from Section 8 with this
-reserved target:
+UoT is available only on an authenticated TLS/TCP connection. The common
+logical-flow header selects UDP with `kind=2`; `FLOW_OPEN` and `FLOW_DUPLEX` are
+then followed by the ordinary target request from Section 8.2, while
+`FLOW_ATTACH` remains header-only. There is no reserved target or second setup
+target.
 
-```text
-uot.nowhere.invalid:0
-```
-
-The reserved target is a protocol switch and MUST NOT be treated as a TCP
-destination. Its request frame uses the same derived field order and
-deterministic padding as every other TCP request.
-
-Immediately after that request, the client MUST send exactly one setup frame:
-
-```text
-target_len_u16 || target_utf8
-```
-
-`target_len_u16` MUST be from 1 through 512, and `target_utf8` MUST satisfy
-Section 10. The Portal bounds reading the complete setup target by
-`NOW_HANDSHAKE_TIMEOUT`. It then resolves the target and opens one connected UDP
-socket, optionally binding its source address according to `dial`. With SOCKS5
-enabled, it instead creates a per-flow UDP ASSOCIATE, keeps the associated TCP
-control connection open, and sends the target in each SOCKS5 UDP packet.
+After a complete logical flow exists, the Portal resolves the target and opens
+one connected UDP socket, optionally binding its source address according to
+`dial`. With SOCKS5 enabled, it instead creates a per-flow UDP ASSOCIATE, keeps
+the associated TCP control connection open, and sends the target in each
+SOCKS5 UDP packet.
 
 After setup, both directions consist only of typed frames:
 
@@ -515,25 +532,26 @@ kind_u8 || payload_len_u16 || payload
 | Kind | Value | Meaning |
 | --- | --- | --- |
 | `DATA` | `1` | One complete UDP packet; an empty payload is valid. |
-| `OPEN_ACK` | `2` | An empty asymmetric-flow acknowledgement. |
+| `READY` | `2` | Empty setup success on the selected downlink. |
 | `CLOSE` | `3` | An empty explicit close notification. |
+| `REJECT` | `4` | Exactly one flow error-code byte from Section 8.3. |
 
-`payload_len_u16` is from 0 through 65535. Control frames MUST have zero length.
-Each `DATA` frame represents exactly one UDP packet, so implementations MUST
-preserve frame and packet boundaries. UoT has no flow ID. One TLS/TCP connection
-carries one target flow; clients use separate connections for different
-concurrent targets.
+`payload_len_u16` is from 0 through 65535. `READY` and `CLOSE` MUST have zero
+length; `REJECT` MUST have length one. Each `DATA` frame represents exactly one
+UDP packet, so implementations MUST preserve frame and packet boundaries. One
+TLS/TCP connection carries one logical-flow half; clients use separate
+connections for different concurrent targets.
 
 Traffic in either direction refreshes `NOW_UDP_IDLE_TIMEOUT`. Clean TCP EOF,
 truncated or invalid framing, a target socket error, the idle timeout, or
 service shutdown closes the UoT flow. Payload bytes are charged to `rate` and
-`etar` and recorded in the UDP counters. The typed frame headers, setup
-frame, authentication frame, and request frame are not counted as UDP payload.
+`etar` and recorded in the UDP counters. The flow header, target request,
+typed-frame headers, and authentication frame are not counted as UDP payload.
 
 ## 10. Target Encoding
 
-TCP requests, QUIC `OPEN_DATA` frames, and UoT setup frames use the same target
-representation. `target_utf8` MUST:
+The target request following `FLOW_OPEN` or `FLOW_DUPLEX` uses one common target
+representation for every kind and carrier. `target_utf8` MUST:
 
 - be valid UTF-8;
 - have a byte length in `1..512`;
@@ -594,11 +612,11 @@ the v1 derivation or frame formats.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams. |
-| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum active UDP flows involving one authenticated QUIC session, across symmetric and asymmetric carriers. |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum active UDP flows per authenticated logical session, across QUIC DATAGRAM, UoT, and asymmetric carrier combinations. |
 | `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued and partially reassembled UDP payload bytes per authenticated QUIC connection. |
 | `NOW_TCP_IDLE_POOL_CONNS` | `4096` | Maximum authenticated TLS/TCP connections waiting for a first request. |
-| `NOW_MAX_PENDING_PAIRS` | `1024` | Maximum unpaired asymmetric flow records per session. |
-| `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Lifetime of an unpaired flow half. |
+| `NOW_MAX_PENDING_PAIRS` | `1024` | Maximum pending logical-flow records (`flow_id` values) per session. |
+| `NOW_FLOW_PAIR_TIMEOUT` | `15s` | Time allowed to complete a split logical flow. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |
@@ -607,7 +625,7 @@ the v1 derivation or frame formats.
 | `NOW_UDP_IDLE_TIMEOUT` | `120s` | QUIC idle timeout and QUIC DATAGRAM/UoT flow idle timeout. |
 | `NOW_HANDSHAKE_TIMEOUT` | `5s` | Base for the single jittered authentication deadline. |
 | `NOW_REPORT_INTERVAL` | `5s` | Local event interval. |
-| `NOW_SHUTDOWN_TIMEOUT` | `5s` | Endpoint idle wait during shutdown. |
+| `NOW_SHUTDOWN_TIMEOUT` | `5s` | Single graceful drain window shared by endpoints, accept loops, and flow tasks. |
 | `NOW_RELOAD_INTERVAL` | `3600s` | Minimum interval between PEM reload attempts. |
 
 Duration values accept human-readable forms supported by the Portal, such as
@@ -632,8 +650,8 @@ traffic is processed.
 
 A conforming implementation MUST reject malformed or truncated frames, invalid
 field lengths, unsupported versions, incorrect deterministic padding, invalid
-authentication tags, trailing authentication-stream bytes, and invalid UoT
-setup or packet frames. It MUST bound all allocations using the limits in this
+authentication tags, trailing authentication-stream bytes, and invalid flow or
+UoT packet frames. It MUST bound all allocations using the limits in this
 document.
 
 The v1 derivation, labels, field-order algorithm, integer encodings, and frame
@@ -653,13 +671,13 @@ An implementation should verify at least the following cases:
    different authentication tags.
 6. Different specs produce their own authentication constants, padding, and
    layouts.
-7. Authentication, TCP request, fixed UDP fragment, UoT setup, and typed UoT
-   encoders round-trip through their decoders.
+7. Authentication, flow header/result, TCP request, fixed UDP fragment, and
+   typed UoT encoders round-trip through their decoders.
 8. Wrong versions, target lengths, padding lengths, padding bytes, frame types,
    and tags are rejected.
 9. The authentication stream is rejected if any byte follows the valid frame.
-10. A TLS/TCP request for `uot.nowhere.invalid:0` switches to UoT, preserves UDP
-    packet boundaries in both directions, and records the flow as UDP.
+10. A TLS/TCP logical flow with `kind=UDP` uses typed UoT, preserves UDP packet
+    boundaries in both directions, and records the flow as UDP.
 
 For the following fixed inputs:
 

@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use crate::protocol::{Carrier, UdpFragment};
+use crate::protocol::UdpFragment;
 
 const UDP_REASSEMBLY_SLOTS: usize = 64;
 const UDP_REASSEMBLY_TTL: Duration = Duration::from_secs(10);
@@ -31,17 +31,10 @@ impl QueuedDatagram {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct OpenMetadata {
-    pub(super) downlink: Carrier,
-    pub(super) target: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ReassemblyKey {
     flow_id: u64,
-    packet_id: u16,
-    is_open: bool,
+    packet_id: u32,
 }
 
 struct ReassemblySlot {
@@ -50,7 +43,7 @@ struct ReassemblySlot {
     total_len: u16,
     fragments: Vec<Option<Bytes>>,
     received: usize,
-    metadata: Option<OpenMetadata>,
+    retained_bytes: usize,
     budget: OwnedSemaphorePermit,
 }
 
@@ -60,7 +53,6 @@ pub(super) enum ReassemblyOutcome {
     },
     Complete {
         datagram: QueuedDatagram,
-        metadata: Option<OpenMetadata>,
         evicted_partial: bool,
     },
     Dropped(&'static str),
@@ -72,19 +64,24 @@ pub(super) struct UdpReassembler {
 }
 
 impl UdpReassembler {
+    pub(super) fn expire(&mut self, now: Instant) -> bool {
+        self.evict_expired(now)
+    }
+
+    pub(super) fn remove_flow(&mut self, flow_id: u64) {
+        self.slots.retain(|key, _| key.flow_id != flow_id);
+    }
+
     pub(super) fn push(
         &mut self,
         flow_id: u64,
         fragment: UdpFragment<'_>,
         payload: Bytes,
-        metadata: Option<OpenMetadata>,
         budget: Arc<Semaphore>,
     ) -> ReassemblyOutcome {
-        let is_open = metadata.is_some();
         let key = ReassemblyKey {
             flow_id,
             packet_id: fragment.packet_id,
-            is_open,
         };
         if fragment.fragment_count == 1 {
             let Some(permit) = reserve_packet_budget(budget, fragment.total_len) else {
@@ -92,7 +89,6 @@ impl UdpReassembler {
             };
             return ReassemblyOutcome::Complete {
                 datagram: QueuedDatagram::new(payload, permit),
-                metadata,
                 evicted_partial: false,
             };
         }
@@ -101,8 +97,7 @@ impl UdpReassembler {
         let mut evicted_partial = self.evict_expired(now);
         if let Some(slot) = self.slots.get(&key)
             && (slot.fragment_count != fragment.fragment_count
-                || slot.total_len != fragment.total_len
-                || slot.metadata != metadata)
+                || slot.total_len != fragment.total_len)
         {
             return ReassemblyOutcome::Dropped("conflicting UDP fragment metadata");
         }
@@ -128,7 +123,7 @@ impl UdpReassembler {
                     total_len: fragment.total_len,
                     fragments: vec![None; fragment.fragment_count as usize],
                     received: 0,
-                    metadata,
+                    retained_bytes: 0,
                     budget: permit,
                 },
             );
@@ -142,8 +137,14 @@ impl UdpReassembler {
                 return ReassemblyOutcome::Dropped("conflicting duplicate UDP fragment");
             }
         } else {
+            let retained_bytes = slot.retained_bytes.saturating_add(payload.len());
+            if retained_bytes > slot.total_len as usize {
+                self.slots.remove(&key);
+                return ReassemblyOutcome::Dropped("UDP fragments exceed total length");
+            }
             slot.fragments[index] = Some(payload);
             slot.received += 1;
+            slot.retained_bytes = retained_bytes;
         }
         if slot.received < slot.fragment_count as usize {
             return ReassemblyOutcome::Pending { evicted_partial };
@@ -162,7 +163,6 @@ impl UdpReassembler {
         }
         ReassemblyOutcome::Complete {
             datagram: QueuedDatagram::new(payload.freeze(), slot.budget),
-            metadata: slot.metadata,
             evicted_partial,
         }
     }

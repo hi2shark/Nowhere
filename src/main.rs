@@ -69,11 +69,11 @@ SOCKS5 outbound:
 
 Environment:
   NOW_QUIC_MAX_STREAMS      Maximum authenticated QUIC streams.
-  NOW_QUIC_MAX_UDP_FLOWS    Maximum UDP flows involving one QUIC session.
+  NOW_QUIC_MAX_UDP_FLOWS    Maximum UDP flows per authenticated logical session.
   NOW_QUIC_UDP_QUEUE_BYTES  Maximum queued/reassembling UDP bytes per QUIC connection.
   NOW_TCP_IDLE_POOL_CONNS   Maximum authenticated idle TLS/TCP connections.
-  NOW_MAX_PENDING_PAIRS     Maximum unmatched asymmetric flow halves per session.
-  NOW_FLOW_PAIR_TIMEOUT     Timeout for matching asymmetric flow halves.
+  NOW_MAX_PENDING_PAIRS     Maximum pending logical-flow IDs per session.
+  NOW_FLOW_PAIR_TIMEOUT     Timeout for completing a split logical flow.
   NOW_TCP_DATA_BUF_SIZE     TCP relay buffer size.
   NOW_UDP_DATA_BUF_SIZE     UDP target receive buffer size.
   NOW_TCP_DIAL_TIMEOUT      TCP target dial timeout.

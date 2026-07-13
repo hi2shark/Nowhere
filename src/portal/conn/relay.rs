@@ -17,9 +17,7 @@ use crate::portal::pairing::LinkPath;
 use crate::protocol::Carrier;
 
 pub(in crate::portal) use self::tcp::relay_paired_tcp;
-pub(super) use self::tcp::relay_tcp_target;
 pub(in crate::portal) use self::uot::relay_paired_udp;
-pub(super) use self::uot::relay_udp_over_tcp_target;
 
 pub(in crate::portal::conn) const TCP_EXCHANGE_STARTING: &str = "exchange starting";
 pub(in crate::portal::conn) const TCP_EXCHANGE_COMPLETE: &str = "exchange complete";
@@ -49,6 +47,7 @@ fn paired_exchange_path(
     )
 }
 
+#[cfg(test)]
 pub(in crate::portal::conn) fn symmetric_exchange_path(
     carrier: Carrier,
     peer: &str,
@@ -65,8 +64,8 @@ pub(in crate::portal::conn) fn symmetric_exchange_path(
 
 fn carrier_name(carrier: Carrier) -> &'static str {
     match carrier {
-        Carrier::Tcp => "TCP",
-        Carrier::Udp => "UDP",
+        Carrier::TlsTcp => "TCP",
+        Carrier::Quic => "UDP",
     }
 }
 

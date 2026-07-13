@@ -15,9 +15,9 @@ port. It does not restrict the Portal to one proxy payload type.
 | `udp` | QUIC/UDP | Bidirectional QUIC stream | QUIC DATAGRAM |
 | `mix` | Both | Both paths | Both paths |
 
-UoT uses the reserved request target `uot.nowhere.invalid:0`, followed by one
-target setup frame and typed UDP packet/control frames. It is part of the v1 wire
-protocol and requires no separate server option.
+UoT uses the same logical-flow header as every other carrier, followed by the
+role-dependent target request and typed UDP packet/control frames. It is part
+of the v1 wire protocol and requires no separate server option.
 
 ## Documents
 

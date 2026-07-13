@@ -17,11 +17,11 @@ fn paired_path_contains_both_carriers_and_both_client_links() {
     };
     assert_eq!(
         paired_exchange_path(
-            Carrier::Tcp,
+            Carrier::TlsTcp,
             &uplink,
             "192.0.2.1:3000",
             "target.test:443",
-            Carrier::Udp,
+            Carrier::Quic,
             &downlink,
         ),
         "UP[TCP] 198.51.100.1:1000 -> 192.0.2.1:2077 -> 192.0.2.1:3000 -> target.test:443 | DOWN[UDP] target.test:443 -> 192.0.2.1:3000 -> [2001:db8::1]:2077 -> [2001:db8::2]:2000"
@@ -32,7 +32,7 @@ fn paired_path_contains_both_carriers_and_both_client_links() {
 fn symmetric_path_uses_the_same_carrier_prefix() {
     assert_eq!(
         symmetric_exchange_path(
-            Carrier::Udp,
+            Carrier::Quic,
             "198.51.100.1:1000",
             "192.0.2.1:2077",
             "192.0.2.1:3000",

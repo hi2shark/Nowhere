@@ -6,20 +6,13 @@
 use super::*;
 
 #[tokio::test]
-async fn setup_target_frame_round_trips() {
-    let frame = write_uot_setup_frame("example.com:53").unwrap();
-    let mut reader = frame.as_slice();
-
-    assert_eq!(
-        read_uot_setup_target(&mut reader).await.unwrap(),
-        "example.com:53"
-    );
-}
-
-#[tokio::test]
-async fn typed_frames_distinguish_empty_data_ack_close_and_eof() {
+async fn typed_frames_distinguish_empty_data_ready_reject_close_and_eof() {
     let mut bytes = encode_udp_stream_frame(UDP_STREAM_DATA, b"").unwrap();
-    bytes.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_OPEN_ACK, b"").unwrap());
+    bytes.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_READY, b"").unwrap());
+    bytes.extend_from_slice(
+        &encode_udp_stream_frame(UDP_STREAM_REJECT, &[FlowErrorCode::MetadataConflict as u8])
+            .unwrap(),
+    );
     bytes.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_CLOSE, b"").unwrap());
     let mut reader = bytes.as_slice();
 
@@ -29,13 +22,33 @@ async fn typed_frames_distinguish_empty_data_ack_close_and_eof() {
     );
     assert_eq!(
         read_udp_stream_frame(&mut reader).await.unwrap(),
-        Some(UdpStreamFrame::OpenAck)
+        Some(UdpStreamFrame::Ready)
+    );
+    assert_eq!(
+        read_udp_stream_frame(&mut reader).await.unwrap(),
+        Some(UdpStreamFrame::Reject(FlowErrorCode::MetadataConflict))
     );
     assert_eq!(
         read_udp_stream_frame(&mut reader).await.unwrap(),
         Some(UdpStreamFrame::Close)
     );
     assert_eq!(read_udp_stream_frame(&mut reader).await.unwrap(), None);
+}
+
+#[test]
+fn fixed_control_vectors_match_the_swift_codec() {
+    assert_eq!(
+        encode_udp_stream_frame(UDP_STREAM_READY, b"").unwrap(),
+        [2, 0, 0]
+    );
+    assert_eq!(
+        encode_udp_stream_frame(UDP_STREAM_CLOSE, b"").unwrap(),
+        [3, 0, 0]
+    );
+    assert_eq!(
+        encode_udp_stream_frame(UDP_STREAM_REJECT, &[5]).unwrap(),
+        [4, 0, 1, 5]
+    );
 }
 
 #[tokio::test]
@@ -50,24 +63,21 @@ async fn stream_writer_matches_encoded_frame() {
     );
 }
 
+#[tokio::test]
+async fn truncated_length_is_an_error_not_a_panic() {
+    for bytes in [vec![UDP_STREAM_DATA], vec![UDP_STREAM_DATA, 0]] {
+        let mut reader = bytes.as_slice();
+        assert!(read_udp_stream_frame(&mut reader).await.is_err());
+    }
+}
+
 #[test]
 fn rejects_invalid_stream_frames() {
     assert!(encode_udp_stream_frame(9, b"").is_err());
-    assert!(encode_udp_stream_frame(UDP_STREAM_OPEN_ACK, b"bad").is_err());
+    assert!(encode_udp_stream_frame(UDP_STREAM_READY, b"bad").is_err());
+    assert!(encode_udp_stream_frame(UDP_STREAM_REJECT, b"").is_err());
+    assert!(encode_udp_stream_frame(UDP_STREAM_REJECT, &[0]).is_err());
+    assert!(encode_udp_stream_frame(UDP_STREAM_REJECT, &[8]).is_err());
+    assert!(encode_udp_stream_frame(UDP_STREAM_REJECT, &[1, 2]).is_err());
     assert!(encode_udp_stream_frame(UDP_STREAM_DATA, &vec![0; u16::MAX as usize + 1]).is_err());
-}
-
-#[test]
-fn rejects_invalid_setup_target() {
-    assert!(write_uot_setup_frame("example.com").is_err());
-}
-
-#[tokio::test]
-async fn rejects_oversized_setup_target() {
-    let target = format!("{}:53", "a".repeat(510));
-    let mut frame = Vec::with_capacity(2 + target.len());
-    frame.extend_from_slice(&(target.len() as u16).to_be_bytes());
-    frame.extend_from_slice(target.as_bytes());
-    let mut reader = frame.as_slice();
-    assert!(read_uot_setup_target(&mut reader).await.is_err());
 }
