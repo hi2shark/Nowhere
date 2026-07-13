@@ -19,7 +19,7 @@ mod state;
 
 pub(super) use self::link::{guarded_reader, guarded_writer};
 pub(super) use self::state::{
-    BoxReader, BoxWriter, CompactAck, LinkHalf, LinkPath, PairedTcp, PairedUdp, QuicUdpReceiver,
+    BoxReader, BoxWriter, LinkHalf, LinkPath, PairedTcp, PairedUdp, QuicUdpReceiver, UdpAck,
     UdpDown, UdpHalf, UdpUp,
 };
 use self::state::{FlowKey, LinkCounts, Metadata, PendingTcp, PendingUdp};
@@ -254,7 +254,8 @@ impl PairingRegistry {
             },
             uplink: None,
             downlink: None,
-            compact_ack: None,
+            udp_ack: None,
+            flow_permit: None,
             uplink_path: None,
             downlink_path: None,
             uplink_generation: None,
@@ -269,7 +270,8 @@ impl PairingRegistry {
             pending.uplink = None;
             pending.uplink_path = None;
             pending.uplink_generation = None;
-            pending.compact_ack = None;
+            pending.udp_ack = None;
+            pending.flow_permit = None;
         }
         if pending.metadata.downlink == crate::protocol::Carrier::Udp
             && pending.downlink_generation != active_generation
@@ -282,7 +284,8 @@ impl PairingRegistry {
             FlowRole::Open => {
                 let UdpHalf::Uplink {
                     uplink,
-                    compact_ack,
+                    udp_ack,
+                    flow_permit,
                 } = half
                 else {
                     bail!("portal::pairing: missing UDP uplink half");
@@ -290,8 +293,12 @@ impl PairingRegistry {
                 if pending.uplink.is_some() {
                     bail!("portal::pairing: duplicate or missing UDP uplink half");
                 }
+                if (metadata.uplink == crate::protocol::Carrier::Udp) != flow_permit.is_some() {
+                    bail!("portal::pairing: invalid UDP flow permit ownership");
+                }
                 pending.uplink = Some(uplink);
-                pending.compact_ack = compact_ack;
+                pending.udp_ack = udp_ack;
+                pending.flow_permit = flow_permit;
                 pending.uplink_path = Some(path);
                 pending.uplink_generation = quic_generation;
             }
@@ -311,6 +318,25 @@ impl PairingRegistry {
         pending.epoch = pending_epoch;
         if pending.uplink.is_some() && pending.downlink.is_some() {
             let mut complete = guard.remove(&key).expect("UDP pair exists");
+            let flow_permit = if complete.metadata.uplink == crate::protocol::Carrier::Tcp
+                && complete.metadata.downlink == crate::protocol::Carrier::Udp
+            {
+                let budget = links
+                    .get(&session_id)
+                    .and_then(|counts| counts.udp.as_ref())
+                    .ok_or_else(|| anyhow::anyhow!("portal::pairing: missing active QUIC link"))?
+                    .udp_flow_budget
+                    .clone();
+                Some(Arc::new(budget.try_acquire_owned().map_err(|_| {
+                    anyhow::anyhow!("portal::pairing: UDP flow limit reached")
+                })?))
+            } else {
+                Some(
+                    complete.flow_permit.take().ok_or_else(|| {
+                        anyhow::anyhow!("portal::pairing: missing UDP flow permit")
+                    })?,
+                )
+            };
             drop(links);
             return Ok(Some(PairedUdp {
                 flow_id: header.flow_id,
@@ -324,7 +350,8 @@ impl PairingRegistry {
                     .downlink_path
                     .take()
                     .expect("UDP downlink path paired"),
-                compact_ack: complete.compact_ack.take(),
+                udp_ack: complete.udp_ack.take(),
+                _flow_permit: flow_permit,
             }));
         }
         drop(links);

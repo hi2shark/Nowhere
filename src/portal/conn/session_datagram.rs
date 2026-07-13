@@ -5,22 +5,18 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
-    Carrier, CompactUdpFrame, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_COMPACT_CLOSE,
-    DATAGRAM_UDP_OPEN_ACK, DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, FlowHeader, FlowKind,
-    FlowRole, decode_udp_compact, decode_udp_datagram_parts, encode_udp_compact,
-    new_udp_datagram_header,
+    Carrier, FlowHeader, FlowKind, FlowRole, UDP_FRAME_CLOSE, UDP_FRAME_OPEN_ACK, UdpFragment,
+    UdpFrame, decode_udp_frame, encode_udp_control,
 };
 
-use super::flow::{PortalUdpFlow, QueuedDatagram, UdpFlowKey};
-use super::{CompactUdpState, PortalSession};
+use super::flow::{OpenMetadata, ReassemblyOutcome};
+use super::{PortalSession, QueuedDatagram, UdpState};
 
 impl PortalSession {
     /// Consumes pending and live QUIC datagrams for this authenticated session.
@@ -51,314 +47,239 @@ impl PortalSession {
     }
 
     async fn handle_datagram(self: &Arc<Self>, data: Bytes) {
-        if data.get(1).is_some_and(|kind| matches!(*kind, 0x11..=0x14)) {
-            self.handle_compact_datagram(data).await;
-            return;
-        }
-        let decoded = match decode_udp_datagram_parts(&data, &self.portal.credentials.protocol_spec)
-        {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                self.portal.logger.debug(format_args!(
-                    "portal::conn::datagram_loop: failed to decode datagram: {err}"
-                ));
-                return;
-            }
-        };
-
-        if decoded.frame_type == DATAGRAM_UDP_CLOSE {
-            self.close_udp_flow(decoded.flow_id, decoded.target_addr)
-                .await;
-            return;
-        }
-        if decoded.frame_type != DATAGRAM_UDP_REQUEST {
-            return;
-        }
-
-        let retained_bytes = data.len();
-        let payload = data.slice(decoded.payload_offset..);
-        self.handle_udp_request(
-            decoded.flow_id,
-            decoded.target_addr,
-            payload,
-            retained_bytes,
-        )
-        .await;
-    }
-
-    async fn handle_compact_datagram(self: &Arc<Self>, data: Bytes) {
-        let frame = match decode_udp_compact(&data) {
+        let frame = match decode_udp_frame(&data) {
             Ok(frame) => frame,
             Err(err) => {
                 self.portal.logger.debug(format_args!(
-                    "portal::conn::datagram_loop: invalid compact UDP frame: {err}"
+                    "portal::conn::datagram_loop: invalid UDP frame: {err}"
                 ));
                 return;
             }
         };
         match frame {
-            CompactUdpFrame::OpenData {
+            UdpFrame::OpenData {
                 flow_id,
                 downlink,
                 target,
-                payload,
+                fragment,
             } => {
-                let payload_offset = payload.as_ptr() as usize - data.as_ptr() as usize;
-                let payload = data.slice(payload_offset..);
-                let existing = self
-                    .compact_udp_flows
-                    .lock()
-                    .await
-                    .get(&flow_id)
-                    .map(|state| {
-                        (
-                            state.target == target && state.downlink == downlink,
-                            state.sender.clone(),
-                            state.acked.load(Ordering::Acquire),
-                        )
-                    });
-                if let Some((valid, sender, acked)) = existing {
-                    if valid {
-                        self.enqueue_compact(&sender, payload, data.len());
-                        if acked
-                            && let Ok(frame) =
-                                encode_udp_compact(DATAGRAM_UDP_OPEN_ACK, flow_id, &[])
-                        {
-                            let _ = self.conn.send_datagram(Bytes::from(frame));
-                        }
-                    } else {
-                        drop(sender);
-                        self.reject_compact_flow(flow_id).await;
-                    }
-                    return;
-                }
-                if self.compact_udp_flows.lock().await.len()
-                    >= self.portal.udp_flow_limits.max_flows
-                {
-                    self.warn_udp_drop("compact flow limit reached");
-                    return;
-                }
-                let (sender, receiver) = tokio::sync::mpsc::channel(64);
-                let acked = Arc::new(AtomicBool::new(false));
-                self.compact_udp_flows.lock().await.insert(
+                self.handle_udp_fragment(
                     flow_id,
-                    CompactUdpState {
-                        target: target.clone(),
-                        downlink,
-                        sender: sender.clone(),
-                        acked: acked.clone(),
-                    },
-                );
-                if !self.enqueue_compact(&sender, payload, data.len()) {
-                    self.compact_udp_flows.lock().await.remove(&flow_id);
-                    return;
-                }
-                let weak_session = Arc::downgrade(self);
-                let receiver = crate::portal::pairing::QuicUdpReceiver::new(receiver, move || {
-                    let Some(session) = weak_session.upgrade() else {
-                        return;
-                    };
-                    tokio::spawn(async move {
-                        session.compact_udp_flows.lock().await.remove(&flow_id);
-                    });
-                });
-                let paired = if downlink == Carrier::Udp {
-                    let path = self.link_path();
-                    Some(crate::portal::pairing::PairedUdp {
-                        flow_id,
-                        target,
-                        uplink: crate::portal::pairing::UdpUp::Quic(receiver),
-                        downlink: crate::portal::pairing::UdpDown::Quic(self.conn.clone()),
-                        uplink_carrier: Carrier::Udp,
-                        downlink_carrier: Carrier::Udp,
-                        uplink_path: path.clone(),
-                        downlink_path: path,
-                        compact_ack: Some(crate::portal::pairing::CompactAck {
-                            conn: self.conn.clone(),
-                            acked,
-                        }),
-                    })
-                } else {
-                    let header = FlowHeader {
-                        role: FlowRole::Open,
-                        flow_id,
-                        kind: FlowKind::Udp,
-                        uplink: Carrier::Udp,
-                        downlink,
-                    };
-                    match self
-                        .portal
-                        .pairing
-                        .submit_udp(
-                            self.session_id,
-                            header,
-                            target,
-                            crate::portal::pairing::LinkHalf::quic(
-                                self.link_path(),
-                                self.quic_generation(),
-                            ),
-                            crate::portal::pairing::UdpHalf::Uplink {
-                                uplink: crate::portal::pairing::UdpUp::Quic(receiver),
-                                compact_ack: Some(crate::portal::pairing::CompactAck {
-                                    conn: self.conn.clone(),
-                                    acked,
-                                }),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(paired) => paired,
-                        Err(err) => {
-                            self.portal.logger.error(format_args!(
-                                "portal::conn::datagram_loop: failed to pair UDP flow: {err}"
-                            ));
-                            self.reject_compact_flow(flow_id).await;
-                            None
-                        }
-                    }
-                };
-                if let Some(paired) = paired {
-                    tokio::spawn(super::super::relay::relay_paired_udp(
-                        self.portal.clone(),
-                        paired,
-                    ));
-                }
+                    fragment,
+                    Some(OpenMetadata { downlink, target }),
+                )
+                .await;
             }
-            CompactUdpFrame::Data { flow_id, payload } => {
-                let sender = self
-                    .compact_udp_flows
-                    .lock()
-                    .await
-                    .get(&flow_id)
-                    .map(|s| s.sender.clone());
-                if let Some(sender) = sender {
-                    let payload_offset = payload.as_ptr() as usize - data.as_ptr() as usize;
-                    self.enqueue_compact(&sender, data.slice(payload_offset..), data.len());
-                } else {
-                    self.reject_compact_flow(flow_id).await;
-                }
+            UdpFrame::Data { flow_id, fragment } => {
+                self.handle_udp_fragment(flow_id, fragment, None).await;
             }
-            CompactUdpFrame::Close { flow_id } => {
-                self.compact_udp_flows.lock().await.remove(&flow_id);
-                self.portal
-                    .pairing
-                    .cancel_udp(self.session_id, flow_id)
-                    .await;
-            }
-            CompactUdpFrame::OpenAck { .. } => {}
+            UdpFrame::Close { flow_id } => self.close_udp_flow(flow_id).await,
+            UdpFrame::OpenAck { .. } => {}
         }
     }
 
-    async fn reject_compact_flow(&self, flow_id: u64) {
-        self.compact_udp_flows.lock().await.remove(&flow_id);
+    async fn handle_udp_fragment(
+        self: &Arc<Self>,
+        flow_id: u64,
+        fragment: UdpFragment<'_>,
+        metadata: Option<OpenMetadata>,
+    ) {
+        // Copy only the fragment body. Retaining the complete QUIC DATAGRAM would
+        // let repeated OPEN metadata bypass the packet-byte budget.
+        let payload = Bytes::copy_from_slice(fragment.payload);
+        let outcome = self.udp_reassembler.lock().await.push(
+            flow_id,
+            fragment,
+            payload,
+            metadata,
+            self.udp_queue_budget.clone(),
+        );
+        match outcome {
+            ReassemblyOutcome::Pending { evicted_partial } => {
+                if evicted_partial {
+                    self.warn_udp_drop("incomplete UDP packet evicted");
+                }
+            }
+            ReassemblyOutcome::Dropped(reason) => self.warn_udp_drop(reason),
+            ReassemblyOutcome::Complete {
+                datagram,
+                metadata,
+                evicted_partial,
+            } => {
+                if evicted_partial {
+                    self.warn_udp_drop("incomplete UDP packet evicted");
+                }
+                if let Some(metadata) = metadata {
+                    self.handle_udp_open(flow_id, metadata, datagram).await;
+                } else {
+                    self.handle_udp_data(flow_id, datagram).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_udp_open(
+        self: &Arc<Self>,
+        flow_id: u64,
+        metadata: OpenMetadata,
+        datagram: QueuedDatagram,
+    ) {
+        let existing = self.udp_flows.lock().await.get(&flow_id).map(|state| {
+            (
+                state.target == metadata.target && state.downlink == metadata.downlink,
+                state.sender.clone(),
+                state.acked.load(Ordering::Acquire),
+            )
+        });
+        if let Some((valid, sender, acked)) = existing {
+            if !valid {
+                self.reject_udp_flow(flow_id).await;
+                return;
+            }
+            self.enqueue_udp(&sender, datagram);
+            if acked {
+                let _ = self.send_udp_control(UDP_FRAME_OPEN_ACK, flow_id).await;
+            }
+            return;
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(flow_permit) = self.udp_flow_budget.clone().try_acquire_owned() else {
+            self.warn_udp_drop("per-session UDP flow limit reached");
+            return;
+        };
+        let flow_permit = Arc::new(flow_permit);
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let acked = Arc::new(AtomicBool::new(false));
+        self.udp_flows.lock().await.insert(
+            flow_id,
+            UdpState {
+                target: metadata.target.clone(),
+                downlink: metadata.downlink,
+                sender: sender.clone(),
+                acked: acked.clone(),
+                _flow_permit: flow_permit.clone(),
+            },
+        );
+        if !self.enqueue_udp(&sender, datagram) {
+            self.udp_flows.lock().await.remove(&flow_id);
+            return;
+        }
+
+        let weak_session = Arc::downgrade(self);
+        let receiver = crate::portal::pairing::QuicUdpReceiver::new(receiver, move || {
+            let Some(session) = weak_session.upgrade() else {
+                return;
+            };
+            tokio::spawn(async move {
+                session.udp_flows.lock().await.remove(&flow_id);
+            });
+        });
+        let paired = if metadata.downlink == Carrier::Udp {
+            let path = self.link_path();
+            Some(crate::portal::pairing::PairedUdp {
+                flow_id,
+                target: metadata.target,
+                uplink: crate::portal::pairing::UdpUp::Quic(receiver),
+                downlink: crate::portal::pairing::UdpDown::Quic(self.conn.clone()),
+                uplink_carrier: Carrier::Udp,
+                downlink_carrier: Carrier::Udp,
+                uplink_path: path.clone(),
+                downlink_path: path,
+                udp_ack: Some(crate::portal::pairing::UdpAck {
+                    conn: self.conn.clone(),
+                    acked,
+                }),
+                _flow_permit: Some(flow_permit),
+            })
+        } else {
+            let header = FlowHeader {
+                role: FlowRole::Open,
+                flow_id,
+                kind: FlowKind::Udp,
+                uplink: Carrier::Udp,
+                downlink: metadata.downlink,
+            };
+            match self
+                .portal
+                .pairing
+                .submit_udp(
+                    self.session_id,
+                    header,
+                    metadata.target,
+                    crate::portal::pairing::LinkHalf::quic(
+                        self.link_path(),
+                        self.quic_generation(),
+                    ),
+                    crate::portal::pairing::UdpHalf::Uplink {
+                        uplink: crate::portal::pairing::UdpUp::Quic(receiver),
+                        udp_ack: Some(crate::portal::pairing::UdpAck {
+                            conn: self.conn.clone(),
+                            acked,
+                        }),
+                        flow_permit: Some(flow_permit),
+                    },
+                )
+                .await
+            {
+                Ok(paired) => paired,
+                Err(err) => {
+                    self.portal.logger.error(format_args!(
+                        "portal::conn::datagram_loop: failed to pair UDP flow: {err}"
+                    ));
+                    self.reject_udp_flow(flow_id).await;
+                    None
+                }
+            }
+        };
+        if let Some(paired) = paired {
+            tokio::spawn(super::super::relay::relay_paired_udp(
+                self.portal.clone(),
+                paired,
+            ));
+        }
+    }
+
+    async fn handle_udp_data(&self, flow_id: u64, datagram: QueuedDatagram) {
+        let sender = self
+            .udp_flows
+            .lock()
+            .await
+            .get(&flow_id)
+            .map(|state| state.sender.clone());
+        if let Some(sender) = sender {
+            self.enqueue_udp(&sender, datagram);
+        } else {
+            self.reject_udp_flow(flow_id).await;
+        }
+    }
+
+    async fn close_udp_flow(&self, flow_id: u64) {
+        self.udp_flows.lock().await.remove(&flow_id);
         self.portal
             .pairing
             .cancel_udp(self.session_id, flow_id)
             .await;
-        if let Ok(frame) = encode_udp_compact(DATAGRAM_UDP_COMPACT_CLOSE, flow_id, &[]) {
-            let _ = self.conn.send_datagram(Bytes::from(frame));
-        }
     }
 
-    async fn close_udp_flow(&self, flow_id: u64, target_addr: String) {
-        let key = UdpFlowKey::new(flow_id, target_addr);
-        let flow = self.udp_flows.lock().await.get(&key).cloned();
-        if let Some(flow) = flow {
-            flow.close().await;
-        }
+    async fn reject_udp_flow(&self, flow_id: u64) {
+        self.close_udp_flow(flow_id).await;
+        let _ = self.send_udp_control(UDP_FRAME_CLOSE, flow_id).await;
     }
 
-    async fn handle_udp_request(
-        self: &Arc<Self>,
-        flow_id: u64,
-        target_addr: String,
-        payload: Bytes,
-        retained_bytes: usize,
-    ) {
-        let Some(budget) = self.try_reserve_udp_queue(retained_bytes) else {
-            self.warn_udp_drop("connection queue byte limit reached");
-            return;
-        };
-        let flow = match self.get_or_create_udp_flow(flow_id, target_addr).await {
-            Ok(Some(flow)) => flow,
-            Ok(None) => {
-                self.warn_udp_drop("per-connection flow limit reached");
-                return;
-            }
-            Err(err) => {
-                self.portal.logger.error(format_args!(
-                    "portal::conn::handle_udp_request: failed to create UDP flow: {err}"
-                ));
-                return;
-            }
-        };
-        if !flow.enqueue(QueuedDatagram::new(payload, budget)) {
-            self.warn_udp_drop("per-flow datagram queue is full");
-        }
+    async fn send_udp_control(&self, frame_type: u8, flow_id: u64) -> anyhow::Result<()> {
+        let frame = encode_udp_control(frame_type, flow_id)?;
+        self.conn.send_datagram_wait(Bytes::from(frame)).await?;
+        Ok(())
     }
 
-    async fn get_or_create_udp_flow(
-        self: &Arc<Self>,
-        flow_id: u64,
-        target_addr: String,
-    ) -> anyhow::Result<Option<Arc<PortalUdpFlow>>> {
-        let key = UdpFlowKey::new(flow_id, target_addr);
-        let mut guard = self.udp_flows.lock().await;
-        if self.closed.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        if let Some(flow) = guard.get(&key).cloned() {
-            if !flow.is_closed() {
-                return Ok(Some(flow));
-            }
-            guard.remove(&key);
-        }
-        if guard.len() >= self.portal.udp_flow_limits.max_flows {
-            return Ok(None);
-        }
-        let response_header = new_udp_datagram_header(
-            DATAGRAM_UDP_RESPONSE,
-            flow_id,
-            key.target(),
-            &self.portal.credentials.protocol_spec,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "portal::conn::get_or_create_udp_flow: failed to build response header: {e}"
-            )
-        })?;
-        let (flow, receiver) = PortalUdpFlow::new(Arc::downgrade(self), key.clone());
-        let flow = Arc::new(flow);
-        guard.insert(key, flow.clone());
-        self.portal.stats.add_session(true);
-        drop(guard);
-
-        tokio::spawn(flow.clone().run(receiver, response_header));
-        Ok(Some(flow))
-    }
-
-    fn try_reserve_udp_queue(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let permits = u32::try_from(bytes).ok()?;
-        self.udp_queue_budget
-            .clone()
-            .try_acquire_many_owned(permits)
-            .ok()
-    }
-
-    fn enqueue_compact(
+    fn enqueue_udp(
         &self,
         sender: &tokio::sync::mpsc::Sender<QueuedDatagram>,
-        payload: Bytes,
-        retained_bytes: usize,
+        datagram: QueuedDatagram,
     ) -> bool {
-        let Some(budget) = self.try_reserve_udp_queue(retained_bytes) else {
-            self.warn_udp_drop("connection queue byte limit reached");
-            return false;
-        };
-        if sender
-            .try_send(QueuedDatagram::new(payload, budget))
-            .is_err()
-        {
+        if sender.try_send(datagram).is_err() {
             self.warn_udp_drop("per-flow datagram queue is full");
             return false;
         }
@@ -366,10 +287,6 @@ impl PortalSession {
     }
 
     fn warn_udp_drop(&self, reason: &str) {
-        self.portal
-            .stats
-            .udp_dropped
-            .fetch_add(1, Ordering::Relaxed);
         if !self.udp_overload_logged.swap(true, Ordering::AcqRel) {
             self.portal.logger.warn(format_args!(
                 "portal::conn::datagram_loop: dropping UDP datagrams for {}: {reason}",

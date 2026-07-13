@@ -71,7 +71,7 @@ authenticated session and flow IDs, never by source IP.
 
 UoT has no separate Portal setting. A compatible client selects it inside an
 authenticated TLS/TCP connection by using the reserved UoT request target and
-then sending length-prefixed UDP packets. See the
+then sending typed UDP packet/control frames. See the
 [protocol specification](protocol.md#92-udp-over-tcp-uot) for the wire format.
 
 ## Listener Address Rules

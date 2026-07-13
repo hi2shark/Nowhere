@@ -21,7 +21,7 @@ use self::derivation::{base64_url_no_pad, hkdf_expand, hkdf_extract};
 pub(super) use self::input::decode_username;
 use self::input::{query_value, validate_optional, validate_required};
 use self::layout::auth_frame_order_from_seed;
-pub use self::layout::{AuthFrameElement, ProxyFrameLayout, TcpFrameElement, UdpFrameElement};
+pub use self::layout::{AuthFrameElement, ProxyFrameLayout, TcpFrameElement};
 
 /// Default ALPN advertised by the portal.
 pub const DEFAULT_ALPN: &str = "now/1";
@@ -87,7 +87,7 @@ pub struct EffectiveProtocolSpec {
     pub tcp_padding_len: u8,
     /// Key material used to derive TCP request padding bytes.
     pub tcp_padding_key: [u8; TCP_PADDING_KEY_LEN],
-    /// Spec-derived TCP and UDP frame layouts.
+    /// Spec-derived TCP request frame layout.
     pub frame_layout: ProxyFrameLayout,
 }
 

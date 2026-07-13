@@ -1,362 +1,295 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! UDP datagram frame encoding and decoding.
+//! Fixed QUIC UDP frames with bounded application-layer fragmentation.
 
 use anyhow::{Result, bail};
-use bytes::{Bytes, BytesMut};
-
-use super::spec::{EffectiveProtocolSpec, PROXY_FRAME_VERSION, UdpFrameElement};
-use super::util::{TARGET_LEN_MAX, check_target_len, validate_target};
 
 use super::Carrier;
+use super::util::{TARGET_LEN_MAX, check_target_len, validate_target};
 
-/// Client-to-portal UDP payload frame.
-pub const DATAGRAM_UDP_REQUEST: u8 = 1;
-/// Portal-to-client UDP payload frame.
-pub const DATAGRAM_UDP_RESPONSE: u8 = 2;
-/// Client request to close a UDP flow.
-pub const DATAGRAM_UDP_CLOSE: u8 = 3;
+/// Fixed discriminator carried by every QUIC UDP frame.
+pub const UDP_FRAME_MAGIC: [u8; 4] = *b"NOWU";
+/// Opens or refreshes a flow and carries one UDP packet fragment.
+pub const UDP_FRAME_OPEN_DATA: u8 = 1;
+/// Acknowledges that target-free DATA frames may be used.
+pub const UDP_FRAME_OPEN_ACK: u8 = 2;
+/// Carries one target-free UDP packet fragment.
+pub const UDP_FRAME_DATA: u8 = 3;
+/// Closes a flow.
+pub const UDP_FRAME_CLOSE: u8 = 4;
 
-/// First payload for a flow using the compact v1 data plane.
-pub const DATAGRAM_UDP_OPEN_DATA: u8 = 0x11;
-/// Portal acknowledgement that compact DATA frames may be used.
-pub const DATAGRAM_UDP_OPEN_ACK: u8 = 0x12;
-/// Target-free compact payload frame.
-pub const DATAGRAM_UDP_DATA: u8 = 0x13;
-/// Compact flow close frame.
-pub const DATAGRAM_UDP_COMPACT_CLOSE: u8 = 0x14;
+/// Largest UDP payload representable by the protocol.
+pub const UDP_PACKET_MAX: usize = u16::MAX as usize;
 
-const COMPACT_HEADER_LEN: usize = 1 + 1 + 8;
+const CONTROL_HEADER_LEN: usize = UDP_FRAME_MAGIC.len() + 1 + 8;
+const FRAGMENT_HEADER_LEN: usize = 2 + 1 + 1 + 2;
+const DATA_HEADER_LEN: usize = CONTROL_HEADER_LEN + FRAGMENT_HEADER_LEN;
+const OPEN_METADATA_LEN: usize = 1 + 2;
 
-#[derive(Debug)]
-pub enum CompactUdpFrame<'a> {
+/// Borrowed fragment metadata decoded from a DATA or OPEN_DATA frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpFragment<'a> {
+    /// Packet identifier scoped to one UDP flow.
+    pub packet_id: u16,
+    /// Zero-based fragment index.
+    pub fragment_id: u8,
+    /// Total fragments in the original UDP packet.
+    pub fragment_count: u8,
+    /// Original UDP packet length before fragmentation.
+    pub total_len: u16,
+    /// Fragment payload.
+    pub payload: &'a [u8],
+}
+
+/// One decoded QUIC UDP frame.
+#[derive(Debug, Eq, PartialEq)]
+pub enum UdpFrame<'a> {
+    /// Flow metadata plus one UDP packet fragment.
     OpenData {
+        /// Flow identifier scoped to one authenticated QUIC connection.
         flow_id: u64,
+        /// Selected downlink carrier.
         downlink: Carrier,
+        /// Target host and port.
         target: String,
-        payload: &'a [u8],
+        /// Packet fragment.
+        fragment: UdpFragment<'a>,
     },
+    /// Flow-open acknowledgement.
     OpenAck {
+        /// Acknowledged flow identifier.
         flow_id: u64,
     },
+    /// Target-free packet fragment.
     Data {
+        /// Flow identifier.
         flow_id: u64,
-        payload: &'a [u8],
+        /// Packet fragment.
+        fragment: UdpFragment<'a>,
     },
+    /// Flow-close request or notification.
     Close {
+        /// Closed flow identifier.
         flow_id: u64,
     },
 }
 
-pub fn encode_udp_open_data(
+/// Encodes an OPEN_DATA packet into DATAGRAM-sized fragments.
+pub fn encode_udp_open_fragments(
     flow_id: u64,
+    packet_id: u16,
     downlink: Carrier,
     target: &str,
     payload: &[u8],
-) -> Result<Vec<u8>> {
+    max_datagram_size: usize,
+) -> Result<Vec<Vec<u8>>> {
+    validate_flow_id(flow_id, "encode_udp_open_fragments")?;
     validate_target(target)
-        .map_err(|e| anyhow::anyhow!("protocol::datagram::encode_udp_open_data: {e}"))?;
-    check_target_len("protocol::datagram::encode_udp_open_data", target)?;
-    if flow_id == 0 {
-        bail!("protocol::datagram::encode_udp_open_data: zero flow id");
+        .map_err(|e| anyhow::anyhow!("protocol::datagram::encode_udp_open_fragments: {e}"))?;
+    check_target_len("protocol::datagram::encode_udp_open_fragments", target)?;
+    let header_len = DATA_HEADER_LEN + OPEN_METADATA_LEN + target.len();
+    encode_fragments(
+        UDP_FRAME_OPEN_DATA,
+        flow_id,
+        packet_id,
+        payload,
+        max_datagram_size,
+        header_len,
+        |out| {
+            out.push(downlink as u8);
+            out.extend_from_slice(&(target.len() as u16).to_be_bytes());
+            out.extend_from_slice(target.as_bytes());
+        },
+    )
+}
+
+/// Encodes a target-free DATA packet into DATAGRAM-sized fragments.
+pub fn encode_udp_data_fragments(
+    flow_id: u64,
+    packet_id: u16,
+    payload: &[u8],
+    max_datagram_size: usize,
+) -> Result<Vec<Vec<u8>>> {
+    validate_flow_id(flow_id, "encode_udp_data_fragments")?;
+    encode_fragments(
+        UDP_FRAME_DATA,
+        flow_id,
+        packet_id,
+        payload,
+        max_datagram_size,
+        DATA_HEADER_LEN,
+        |_| {},
+    )
+}
+
+/// Encodes an OPEN_ACK or CLOSE control frame.
+pub fn encode_udp_control(frame_type: u8, flow_id: u64) -> Result<Vec<u8>> {
+    validate_flow_id(flow_id, "encode_udp_control")?;
+    if !matches!(frame_type, UDP_FRAME_OPEN_ACK | UDP_FRAME_CLOSE) {
+        bail!("protocol::datagram::encode_udp_control: invalid type: {frame_type}");
     }
-    let mut out = Vec::with_capacity(COMPACT_HEADER_LEN + 3 + target.len() + payload.len());
-    write_compact_header(&mut out, DATAGRAM_UDP_OPEN_DATA, flow_id);
-    out.push(downlink as u8);
-    out.extend_from_slice(&(target.len() as u16).to_be_bytes());
-    out.extend_from_slice(target.as_bytes());
-    out.extend_from_slice(payload);
+    let mut out = Vec::with_capacity(CONTROL_HEADER_LEN);
+    write_base_header(&mut out, frame_type, flow_id);
     Ok(out)
 }
 
-pub fn encode_udp_compact(frame_type: u8, flow_id: u64, payload: &[u8]) -> Result<Vec<u8>> {
-    if flow_id == 0 {
-        bail!("protocol::datagram::encode_udp_compact: zero flow id");
+fn encode_fragments(
+    frame_type: u8,
+    flow_id: u64,
+    packet_id: u16,
+    payload: &[u8],
+    max_datagram_size: usize,
+    header_len: usize,
+    mut write_metadata: impl FnMut(&mut Vec<u8>),
+) -> Result<Vec<Vec<u8>>> {
+    if payload.len() > UDP_PACKET_MAX {
+        bail!(
+            "protocol::datagram::encode_fragments: UDP payload too large: {}",
+            payload.len()
+        );
     }
-    if !matches!(
-        frame_type,
-        DATAGRAM_UDP_OPEN_ACK | DATAGRAM_UDP_DATA | DATAGRAM_UDP_COMPACT_CLOSE
-    ) {
-        bail!("protocol::datagram::encode_udp_compact: invalid type: {frame_type}");
+    let max_payload = max_datagram_size.checked_sub(header_len).ok_or_else(|| {
+        anyhow::anyhow!(
+            "protocol::datagram::encode_fragments: DATAGRAM limit {max_datagram_size} smaller than header {header_len}"
+        )
+    })?;
+    if max_payload == 0 && !payload.is_empty() {
+        bail!("protocol::datagram::encode_fragments: no DATAGRAM payload capacity");
     }
-    if frame_type != DATAGRAM_UDP_DATA && !payload.is_empty() {
-        bail!("protocol::datagram::encode_udp_compact: control frame payload");
+    let fragment_count = if payload.is_empty() {
+        1
+    } else {
+        payload.len().div_ceil(max_payload)
+    };
+    if fragment_count > u8::MAX as usize {
+        bail!("protocol::datagram::encode_fragments: too many fragments: {fragment_count}");
     }
-    let mut out = Vec::with_capacity(COMPACT_HEADER_LEN + payload.len());
-    write_compact_header(&mut out, frame_type, flow_id);
-    out.extend_from_slice(payload);
-    Ok(out)
+    let total_len = payload.len() as u16;
+    let mut frames = Vec::with_capacity(fragment_count);
+    for fragment_id in 0..fragment_count {
+        let start = fragment_id * max_payload;
+        let end = payload.len().min(start.saturating_add(max_payload));
+        let fragment_payload = &payload[start..end];
+        let mut out = Vec::with_capacity(header_len + fragment_payload.len());
+        write_base_header(&mut out, frame_type, flow_id);
+        write_metadata(&mut out);
+        out.extend_from_slice(&packet_id.to_be_bytes());
+        out.push(fragment_id as u8);
+        out.push(fragment_count as u8);
+        out.extend_from_slice(&total_len.to_be_bytes());
+        out.extend_from_slice(fragment_payload);
+        debug_assert!(out.len() <= max_datagram_size);
+        frames.push(out);
+    }
+    Ok(frames)
 }
 
-fn write_compact_header(out: &mut Vec<u8>, frame_type: u8, flow_id: u64) {
-    out.push(PROXY_FRAME_VERSION);
+fn write_base_header(out: &mut Vec<u8>, frame_type: u8, flow_id: u64) {
+    out.extend_from_slice(&UDP_FRAME_MAGIC);
     out.push(frame_type);
     out.extend_from_slice(&flow_id.to_be_bytes());
 }
 
-pub fn decode_udp_compact(buf: &[u8]) -> Result<CompactUdpFrame<'_>> {
-    if buf.len() < COMPACT_HEADER_LEN || buf[0] != PROXY_FRAME_VERSION {
-        bail!("protocol::datagram::decode_udp_compact: invalid header");
+/// Decodes one fixed QUIC UDP frame.
+pub fn decode_udp_frame(buf: &[u8]) -> Result<UdpFrame<'_>> {
+    if buf.len() < CONTROL_HEADER_LEN || buf[..UDP_FRAME_MAGIC.len()] != UDP_FRAME_MAGIC {
+        bail!("protocol::datagram::decode_udp_frame: invalid magic or short header");
     }
-    let frame_type = buf[1];
-    let flow_id = u64::from_be_bytes(buf[2..10].try_into().expect("fixed flow id"));
-    if flow_id == 0 {
-        bail!("protocol::datagram::decode_udp_compact: zero flow id");
-    }
+    let frame_type = buf[UDP_FRAME_MAGIC.len()];
+    let flow_id = u64::from_be_bytes(
+        buf[UDP_FRAME_MAGIC.len() + 1..CONTROL_HEADER_LEN]
+            .try_into()
+            .expect("fixed flow id"),
+    );
+    validate_flow_id(flow_id, "decode_udp_frame")?;
     match frame_type {
-        DATAGRAM_UDP_OPEN_DATA => {
-            if buf.len() < COMPACT_HEADER_LEN + 3 {
-                bail!("protocol::datagram::decode_udp_compact: short open frame");
+        UDP_FRAME_OPEN_ACK => {
+            if buf.len() != CONTROL_HEADER_LEN {
+                bail!("protocol::datagram::decode_udp_frame: ACK payload");
             }
-            let downlink = match buf[10] {
+            Ok(UdpFrame::OpenAck { flow_id })
+        }
+        UDP_FRAME_CLOSE => {
+            if buf.len() != CONTROL_HEADER_LEN {
+                bail!("protocol::datagram::decode_udp_frame: CLOSE payload");
+            }
+            Ok(UdpFrame::Close { flow_id })
+        }
+        UDP_FRAME_DATA => Ok(UdpFrame::Data {
+            flow_id,
+            fragment: decode_fragment(buf, CONTROL_HEADER_LEN)?,
+        }),
+        UDP_FRAME_OPEN_DATA => {
+            let metadata_end = CONTROL_HEADER_LEN + OPEN_METADATA_LEN;
+            if buf.len() < metadata_end {
+                bail!("protocol::datagram::decode_udp_frame: short OPEN_DATA metadata");
+            }
+            let downlink = match buf[CONTROL_HEADER_LEN] {
                 1 => Carrier::Tcp,
                 2 => Carrier::Udp,
-                value => bail!("protocol::datagram::decode_udp_compact: invalid carrier: {value}"),
+                value => {
+                    bail!("protocol::datagram::decode_udp_frame: invalid carrier: {value}")
+                }
             };
-            let target_len = u16::from_be_bytes([buf[11], buf[12]]) as usize;
-            let target_end = 13usize.saturating_add(target_len);
+            let target_len =
+                u16::from_be_bytes([buf[CONTROL_HEADER_LEN + 1], buf[CONTROL_HEADER_LEN + 2]])
+                    as usize;
+            let target_end = metadata_end.saturating_add(target_len);
             if target_len == 0 || target_len > TARGET_LEN_MAX || target_end > buf.len() {
-                bail!("protocol::datagram::decode_udp_compact: invalid target length");
+                bail!("protocol::datagram::decode_udp_frame: invalid target length");
             }
-            let target = std::str::from_utf8(&buf[13..target_end])?.to_string();
+            let target = std::str::from_utf8(&buf[metadata_end..target_end])?.to_string();
             validate_target(&target)
-                .map_err(|e| anyhow::anyhow!("protocol::datagram::decode_udp_compact: {e}"))?;
-            Ok(CompactUdpFrame::OpenData {
+                .map_err(|e| anyhow::anyhow!("protocol::datagram::decode_udp_frame: {e}"))?;
+            Ok(UdpFrame::OpenData {
                 flow_id,
                 downlink,
                 target,
-                payload: &buf[target_end..],
+                fragment: decode_fragment(buf, target_end)?,
             })
         }
-        DATAGRAM_UDP_OPEN_ACK => {
-            if buf.len() != COMPACT_HEADER_LEN {
-                bail!("protocol::datagram::decode_udp_compact: ACK payload");
-            }
-            Ok(CompactUdpFrame::OpenAck { flow_id })
+        value => bail!("protocol::datagram::decode_udp_frame: invalid type: {value}"),
+    }
+}
+
+fn decode_fragment(buf: &[u8], offset: usize) -> Result<UdpFragment<'_>> {
+    let payload_offset = offset.saturating_add(FRAGMENT_HEADER_LEN);
+    if buf.len() < payload_offset {
+        bail!("protocol::datagram::decode_udp_frame: short fragment header");
+    }
+    let packet_id = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+    let fragment_id = buf[offset + 2];
+    let fragment_count = buf[offset + 3];
+    let total_len = u16::from_be_bytes([buf[offset + 4], buf[offset + 5]]);
+    let payload = &buf[payload_offset..];
+    if fragment_count == 0 || fragment_id >= fragment_count {
+        bail!("protocol::datagram::decode_udp_frame: invalid fragment index");
+    }
+    if payload.len() > total_len as usize {
+        bail!("protocol::datagram::decode_udp_frame: fragment exceeds total length");
+    }
+    if total_len == 0 {
+        if fragment_count != 1 || fragment_id != 0 || !payload.is_empty() {
+            bail!("protocol::datagram::decode_udp_frame: invalid empty packet");
         }
-        DATAGRAM_UDP_DATA => Ok(CompactUdpFrame::Data {
-            flow_id,
-            payload: &buf[COMPACT_HEADER_LEN..],
-        }),
-        DATAGRAM_UDP_COMPACT_CLOSE => {
-            if buf.len() != COMPACT_HEADER_LEN {
-                bail!("protocol::datagram::decode_udp_compact: CLOSE payload");
-            }
-            Ok(CompactUdpFrame::Close { flow_id })
-        }
-        value => bail!("protocol::datagram::decode_udp_compact: invalid type: {value}"),
+    } else if payload.is_empty() || fragment_count == 1 && payload.len() != total_len as usize {
+        bail!("protocol::datagram::decode_udp_frame: invalid fragment payload");
     }
-}
-
-const DATAGRAM_HEADER_FIXED_LEN: usize = 1 + 1 + 8 + 2;
-
-/// Owned header fields plus the offset of the borrowed payload.
-pub(crate) struct DecodedUdpDatagram {
-    pub(crate) frame_type: u8,
-    pub(crate) flow_id: u64,
-    pub(crate) target_addr: String,
-    pub(crate) payload_offset: usize,
-}
-
-/// Encodes a UDP datagram frame with payload.
-pub fn encode_udp_datagram(
-    frame_type: u8,
-    flow_id: u64,
-    target_addr: &str,
-    payload: &[u8],
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<Vec<u8>> {
-    let header = new_udp_datagram_header(frame_type, flow_id, target_addr, protocol_spec)
-        .map_err(|e| anyhow::anyhow!("protocol::datagram::encode_udp_datagram: {e}"))?;
-    let mut buf = header;
-    buf.extend_from_slice(payload);
-    Ok(buf)
-}
-
-/// Builds only the reusable UDP datagram header for a flow.
-pub fn new_udp_datagram_header(
-    frame_type: u8,
-    flow_id: u64,
-    target_addr: &str,
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<Vec<u8>> {
-    udp_datagram_header_size(frame_type, target_addr)
-        .map_err(|e| anyhow::anyhow!("protocol::datagram::new_udp_datagram_header: {e}"))?;
-    let mut buf = vec![0; DATAGRAM_HEADER_FIXED_LEN + target_addr.len()];
-    write_udp_datagram_header(&mut buf, frame_type, flow_id, target_addr, protocol_spec);
-    Ok(buf)
-}
-
-fn udp_datagram_header_size(frame_type: u8, target_addr: &str) -> Result<usize> {
-    if !matches!(
-        frame_type,
-        DATAGRAM_UDP_REQUEST | DATAGRAM_UDP_RESPONSE | DATAGRAM_UDP_CLOSE
-    ) {
-        bail!("protocol::datagram::udp_datagram_header_size: invalid frame type: {frame_type}");
-    }
-    validate_target(target_addr)
-        .map_err(|e| anyhow::anyhow!("protocol::datagram::udp_datagram_header_size: {e}"))?;
-    check_target_len("protocol::datagram::udp_datagram_header_size", target_addr)?;
-    Ok(DATAGRAM_HEADER_FIXED_LEN + target_addr.len())
-}
-
-fn write_udp_datagram_header(
-    buf: &mut [u8],
-    frame_type: u8,
-    flow_id: u64,
-    target_addr: &str,
-    protocol_spec: &EffectiveProtocolSpec,
-) {
-    let target_len = (target_addr.len() as u16).to_be_bytes();
-    let mut offset = 0;
-    // The field order is part of the effective spec, so encode by walking the
-    // derived layout instead of writing the canonical order directly.
-    for element in protocol_spec.frame_layout.udp {
-        match element {
-            UdpFrameElement::Version => {
-                buf[offset] = PROXY_FRAME_VERSION;
-                offset += 1;
-            }
-            UdpFrameElement::Type => {
-                buf[offset] = frame_type;
-                offset += 1;
-            }
-            UdpFrameElement::FlowId => {
-                buf[offset..offset + 8].copy_from_slice(&flow_id.to_be_bytes());
-                offset += 8;
-            }
-            UdpFrameElement::Target => {
-                buf[offset..offset + 2].copy_from_slice(&target_len);
-                offset += 2;
-                buf[offset..offset + target_addr.len()].copy_from_slice(target_addr.as_bytes());
-                offset += target_addr.len();
-            }
-        }
-    }
-    debug_assert_eq!(offset, buf.len());
-}
-
-/// Decodes a UDP datagram frame and returns the remaining payload slice.
-pub fn decode_udp_datagram<'a>(
-    buf: &'a [u8],
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<(u8, u64, String, &'a [u8])> {
-    let decoded = decode_udp_datagram_parts(buf, protocol_spec)?;
-    Ok((
-        decoded.frame_type,
-        decoded.flow_id,
-        decoded.target_addr,
-        &buf[decoded.payload_offset..],
-    ))
-}
-
-/// Decodes the owned header fields while leaving payload ownership to the caller.
-pub(crate) fn decode_udp_datagram_parts(
-    buf: &[u8],
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<DecodedUdpDatagram> {
-    if buf.len() < DATAGRAM_HEADER_FIXED_LEN {
-        bail!("protocol::datagram::decode_udp_datagram: frame too short");
-    }
-
-    let mut offset = 0;
-    let mut frame_type = None;
-    let mut flow_id = None;
-    let mut target_addr = None;
-    // Decode fields in the same spec-derived order used during encoding.
-    for element in protocol_spec.frame_layout.udp {
-        match element {
-            UdpFrameElement::Version => {
-                let version = *buf.get(offset).ok_or_else(|| {
-                    anyhow::anyhow!("protocol::datagram::decode_udp_datagram: missing version")
-                })?;
-                offset += 1;
-                if version != PROXY_FRAME_VERSION {
-                    bail!(
-                        "protocol::datagram::decode_udp_datagram: unsupported frame version: {version}"
-                    );
-                }
-            }
-            UdpFrameElement::Type => {
-                frame_type = Some(*buf.get(offset).ok_or_else(|| {
-                    anyhow::anyhow!("protocol::datagram::decode_udp_datagram: missing frame type")
-                })?);
-                offset += 1;
-            }
-            UdpFrameElement::FlowId => {
-                let Some(bytes) = buf.get(offset..offset + 8) else {
-                    bail!("protocol::datagram::decode_udp_datagram: missing flow id");
-                };
-                flow_id = Some(u64::from_be_bytes(bytes.try_into().expect("slice len")));
-                offset += 8;
-            }
-            UdpFrameElement::Target => {
-                let Some(len_bytes) = buf.get(offset..offset + 2) else {
-                    bail!("protocol::datagram::decode_udp_datagram: missing target length");
-                };
-                let target_len =
-                    u16::from_be_bytes(len_bytes.try_into().expect("slice len")) as usize;
-                offset += 2;
-                if target_len == 0 || target_len > TARGET_LEN_MAX || buf.len() < offset + target_len
-                {
-                    bail!(
-                        "protocol::datagram::decode_udp_datagram: invalid target length: {target_len}"
-                    );
-                }
-                let target = std::str::from_utf8(&buf[offset..offset + target_len])
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "protocol::datagram::decode_udp_datagram: invalid target UTF-8: {e}"
-                        )
-                    })?
-                    .to_string();
-                offset += target_len;
-                validate_target(&target)
-                    .map_err(|e| anyhow::anyhow!("protocol::datagram::decode_udp_datagram: {e}"))?;
-                target_addr = Some(target);
-            }
-        }
-    }
-
-    let frame_type = frame_type.ok_or_else(|| {
-        anyhow::anyhow!("protocol::datagram::decode_udp_datagram: missing frame type")
-    })?;
-    if !matches!(
-        frame_type,
-        DATAGRAM_UDP_REQUEST | DATAGRAM_UDP_RESPONSE | DATAGRAM_UDP_CLOSE
-    ) {
-        bail!("protocol::datagram::decode_udp_datagram: invalid frame type: {frame_type}");
-    }
-    let flow_id = flow_id.ok_or_else(|| {
-        anyhow::anyhow!("protocol::datagram::decode_udp_datagram: missing flow id")
-    })?;
-    let target_addr = target_addr.ok_or_else(|| {
-        anyhow::anyhow!("protocol::datagram::decode_udp_datagram: missing target")
-    })?;
-
-    Ok(DecodedUdpDatagram {
-        frame_type,
-        flow_id,
-        target_addr,
-        payload_offset: offset,
+    Ok(UdpFragment {
+        packet_id,
+        fragment_id,
+        fragment_count,
+        total_len,
+        payload,
     })
 }
 
-/// Reuses an output allocation by replacing it with `header || payload`.
-pub fn append_frame_payload(dst: &mut Vec<u8>, header: &[u8], payload: &[u8]) {
-    dst.clear();
-    dst.reserve(header.len() + payload.len());
-    dst.extend_from_slice(header);
-    dst.extend_from_slice(payload);
-}
-
-/// Builds `header || payload` directly in the owned buffer passed to QUIC.
-pub fn frame_payload_bytes(header: &[u8], payload: &[u8]) -> Bytes {
-    let mut frame = BytesMut::with_capacity(header.len() + payload.len());
-    frame.extend_from_slice(header);
-    frame.extend_from_slice(payload);
-    frame.freeze()
+fn validate_flow_id(flow_id: u64, operation: &str) -> Result<()> {
+    if flow_id == 0 {
+        bail!("protocol::datagram::{operation}: zero flow id");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

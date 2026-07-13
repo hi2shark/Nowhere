@@ -11,6 +11,23 @@ use super::util::{TARGET_LEN_MAX, check_target_len, validate_target};
 
 /// Reserved TCP request target that switches an authenticated stream into UoT.
 pub const UOT_MAGIC_TARGET: &str = "uot.nowhere.invalid:0";
+/// UDP packet carried by a UoT stream.
+pub const UDP_STREAM_DATA: u8 = 1;
+/// Flow-open acknowledgement carried by a paired UoT downlink.
+pub const UDP_STREAM_OPEN_ACK: u8 = 2;
+/// Explicit paired-flow close notification.
+pub const UDP_STREAM_CLOSE: u8 = 3;
+
+/// One typed frame carried after UoT setup.
+#[derive(Debug, Eq, PartialEq)]
+pub enum UdpStreamFrame {
+    /// One complete UDP packet. The payload may be empty.
+    Data(Vec<u8>),
+    /// Flow-open acknowledgement.
+    OpenAck,
+    /// Flow-close notification.
+    Close,
+}
 
 /// Returns whether a TCP request target is the UoT switch target.
 pub fn is_uot_magic_target(target_addr: &str) -> bool {
@@ -27,42 +44,80 @@ pub fn write_uot_setup_frame(target_addr: &str) -> Result<Vec<u8>> {
     write_target_frame("protocol::uot::write_uot_setup_frame", target_addr)
 }
 
-/// Reads one length-prefixed UoT packet, returning `None` on clean EOF.
-pub async fn read_uot_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
-    let Some(length) = read_u16_frame_len("protocol::uot::read_uot_packet", reader).await? else {
+/// Reads one typed UoT frame, returning `None` on clean EOF.
+pub async fn read_udp_stream_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<UdpStreamFrame>> {
+    let context = "protocol::uot::read_udp_stream_frame";
+    let mut frame_type = [0u8; 1];
+    let n = reader
+        .read(&mut frame_type)
+        .await
+        .with_context(|| format!("{context}: failed to read frame type"))?;
+    if n == 0 {
         return Ok(None);
-    };
+    }
+    let length = read_u16_frame_len(context, reader)
+        .await?
+        .expect("frame type was present");
     let mut payload = vec![0; length];
     reader
         .read_exact(&mut payload)
         .await
-        .context("protocol::uot::read_uot_packet: failed to read payload")?;
-    Ok(Some(payload))
+        .context("protocol::uot::read_udp_stream_frame: failed to read payload")?;
+    match frame_type[0] {
+        UDP_STREAM_DATA => Ok(Some(UdpStreamFrame::Data(payload))),
+        UDP_STREAM_OPEN_ACK if payload.is_empty() => Ok(Some(UdpStreamFrame::OpenAck)),
+        UDP_STREAM_CLOSE if payload.is_empty() => Ok(Some(UdpStreamFrame::Close)),
+        UDP_STREAM_OPEN_ACK | UDP_STREAM_CLOSE => {
+            bail!("{context}: control frame payload")
+        }
+        value => bail!("{context}: invalid frame type: {value}"),
+    }
 }
 
-/// Encodes one length-prefixed UoT packet.
-pub fn write_uot_packet_frame(payload: &[u8]) -> Result<Vec<u8>> {
-    check_uot_packet_len("protocol::uot::write_uot_packet_frame", payload.len())?;
-    let mut frame = Vec::with_capacity(2 + payload.len());
+/// Encodes one typed UoT frame.
+pub fn encode_udp_stream_frame(frame_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    check_udp_stream_frame(
+        "protocol::uot::encode_udp_stream_frame",
+        frame_type,
+        payload,
+    )?;
+    let mut frame = Vec::with_capacity(3 + payload.len());
+    frame.push(frame_type);
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
 }
 
-/// Writes one length-prefixed UoT packet without first concatenating a frame.
-pub async fn write_uot_packet<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
-    check_uot_packet_len("protocol::uot::write_uot_packet", payload.len())?;
+/// Writes one typed UoT frame without first concatenating it.
+pub async fn write_udp_stream_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame_type: u8,
+    payload: &[u8],
+) -> Result<()> {
+    check_udp_stream_frame("protocol::uot::write_udp_stream_frame", frame_type, payload)?;
+    let kind = [frame_type];
     let length = (payload.len() as u16).to_be_bytes();
-    let mut frame = Buf::chain(&length[..], payload);
+    let mut frame = Buf::chain(Buf::chain(&kind[..], &length[..]), payload);
     writer
         .write_all_buf(&mut frame)
         .await
-        .context("protocol::uot::write_uot_packet: failed to write frame")
+        .context("protocol::uot::write_udp_stream_frame: failed to write frame")
 }
 
-fn check_uot_packet_len(context: &str, len: usize) -> Result<()> {
-    if len > u16::MAX as usize {
-        bail!("{context}: payload too large: {len}");
+fn check_udp_stream_frame(context: &str, frame_type: u8, payload: &[u8]) -> Result<()> {
+    if payload.len() > u16::MAX as usize {
+        bail!("{context}: payload too large: {}", payload.len());
+    }
+    if !matches!(
+        frame_type,
+        UDP_STREAM_DATA | UDP_STREAM_OPEN_ACK | UDP_STREAM_CLOSE
+    ) {
+        bail!("{context}: invalid frame type: {frame_type}");
+    }
+    if frame_type != UDP_STREAM_DATA && !payload.is_empty() {
+        bail!("{context}: control frame payload");
     }
     Ok(())
 }

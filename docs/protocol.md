@@ -7,7 +7,7 @@ configuration required by the reference implementation.
 
 Nowhere carries authenticated TCP and UDP proxy traffic over TLS/TCP or QUIC.
 TCP uses a dedicated TLS/TCP connection or a QUIC bidirectional stream. UDP
-uses QUIC DATAGRAM frames or a length-prefixed UDP-over-TCP (UoT) flow. A shared
+uses fragmentable QUIC DATAGRAM frames or a typed UDP-over-TCP (UoT) flow. A shared
 key authenticates each transport connection, while a deterministic `spec`
 value selects the authentication shape, padding, and field layout.
 
@@ -162,17 +162,17 @@ for i from len(A) - 1 down to 1:
     swap A[i] and A[j]
 ```
 
-The three layouts are derived as follows:
+The two layouts are derived as follows:
 
 | Layout | Initial array | Seed offset |
 | --- | --- | --- |
 | Authentication | `[magic, nonce, padding, tag]` | `0` in `auth_layout_seed` |
 | TCP request | `[version, target, padding]` | `0` in `proxy_layout_seed` |
-| UDP header | `[version, type, flow_id, target]` | `1` in `proxy_layout_seed` |
 
 If the authentication shuffle produces its initial array unchanged, the result
-MUST be rotated left once to `[nonce, padding, tag, magic]`. TCP and UDP layouts
-do not apply this rotation.
+MUST be rotated left once to `[nonce, padding, tag, magic]`. The TCP layout does
+not apply this rotation. UDP frames use the fixed format in Section 9.1 and are
+not spec-derived.
 
 All peers MUST implement these algorithms exactly. Derivation MUST NOT depend
 on the shared key, wall-clock time, randomness, locale, platform integer width,
@@ -412,9 +412,9 @@ flows omit this envelope and retain their direct fast path.
 
 UDP relay has two transport-specific forms:
 
-- QUIC DATAGRAM multiplexes flows by `(flow_id, target)` on one authenticated
-  QUIC connection.
-- UoT carries one target flow as length-prefixed packets on one authenticated
+- QUIC DATAGRAM multiplexes flows by `flow_id` on one authenticated QUIC
+  connection and fragments packets that exceed the current DATAGRAM limit.
+- UoT carries one target flow as typed packet frames on one authenticated
   TLS/TCP connection.
 
 The forms share target validation, outbound UDP dialing, rate limits, idle
@@ -422,50 +422,52 @@ timeouts, and UDP counters. Their wire frames are otherwise independent.
 
 ### 9.1 QUIC DATAGRAM Frames
 
-The upgraded client uses a fixed compact data plane:
+Every QUIC UDP frame begins with this fixed base header:
+
+```text
+magic[4]("NOWU") || type_u8 || flow_id_u64
+```
 
 | Type | Value | Body |
 | --- | --- | --- |
-| `OPEN_DATA` | `0x11` | `flow_id_u64 || downlink_u8 || target_len_u16 || target || payload` |
-| `OPEN_ACK` | `0x12` | `flow_id_u64` |
-| `DATA` | `0x13` | `flow_id_u64 || payload` |
-| `CLOSE` | `0x14` | `flow_id_u64` |
+| `OPEN_DATA` | `1` | `downlink_u8 || target_len_u16 || target || fragment_header || fragment` |
+| `OPEN_ACK` | `2` | Empty |
+| `DATA` | `3` | `fragment_header || fragment` |
+| `CLOSE` | `4` | Empty |
 
-Every frame begins with `version_u8(1) || type_u8`. Before receiving
-`OPEN_ACK`, every client payload uses `OPEN_DATA`; after the ACK, the client
-uses target-free `DATA`. The Portal treats repeated open metadata idempotently
-and forwards the first payload without an additional RTT. Target-to-client
-DATAGRAMs always use compact `DATA`. If the Portal receives target-free `DATA`
-for an unknown or expired flow, it returns `CLOSE`; the client then clears its
-ACK state and uses `OPEN_DATA` for the next payload, or recreates an asymmetric
-flow, to restore the target metadata.
+The fragment header is:
 
-The derived-order header below remains accepted for the existing symmetric
-implementation path but is not emitted by the upgraded reference client.
+```text
+packet_id_u16 || fragment_id_u8 || fragment_count_u8 || total_len_u16
+```
 
-Each QUIC DATAGRAM contains a derived-order header followed by an opaque
-payload.
+`fragment_id` is zero-based and less than `fragment_count`, which is from 1
+through 255. `total_len` is the original UDP payload length from 0 through
+65535. A zero-length UDP packet is encoded as exactly one fragment with
+`fragment_id=0`, `fragment_count=1`, `total_len=0`, and no fragment bytes.
 
-| Element | Encoding |
-| --- | --- |
-| `version` | `u8(1)` |
-| `type` | One of the values below |
-| `flow_id` | `u64` scoped to the authenticated QUIC connection |
-| `target` | `target_len_u16 || target_utf8` |
+The sender MUST split a packet so every encoded frame fits the connection's
+current maximum QUIC DATAGRAM size. All fragments of a packet use the same
+packet ID, count, total length, and, for `OPEN_DATA`, identical target and
+downlink metadata. The receiver reassembles the complete UDP packet before
+writing one datagram to the target or delivering one datagram to the client.
+Partial packets are bounded by the connection byte budget, a 64-slot cap, and a
+10-second lifetime.
 
-The header elements appear in the derived UDP order. The payload always follows
-the complete header and is never shuffled.
+Before receiving `OPEN_ACK`, each client packet uses `OPEN_DATA`; after the ACK,
+the client may use target-free `DATA`. Repeated matching `OPEN_DATA` is
+idempotent. If the Portal receives `DATA` for an unknown or expired flow, it
+returns `CLOSE`, and the client restores the flow with a later `OPEN_DATA`.
+Conflicting metadata for an existing flow is rejected.
 
-| Type | Value | Direction and meaning |
-| --- | --- | --- |
-| Request | `1` | Client to Portal; open or reuse the flow and forward the payload to the target. |
-| Response | `2` | Portal to client; payload received from the target. |
-| Close | `3` | Client to Portal; close the matching flow. Any payload is ignored. |
+The Portal uses backpressured DATAGRAM submission so a newer frame cannot
+silently evict an older unsent frame from the local QUIC queue. If the path MTU
+shrinks while a packet is being submitted, the sender recomputes fragments and
+retries once. A packet that still cannot be submitted is dropped without
+closing the UDP flow; later packets remain eligible for delivery.
 
-A UDP flow is identified by `(flow_id, target)` within one QUIC connection.
-Different targets with the same flow ID are distinct flows. The response uses
-the request's flow ID and target. The Portal closes an inactive flow after
-`NOW_UDP_IDLE_TIMEOUT`.
+A UDP flow is identified by `flow_id` within one authenticated QUIC connection.
+The Portal closes an inactive flow after `NOW_UDP_IDLE_TIMEOUT`.
 
 The reference Portal dispatches each flow independently. Target dialing,
 rate-limit waits, and target socket I/O for one flow do not block DATAGRAM
@@ -473,9 +475,9 @@ dispatch to other flows. Each flow queues at most 64 client datagrams. New
 requests are dropped when that queue, the per-connection queued-byte budget, or
 the per-connection flow limit is full; already accepted requests remain FIFO.
 
-Malformed datagrams, unsupported versions, unknown types, and response frames
-received by the Portal are not forwarded. A close frame for an unknown flow has
-no effect.
+Malformed frames, invalid fragment metadata, conflicting duplicate fragments,
+and unknown types are not forwarded. The former derived-order UDP format and
+the earlier compact `0x11..0x14` format are not accepted.
 
 ### 9.2 UDP-over-TCP (UoT)
 
@@ -504,27 +506,33 @@ socket, optionally binding its source address according to `dial`. With SOCKS5
 enabled, it instead creates a per-flow UDP ASSOCIATE, keeps the associated TCP
 control connection open, and sends the target in each SOCKS5 UDP packet.
 
-After setup, both directions consist only of packet frames:
+After setup, both directions consist only of typed frames:
 
 ```text
-payload_len_u16 || payload
+kind_u8 || payload_len_u16 || payload
 ```
 
-`payload_len_u16` is from 0 through 65535. Each frame represents exactly one UDP
-packet, so implementations MUST preserve frame and packet boundaries. UoT has
-no flow ID, message type, or in-band close frame. One TLS/TCP connection carries
-one target flow; clients use separate connections for different concurrent
-targets.
+| Kind | Value | Meaning |
+| --- | --- | --- |
+| `DATA` | `1` | One complete UDP packet; an empty payload is valid. |
+| `OPEN_ACK` | `2` | An empty asymmetric-flow acknowledgement. |
+| `CLOSE` | `3` | An empty explicit close notification. |
+
+`payload_len_u16` is from 0 through 65535. Control frames MUST have zero length.
+Each `DATA` frame represents exactly one UDP packet, so implementations MUST
+preserve frame and packet boundaries. UoT has no flow ID. One TLS/TCP connection
+carries one target flow; clients use separate connections for different
+concurrent targets.
 
 Traffic in either direction refreshes `NOW_UDP_IDLE_TIMEOUT`. Clean TCP EOF,
 truncated or invalid framing, a target socket error, the idle timeout, or
 service shutdown closes the UoT flow. Payload bytes are charged to `rate` and
-`etar` and recorded in the UDP counters. The two-byte packet lengths, setup
+`etar` and recorded in the UDP counters. The typed frame headers, setup
 frame, authentication frame, and request frame are not counted as UDP payload.
 
 ## 10. Target Encoding
 
-TCP requests, QUIC DATAGRAM headers, and UoT setup frames use the same target
+TCP requests, QUIC `OPEN_DATA` frames, and UoT setup frames use the same target
 representation. `target_utf8` MUST:
 
 - be valid UTF-8;
@@ -575,7 +583,7 @@ At debug log level, the Portal also emits carrier-level absolute counters
 without changing `CHECK_POINT`:
 
 ```text
-LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>|UDPDROP=<datagrams>
+LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>
 ```
 
 ## 12. Runtime Controls
@@ -586,8 +594,8 @@ the v1 derivation or frame formats.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams. |
-| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
-| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum active UDP flows involving one authenticated QUIC session, across symmetric and asymmetric carriers. |
+| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued and partially reassembled UDP payload bytes per authenticated QUIC connection. |
 | `NOW_TCP_IDLE_POOL_CONNS` | `4096` | Maximum authenticated TLS/TCP connections waiting for a first request. |
 | `NOW_MAX_PENDING_PAIRS` | `1024` | Maximum unpaired asymmetric flow records per session. |
 | `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Lifetime of an unpaired flow half. |
@@ -645,7 +653,7 @@ An implementation should verify at least the following cases:
    different authentication tags.
 6. Different specs produce their own authentication constants, padding, and
    layouts.
-7. Authentication, TCP request, UDP datagram, UoT setup, and UoT packet
+7. Authentication, TCP request, fixed UDP fragment, UoT setup, and typed UoT
    encoders round-trip through their decoders.
 8. Wrong versions, target lengths, padding lengths, padding bytes, frame types,
    and tags are rejected.

@@ -87,6 +87,7 @@ async fn handle_connection(
         session.session_id,
         portal.stats.clone(),
         link_replaced.clone(),
+        session.udp_flow_budget(),
     );
     session.set_quic_generation(link_guard.quic_generation());
     let _link_guard = link_guard;

@@ -14,9 +14,9 @@ use url::Url;
 use crate::common::{LogLevel, Logger};
 use crate::portal::Portal;
 use crate::protocol::{
-    Carrier, CompactUdpFrame, FlowHeader, FlowKind, FlowRole, decode_udp_compact,
-    encode_udp_open_data, read_uot_packet, write_flow_header, write_request_frame,
-    write_session_auth_frame, write_uot_packet_frame,
+    Carrier, FlowHeader, FlowKind, FlowRole, UDP_STREAM_DATA, UdpFrame, UdpStreamFrame,
+    decode_udp_frame, encode_udp_open_fragments, encode_udp_stream_frame, read_udp_stream_frame,
+    write_flow_header, write_request_frame, write_session_auth_frame,
 };
 
 use super::support::{connect_test_quic_to, connect_test_tls};
@@ -235,21 +235,27 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
     );
     bootstrap.extend_from_slice(&request(&portal, attach, target_addr, b""));
     tls.write_all(&bootstrap).await.unwrap();
-    quic.send_datagram(bytes::Bytes::from(
-        encode_udp_open_data(11, Carrier::Tcp, &target_addr.to_string(), b"ping").unwrap(),
-    ))
-    .unwrap();
-    let ack = read_uot_packet(&mut tls).await.unwrap().unwrap();
-    assert!(ack.is_empty());
+    let open =
+        encode_udp_open_fragments(11, 1, Carrier::Tcp, &target_addr.to_string(), b"ping", 1200)
+            .unwrap();
+    quic.send_datagram(bytes::Bytes::from(open.into_iter().next().unwrap()))
+        .unwrap();
+    assert_eq!(
+        read_udp_stream_frame(&mut tls).await.unwrap(),
+        Some(UdpStreamFrame::OpenAck)
+    );
     let quic_ack = timeout(Duration::from_secs(3), quic.read_datagram())
         .await
         .unwrap()
         .unwrap();
     assert!(matches!(
-        decode_udp_compact(&quic_ack).unwrap(),
-        CompactUdpFrame::OpenAck { flow_id: 11 }
+        decode_udp_frame(&quic_ack).unwrap(),
+        UdpFrame::OpenAck { flow_id: 11 }
     ));
-    assert_eq!(read_uot_packet(&mut tls).await.unwrap().unwrap(), b"pong");
+    assert_eq!(
+        read_udp_stream_frame(&mut tls).await.unwrap(),
+        Some(UdpStreamFrame::Data(b"pong".to_vec()))
+    );
     echo.await.unwrap();
 
     // TLS/TCP upload, QUIC download.
@@ -283,7 +289,7 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
         &portal,
         open,
         target_addr,
-        &write_uot_packet_frame(b"ping").unwrap(),
+        &encode_udp_stream_frame(UDP_STREAM_DATA, b"ping").unwrap(),
     ));
     tls.write_all(&bootstrap).await.unwrap();
     let (mut attach_send, _) = quic.open_bi().await.unwrap();
@@ -300,17 +306,17 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
             .await
             .unwrap()
             .unwrap();
-        match decode_udp_compact(&frame).unwrap() {
-            CompactUdpFrame::OpenAck { flow_id } => {
+        match decode_udp_frame(&frame).unwrap() {
+            UdpFrame::OpenAck { flow_id } => {
                 assert_eq!(flow_id, 12);
                 saw_ack = true;
             }
-            CompactUdpFrame::Data { flow_id, payload } => {
+            UdpFrame::Data { flow_id, fragment } => {
                 assert_eq!(flow_id, 12);
-                assert_eq!(payload, b"pong");
+                assert_eq!(fragment.payload, b"pong");
                 saw_pong = true;
             }
-            _ => panic!("unexpected compact frame"),
+            _ => panic!("unexpected UDP frame"),
         }
     }
     assert!(saw_ack && saw_pong);

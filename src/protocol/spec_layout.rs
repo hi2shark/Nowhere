@@ -20,22 +20,11 @@ pub enum TcpFrameElement {
     Padding,
 }
 
-/// Fields that make up a UDP datagram frame header.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UdpFrameElement {
-    Version,
-    Type,
-    FlowId,
-    Target,
-}
-
-/// Spec-derived frame ordering for TCP requests and UDP datagrams.
+/// Spec-derived frame ordering for TCP requests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyFrameLayout {
     /// TCP request field order.
     pub tcp: [TcpFrameElement; 3],
-    /// UDP datagram header field order.
-    pub udp: [UdpFrameElement; 4],
 }
 
 impl ProxyFrameLayout {
@@ -50,18 +39,7 @@ impl ProxyFrameLayout {
             tcp.swap(i, seed_byte as usize % (i + 1));
         }
 
-        let mut udp = [
-            UdpFrameElement::Version,
-            UdpFrameElement::Type,
-            UdpFrameElement::FlowId,
-            UdpFrameElement::Target,
-        ];
-        for i in (1..udp.len()).rev() {
-            let seed_byte = seed.get(udp.len() - i).copied().unwrap_or_default();
-            udp.swap(i, seed_byte as usize % (i + 1));
-        }
-
-        Self { tcp, udp }
+        Self { tcp }
     }
 }
 

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::common::handshake_timeout;
@@ -26,7 +26,7 @@ use crate::protocol::{
 };
 
 pub(in crate::portal) use self::flow::QueuedDatagram;
-use self::flow::{PortalUdpFlow, UdpFlowKey};
+use self::flow::UdpReassembler;
 use super::relay::relay_tcp_target;
 use crate::portal::PortalInner;
 
@@ -36,18 +36,20 @@ pub(super) struct PortalSession {
     conn: Connection,
     pub(super) session_id: SessionId,
     quic_generation: AtomicU64,
-    udp_flows: Mutex<HashMap<UdpFlowKey, Arc<PortalUdpFlow>>>,
-    compact_udp_flows: Mutex<HashMap<u64, CompactUdpState>>,
+    udp_flows: Mutex<HashMap<u64, UdpState>>,
+    udp_reassembler: Mutex<UdpReassembler>,
     udp_queue_budget: Arc<Semaphore>,
+    udp_flow_budget: Arc<Semaphore>,
     udp_overload_logged: AtomicBool,
     closed: AtomicBool,
 }
 
-pub(super) struct CompactUdpState {
+pub(super) struct UdpState {
     pub(super) target: String,
     pub(super) downlink: Carrier,
     pub(super) sender: mpsc::Sender<QueuedDatagram>,
     pub(super) acked: Arc<AtomicBool>,
+    pub(super) _flow_permit: Arc<OwnedSemaphorePermit>,
 }
 
 impl PortalSession {
@@ -64,14 +66,16 @@ impl PortalSession {
     /// Creates session state for one authenticated QUIC connection.
     pub(super) fn new(portal: Arc<PortalInner>, conn: Connection, session_id: SessionId) -> Self {
         let udp_queue_budget = Arc::new(Semaphore::new(portal.udp_flow_limits.queue_bytes));
+        let udp_flow_budget = Arc::new(Semaphore::new(portal.udp_flow_limits.max_flows));
         Self {
             portal,
             conn,
             session_id,
             quic_generation: AtomicU64::new(0),
             udp_flows: Mutex::new(HashMap::new()),
-            compact_udp_flows: Mutex::new(HashMap::new()),
+            udp_reassembler: Mutex::new(UdpReassembler::default()),
             udp_queue_budget,
+            udp_flow_budget,
             udp_overload_logged: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
@@ -83,6 +87,10 @@ impl PortalSession {
 
     pub(super) fn quic_generation(&self) -> u64 {
         self.quic_generation.load(Ordering::Acquire)
+    }
+
+    pub(super) fn udp_flow_budget(&self) -> Arc<Semaphore> {
+        self.udp_flow_budget.clone()
     }
 
     /// Handles a bidirectional QUIC stream carrying one TCP target request.
@@ -228,13 +236,7 @@ impl PortalSession {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let flows = {
-            let mut guard = self.udp_flows.lock().await;
-            guard.drain().map(|(_, flow)| flow).collect::<Vec<_>>()
-        };
-        for flow in flows {
-            flow.close().await;
-        }
-        self.compact_udp_flows.lock().await.clear();
+        self.udp_flows.lock().await.clear();
+        *self.udp_reassembler.lock().await = UdpReassembler::default();
     }
 }

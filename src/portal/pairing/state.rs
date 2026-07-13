@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use quinn::Connection;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::protocol::{FlowKind, SessionId};
 
@@ -110,12 +110,13 @@ pub(in crate::portal) enum UdpDown {
 pub(in crate::portal) enum UdpHalf {
     Uplink {
         uplink: UdpUp,
-        compact_ack: Option<CompactAck>,
+        udp_ack: Option<UdpAck>,
+        flow_permit: Option<Arc<OwnedSemaphorePermit>>,
     },
     Downlink(UdpDown),
 }
 
-pub(in crate::portal) struct CompactAck {
+pub(in crate::portal) struct UdpAck {
     pub(in crate::portal) conn: Connection,
     pub(in crate::portal) acked: Arc<AtomicBool>,
 }
@@ -125,7 +126,8 @@ pub(in crate::portal) struct PendingUdp {
     pub(in crate::portal) metadata: Metadata,
     pub(in crate::portal) uplink: Option<UdpUp>,
     pub(in crate::portal) downlink: Option<UdpDown>,
-    pub(in crate::portal) compact_ack: Option<CompactAck>,
+    pub(in crate::portal) udp_ack: Option<UdpAck>,
+    pub(in crate::portal) flow_permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(in crate::portal) uplink_path: Option<LinkPath>,
     pub(in crate::portal) downlink_path: Option<LinkPath>,
     pub(in crate::portal) uplink_generation: Option<u64>,
@@ -141,7 +143,8 @@ pub(in crate::portal) struct PairedUdp {
     pub(in crate::portal) downlink_carrier: crate::protocol::Carrier,
     pub(in crate::portal) uplink_path: LinkPath,
     pub(in crate::portal) downlink_path: LinkPath,
-    pub(in crate::portal) compact_ack: Option<CompactAck>,
+    pub(in crate::portal) udp_ack: Option<UdpAck>,
+    pub(in crate::portal) _flow_permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub(in crate::portal) struct PairedTcp {
@@ -163,4 +166,5 @@ pub(in crate::portal) struct LinkCounts {
 pub(in crate::portal) struct ActiveQuic {
     pub(in crate::portal) generation: u64,
     pub(in crate::portal) replacement: tokio_util::sync::CancellationToken,
+    pub(in crate::portal) udp_flow_budget: Arc<Semaphore>,
 }

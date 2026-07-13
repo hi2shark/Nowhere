@@ -78,20 +78,19 @@ it does not send transport keepalive packets.
 At debug log level, carrier health and routing counters are emitted separately:
 
 ```text
-LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>|UDPDROP=<datagrams>
+LINK_STATUS|TCP=<lanes>|UDP=<sessions>|PAIRS=<sessions>|UPTCP=<payload-bytes>|UPUDP=<payload-bytes>|DOWNTCP=<payload-bytes>|DOWNUDP=<payload-bytes>
 ```
 
 `TCP` counts authenticated TLS lanes, `UDP` authenticated QUIC sessions, and
 `PAIRS` logical sessions with both carriers ready. Directional byte fields
-count payload after Nowhere framing is removed. `UDPDROP` counts inbound QUIC
-DATAGRAMs rejected by a flow limit, connection byte budget, or full flow queue.
+count payload after Nowhere framing is removed.
 
 ## Rate Limits
 
 `rate` limits client-to-target traffic. `etar` limits target-to-client traffic.
 Both are process-wide limits shared across active TLS/TCP and QUIC sessions.
-For UoT, only UDP payload bytes are charged; the two-byte packet lengths and
-setup framing are not.
+For UoT, only UDP payload bytes are charged; typed frame headers and setup
+framing are not.
 
 ```text
 portal://secret@:2077?rate=100&etar=200
@@ -118,8 +117,14 @@ The Portal:
   authentication;
 - dispatches each DATAGRAM UDP flow to an independent bounded worker so target
   dialing and rate-limit waits do not block unrelated flows;
-- drops new DATAGRAM requests when the per-flow queue, per-connection byte
-  budget, or per-connection flow limit is full;
+- reassembles fixed `NOWU` fragments under a 64-slot, 10-second, connection-byte
+  budget before forwarding one complete UDP packet;
+- applies one flow permit budget to every symmetric and asymmetric UDP flow
+  involving the authenticated QUIC session;
+- uses backpressured DATAGRAM submission, re-fragments once after a path-MTU
+  change, and drops only the affected packet if it remains too large;
+- drops new DATAGRAM packets when the per-flow queue, per-connection byte
+  budget, reassembly cap, or per-connection flow limit is full;
 - raises the connection-level receive credit to 32 MiB after authentication;
 - uses 16 MiB per-stream receive credit;
 - permits up to 32 MiB of unacknowledged stream data per connection;
@@ -137,7 +142,7 @@ socket buffer requests.
 UoT is available whenever the TLS/TCP listener is enabled; it has no separate
 configuration switch. After normal transport authentication, a client sends a
 TCP request for the reserved target `uot.nowhere.invalid:0`, one UDP target
-setup frame, and then a sequence of two-byte-length-prefixed packets.
+setup frame, and then a sequence of typed `DATA`, `OPEN_ACK`, and `CLOSE` frames.
 
 Each UoT connection represents one logical UDP flow to one target. Packet
 boundaries are preserved, traffic in either direction refreshes
@@ -183,8 +188,8 @@ authentication succeeds or fails.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams after authentication. |
-| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
-| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum active UDP flows involving one authenticated QUIC session. |
+| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued and partially reassembled UDP payload bytes per authenticated QUIC connection. |
 | `NOW_TCP_IDLE_POOL_CONNS` | `4096` | Maximum authenticated TLS/TCP connections waiting for a first request. |
 | `NOW_MAX_PENDING_PAIRS` | `1024` | Maximum pending asymmetric flow pairs per session. |
 | `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Timeout for an unmatched flow half. |

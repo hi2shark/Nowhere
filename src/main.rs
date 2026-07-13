@@ -69,8 +69,8 @@ SOCKS5 outbound:
 
 Environment:
   NOW_QUIC_MAX_STREAMS      Maximum authenticated QUIC streams.
-  NOW_QUIC_MAX_UDP_FLOWS    Maximum DATAGRAM UDP flows per QUIC connection.
-  NOW_QUIC_UDP_QUEUE_BYTES  Maximum queued DATAGRAM bytes per QUIC connection.
+  NOW_QUIC_MAX_UDP_FLOWS    Maximum UDP flows involving one QUIC session.
+  NOW_QUIC_UDP_QUEUE_BYTES  Maximum queued/reassembling UDP bytes per QUIC connection.
   NOW_TCP_IDLE_POOL_CONNS   Maximum authenticated idle TLS/TCP connections.
   NOW_MAX_PENDING_PAIRS     Maximum unmatched asymmetric flow halves per session.
   NOW_FLOW_PAIR_TIMEOUT     Timeout for matching asymmetric flow halves.

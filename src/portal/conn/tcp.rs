@@ -280,7 +280,8 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                                             link_guard.take().expect("TCP link guard"),
                                         ),
                                     ),
-                                    compact_ack: None,
+                                    udp_ack: None,
+                                    flow_permit: None,
                                 },
                             )
                             .await

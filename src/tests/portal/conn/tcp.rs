@@ -15,8 +15,8 @@ use url::Url;
 use crate::common::{LogLevel, Logger, handshake_timeout};
 use crate::portal::Portal;
 use crate::protocol::{
-    UOT_MAGIC_TARGET, read_uot_packet, write_auth_frame, write_request_frame,
-    write_uot_packet_frame, write_uot_setup_frame,
+    UDP_STREAM_DATA, UOT_MAGIC_TARGET, UdpStreamFrame, encode_udp_stream_frame,
+    read_udp_stream_frame, write_auth_frame, write_request_frame, write_uot_setup_frame,
 };
 
 use super::super::*;
@@ -184,15 +184,15 @@ async fn tls_tcp_uot_relays_udp_and_counts_logical_udp() {
         &write_request_frame(UOT_MAGIC_TARGET, &portal.inner.credentials.protocol_spec).unwrap(),
     );
     bootstrap.extend_from_slice(&write_uot_setup_frame(&target_addr.to_string()).unwrap());
-    bootstrap.extend_from_slice(&write_uot_packet_frame(b"ping").unwrap());
+    bootstrap.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_DATA, b"ping").unwrap());
     tls.write_all(&bootstrap).await.unwrap();
 
-    let response = timeout(Duration::from_secs(3), read_uot_packet(&mut tls))
+    let response = timeout(Duration::from_secs(3), read_udp_stream_frame(&mut tls))
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(response, b"pong");
+    assert_eq!(response, UdpStreamFrame::Data(b"pong".to_vec()));
     assert_eq!(portal.inner.stats.udp_active.load(Ordering::Relaxed), 1);
     assert_eq!(portal.inner.stats.udp_rx.load(Ordering::Relaxed), 4);
     assert_eq!(portal.inner.stats.udp_tx.load(Ordering::Relaxed), 4);
@@ -241,15 +241,15 @@ async fn tls_tcp_uot_relays_through_authenticated_socks5_udp() {
         &write_request_frame(UOT_MAGIC_TARGET, &portal.inner.credentials.protocol_spec).unwrap(),
     );
     bootstrap.extend_from_slice(&write_uot_setup_frame("dns.test:53").unwrap());
-    bootstrap.extend_from_slice(&write_uot_packet_frame(b"ping").unwrap());
+    bootstrap.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_DATA, b"ping").unwrap());
     tls.write_all(&bootstrap).await.unwrap();
 
-    let response = timeout(Duration::from_secs(3), read_uot_packet(&mut tls))
+    let response = timeout(Duration::from_secs(3), read_udp_stream_frame(&mut tls))
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(response, b"pong");
+    assert_eq!(response, UdpStreamFrame::Data(b"pong".to_vec()));
     assert_eq!(portal.inner.stats.udp_rx.load(Ordering::Relaxed), 4);
     assert_eq!(portal.inner.stats.udp_tx.load(Ordering::Relaxed), 4);
 

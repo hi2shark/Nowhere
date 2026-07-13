@@ -16,8 +16,6 @@ pub struct Stats {
     pub udp_rx: AtomicU64,
     /// Bytes read from UDP targets and sent to clients.
     pub udp_tx: AtomicU64,
-    /// UDP datagrams dropped by bounded Portal queues and flow limits.
-    pub udp_dropped: AtomicU64,
     /// Currently active TCP relay sessions.
     pub tcp_active: AtomicI32,
     /// Currently active UDP relay sessions.

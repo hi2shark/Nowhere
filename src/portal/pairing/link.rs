@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
 
 use super::PairingRegistry;
 use super::state::{ActiveQuic, BoxReader, BoxWriter};
@@ -152,6 +153,7 @@ impl PairingRegistry {
         session_id: SessionId,
         stats: Arc<Stats>,
         replacement: tokio_util::sync::CancellationToken,
+        udp_flow_budget: Arc<Semaphore>,
     ) -> LinkGuard {
         let generation = self.next_quic_generation.fetch_add(1, Ordering::Relaxed);
         let mut links = self.links.lock().expect("link registry poisoned");
@@ -160,6 +162,7 @@ impl PairingRegistry {
         let previous = counts.udp.replace(ActiveQuic {
             generation,
             replacement,
+            udp_flow_budget,
         });
         let is_paired = counts.tcp > 0;
         if previous.is_none() {

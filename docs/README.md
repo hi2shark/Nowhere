@@ -16,7 +16,7 @@ port. It does not restrict the Portal to one proxy payload type.
 | `mix` | Both | Both paths | Both paths |
 
 UoT uses the reserved request target `uot.nowhere.invalid:0`, followed by one
-target setup frame and length-prefixed UDP packets. It is part of the v1 wire
+target setup frame and typed UDP packet/control frames. It is part of the v1 wire
 protocol and requires no separate server option.
 
 ## Documents

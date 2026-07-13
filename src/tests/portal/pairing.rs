@@ -12,7 +12,11 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+
+fn quic_udp_budget() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(256))
+}
 
 fn header(role: FlowRole) -> FlowHeader {
     header_with_id(role, 7)
@@ -49,9 +53,19 @@ fn newer_quic_session_replaces_previous_generation() {
     let stats = Arc::new(Stats::default());
     let session_id = [9; SESSION_ID_LEN];
     let first_replaced = tokio_util::sync::CancellationToken::new();
-    let first = registry.register_quic_link(session_id, stats.clone(), first_replaced.clone());
+    let first = registry.register_quic_link(
+        session_id,
+        stats.clone(),
+        first_replaced.clone(),
+        quic_udp_budget(),
+    );
     let second_replaced = tokio_util::sync::CancellationToken::new();
-    let second = registry.register_quic_link(session_id, stats.clone(), second_replaced.clone());
+    let second = registry.register_quic_link(
+        session_id,
+        stats.clone(),
+        second_replaced.clone(),
+        quic_udp_budget(),
+    );
     assert!(first_replaced.is_cancelled());
     assert!(!second_replaced.is_cancelled());
     assert_eq!(stats.link_udp.load(Ordering::Relaxed), 1);
@@ -70,6 +84,7 @@ async fn newer_generation_replaces_pending_quic_half() {
         session_id,
         stats.clone(),
         tokio_util::sync::CancellationToken::new(),
+        quic_udp_budget(),
     );
     let (old_down, mut old_peer) = tokio::io::duplex(64);
     assert!(
@@ -91,6 +106,7 @@ async fn newer_generation_replaces_pending_quic_half() {
         session_id,
         stats,
         tokio_util::sync::CancellationToken::new(),
+        quic_udp_budget(),
     );
     let (new_down, mut new_peer) = tokio::io::duplex(64);
     assert!(
@@ -145,6 +161,7 @@ async fn stale_timeout_does_not_remove_replacement_half() {
         session_id,
         stats.clone(),
         tokio_util::sync::CancellationToken::new(),
+        quic_udp_budget(),
     );
     let (old_down, _) = tokio::io::duplex(64);
     registry
@@ -164,6 +181,7 @@ async fn stale_timeout_does_not_remove_replacement_half() {
         session_id,
         stats,
         tokio_util::sync::CancellationToken::new(),
+        quic_udp_budget(),
     );
     let (new_down, mut new_peer) = tokio::io::duplex(64);
     registry
@@ -207,6 +225,7 @@ async fn pairs_out_of_order_and_rejects_conflicting_metadata() {
         [1; SESSION_ID_LEN],
         stats.clone(),
         tokio_util::sync::CancellationToken::new(),
+        quic_udp_budget(),
     );
     let (_, down) = tokio::io::duplex(64);
     assert!(
@@ -245,6 +264,7 @@ async fn pairs_out_of_order_and_rejects_conflicting_metadata() {
         [2; SESSION_ID_LEN],
         stats,
         tokio_util::sync::CancellationToken::new(),
+        quic_udp_budget(),
     );
     let (up, _) = tokio::io::duplex(64);
     assert!(
@@ -338,7 +358,8 @@ async fn pending_limit_is_enforced_per_session() {
                 tcp_half(),
                 UdpHalf::Uplink {
                     uplink: UdpUp::Tcp(Box::pin(up)),
-                    compact_ack: None,
+                    udp_ack: None,
+                    flow_permit: None,
                 },
             )
             .await

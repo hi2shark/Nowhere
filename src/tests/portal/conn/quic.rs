@@ -14,9 +14,8 @@ use crate::portal::{
     DEFAULT_QUIC_MAX_UDP_FLOWS, DEFAULT_QUIC_UDP_QUEUE_BYTES, Portal, UdpFlowLimits,
 };
 use crate::protocol::{
-    Carrier, CompactUdpFrame, DATAGRAM_UDP_CLOSE, DATAGRAM_UDP_COMPACT_CLOSE, DATAGRAM_UDP_DATA,
-    DATAGRAM_UDP_REQUEST, DATAGRAM_UDP_RESPONSE, decode_udp_compact, decode_udp_datagram,
-    encode_udp_compact, encode_udp_open_data, new_udp_datagram_header, write_auth_frame,
+    Carrier, UDP_FRAME_CLOSE, UdpFrame, decode_udp_frame, encode_udp_control,
+    encode_udp_data_fragments, encode_udp_open_fragments, write_auth_frame,
 };
 
 use super::super::*;
@@ -41,22 +40,11 @@ async fn authenticate_test_connection(portal: &Portal, connection: &quinn::Conne
         .unwrap();
 }
 
-fn test_udp_datagram(
-    portal: &Portal,
-    frame_type: u8,
-    flow_id: u64,
-    target: &str,
-    payload: &[u8],
-) -> Bytes {
-    let mut frame = new_udp_datagram_header(
-        frame_type,
-        flow_id,
-        target,
-        &portal.inner.credentials.protocol_spec,
-    )
-    .unwrap();
-    frame.extend_from_slice(payload);
-    Bytes::from(frame)
+fn test_udp_datagram(flow_id: u64, target: &str, payload: &[u8]) -> Bytes {
+    let frames =
+        encode_udp_open_fragments(flow_id, 1, Carrier::Udp, target, payload, 1200).unwrap();
+    assert_eq!(frames.len(), 1);
+    Bytes::from(frames.into_iter().next().unwrap())
 }
 
 async fn wait_for_udp_active(portal: &Portal, expected: i32) {
@@ -69,24 +57,71 @@ async fn wait_for_udp_active(portal: &Portal, expected: i32) {
     .unwrap();
 }
 
+async fn read_udp_data(connection: &quinn::Connection) -> Bytes {
+    loop {
+        let frame = timeout(Duration::from_secs(2), connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(decode_udp_frame(&frame).unwrap(), UdpFrame::Data { .. }) {
+            return frame;
+        }
+    }
+}
+
+async fn read_udp_packet(connection: &quinn::Connection) -> (u64, Vec<u8>) {
+    let mut flow_id = None;
+    let mut total_len = None;
+    let mut fragments: Vec<Option<Vec<u8>>> = Vec::new();
+    loop {
+        let frame = timeout(Duration::from_secs(2), connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        let UdpFrame::Data {
+            flow_id: frame_flow_id,
+            fragment,
+        } = decode_udp_frame(&frame).unwrap()
+        else {
+            continue;
+        };
+        flow_id.get_or_insert(frame_flow_id);
+        total_len.get_or_insert(fragment.total_len as usize);
+        if fragments.is_empty() {
+            fragments.resize(fragment.fragment_count as usize, None);
+        }
+        fragments[fragment.fragment_id as usize] = Some(fragment.payload.to_vec());
+        if fragments.iter().all(Option::is_some) {
+            let payload = fragments
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(payload.len(), total_len.unwrap());
+            return (flow_id.unwrap(), payload);
+        }
+    }
+}
+
 #[tokio::test]
-async fn unknown_compact_udp_data_requests_flow_reopen() {
+async fn unknown_udp_data_requests_flow_reopen() {
     let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
         connect_test_quic().await;
     authenticate_test_connection(&portal, &connection).await;
 
-    let data = encode_udp_compact(DATAGRAM_UDP_DATA, 77, b"target-free").unwrap();
-    connection.send_datagram(Bytes::from(data)).unwrap();
+    let data = encode_udp_data_fragments(77, 1, b"target-free", 1200).unwrap();
+    connection
+        .send_datagram(Bytes::from(data.into_iter().next().unwrap()))
+        .unwrap();
 
     let response = timeout(Duration::from_secs(2), connection.read_datagram())
         .await
         .unwrap()
         .unwrap();
     assert!(matches!(
-        decode_udp_compact(&response).unwrap(),
-        CompactUdpFrame::Close { flow_id: 77 }
+        decode_udp_frame(&response).unwrap(),
+        UdpFrame::Close { flow_id: 77 }
     ));
-    assert_eq!(response[1], DATAGRAM_UDP_COMPACT_CLOSE);
 
     connection.close(VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
@@ -101,20 +136,84 @@ async fn repeated_open_data_resends_open_ack() {
     authenticate_test_connection(&portal, &connection).await;
 
     for payload in [b"first".as_slice(), b"second".as_slice()] {
-        let open = encode_udp_open_data(78, Carrier::Udp, &target_addr, payload).unwrap();
-        connection.send_datagram(Bytes::from(open)).unwrap();
+        connection
+            .send_datagram(test_udp_datagram(78, &target_addr, payload))
+            .unwrap();
         let ack = timeout(Duration::from_secs(2), connection.read_datagram())
             .await
             .unwrap()
             .unwrap();
         assert!(matches!(
-            decode_udp_compact(&ack).unwrap(),
-            CompactUdpFrame::OpenAck { flow_id: 78 }
+            decode_udp_frame(&ack).unwrap(),
+            UdpFrame::OpenAck { flow_id: 78 }
         ));
     }
 
     connection.close(VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn large_target_packet_is_fragmented_without_closing_flow() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let large = vec![0x5a; 4_000];
+    let expected = large.clone();
+    let target_task = tokio::spawn(async move {
+        let mut buf = [0u8; 16];
+        let (_, peer) = target.recv_from(&mut buf).await.unwrap();
+        target.send_to(&large, peer).await.unwrap();
+        let (_, peer) = target.recv_from(&mut buf).await.unwrap();
+        target.send_to(b"ok", peer).await.unwrap();
+    });
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    connection
+        .send_datagram(test_udp_datagram(79, &target_addr, b"first"))
+        .unwrap();
+    let (flow_id, received) = read_udp_packet(&connection).await;
+    assert_eq!(flow_id, 79);
+    assert_eq!(received, expected);
+
+    let data = encode_udp_data_fragments(79, 2, b"second", 1_200).unwrap();
+    connection
+        .send_datagram(Bytes::from(data.into_iter().next().unwrap()))
+        .unwrap();
+    let (flow_id, received) = read_udp_packet(&connection).await;
+    assert_eq!(flow_id, 79);
+    assert_eq!(received, b"ok");
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+    target_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn zero_length_udp_packet_round_trips_as_data() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let target_task = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        let (length, peer) = target.recv_from(&mut buf).await.unwrap();
+        assert_eq!(length, 0);
+        assert_eq!(target.send_to(&[], peer).await.unwrap(), 0);
+    });
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    connection
+        .send_datagram(test_udp_datagram(80, &target_addr, &[]))
+        .unwrap();
+    let (flow_id, received) = read_udp_packet(&connection).await;
+    assert_eq!(flow_id, 80);
+    assert!(received.is_empty());
+
+    connection.close(VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+    target_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -151,15 +250,9 @@ async fn quic_pre_auth_stream_limit_is_raised_and_early_datagram_is_preserved() 
             .is_err()
     );
 
-    let mut datagram = new_udp_datagram_header(
-        DATAGRAM_UDP_REQUEST,
-        7,
-        &target_addr.to_string(),
-        &portal.inner.credentials.protocol_spec,
-    )
-    .unwrap();
-    datagram.extend_from_slice(b"early");
-    connection.send_datagram(Bytes::from(datagram)).unwrap();
+    connection
+        .send_datagram(test_udp_datagram(7, &target_addr.to_string(), b"early"))
+        .unwrap();
 
     let auth = write_auth_frame(
         portal.inner.credentials.key,
@@ -205,26 +298,16 @@ async fn quic_datagram_relays_through_socks5_udp_associate() {
         .unwrap()
         .unwrap();
 
-    let mut request = new_udp_datagram_header(
-        DATAGRAM_UDP_REQUEST,
-        11,
-        "dns.test:53",
-        &portal.inner.credentials.protocol_spec,
-    )
-    .unwrap();
-    request.extend_from_slice(b"ping");
-    connection.send_datagram(Bytes::from(request)).unwrap();
-
-    let response = timeout(Duration::from_secs(3), connection.read_datagram())
-        .await
-        .unwrap()
+    connection
+        .send_datagram(test_udp_datagram(11, "dns.test:53", b"ping"))
         .unwrap();
-    let (frame_type, flow_id, target, payload) =
-        decode_udp_datagram(&response, &portal.inner.credentials.protocol_spec).unwrap();
-    assert_eq!(frame_type, DATAGRAM_UDP_RESPONSE);
+
+    let response = read_udp_data(&connection).await;
+    let UdpFrame::Data { flow_id, fragment } = decode_udp_frame(&response).unwrap() else {
+        panic!("expected DATA");
+    };
     assert_eq!(flow_id, 11);
-    assert_eq!(target, "dns.test:53");
-    assert_eq!(payload, b"pong");
+    assert_eq!(fragment.payload, b"pong");
 
     connection.close(VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
@@ -241,30 +324,16 @@ async fn stalled_udp_dial_does_not_block_an_existing_flow() {
     authenticate_test_connection(&portal, &connection).await;
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            1,
-            "fast.test:53",
-            b"one",
-        ))
+        .send_datagram(test_udp_datagram(1, "fast.test:53", b"one"))
         .unwrap();
-    let first = timeout(Duration::from_secs(2), connection.read_datagram())
-        .await
-        .unwrap()
-        .unwrap();
-    let (_, _, _, payload) =
-        decode_udp_datagram(&first, &portal.inner.credentials.protocol_spec).unwrap();
-    assert_eq!(payload, b"one");
+    let first = read_udp_data(&connection).await;
+    let UdpFrame::Data { fragment, .. } = decode_udp_frame(&first).unwrap() else {
+        panic!("expected DATA");
+    };
+    assert_eq!(fragment.payload, b"one");
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            2,
-            "slow.test:53",
-            b"blocked",
-        ))
+        .send_datagram(test_udp_datagram(2, "slow.test:53", b"blocked"))
         .unwrap();
     timeout(Duration::from_secs(2), stalled)
         .await
@@ -273,22 +342,16 @@ async fn stalled_udp_dial_does_not_block_an_existing_flow() {
 
     let started = Instant::now();
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            1,
-            "fast.test:53",
-            b"two",
-        ))
+        .send_datagram(test_udp_datagram(1, "fast.test:53", b"two"))
         .unwrap();
-    let second = timeout(Duration::from_millis(500), connection.read_datagram())
+    let second = timeout(Duration::from_millis(500), read_udp_data(&connection))
         .await
-        .unwrap()
         .unwrap();
-    let (_, flow_id, _, payload) =
-        decode_udp_datagram(&second, &portal.inner.credentials.protocol_spec).unwrap();
+    let UdpFrame::Data { flow_id, fragment } = decode_udp_frame(&second).unwrap() else {
+        panic!("expected DATA");
+    };
     assert_eq!(flow_id, 1);
-    assert_eq!(payload, b"two");
+    assert_eq!(fragment.payload, b"two");
     assert!(started.elapsed() < Duration::from_millis(500));
 
     connection.close(VarInt::from_u32(0), b"");
@@ -315,13 +378,7 @@ async fn udp_flow_limit_is_released_by_close_frame() {
     authenticate_test_connection(&portal, &connection).await;
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            10,
-            &first_addr,
-            b"first",
-        ))
+        .send_datagram(test_udp_datagram(10, &first_addr, b"first"))
         .unwrap();
     let mut received = [0u8; 16];
     let (size, _) = timeout(
@@ -334,13 +391,7 @@ async fn udp_flow_limit_is_released_by_close_frame() {
     assert_eq!(&received[..size], b"first");
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            11,
-            &second_addr,
-            b"limited",
-        ))
+        .send_datagram(test_udp_datagram(11, &second_addr, b"limited"))
         .unwrap();
     assert!(
         timeout(
@@ -352,24 +403,14 @@ async fn udp_flow_limit_is_released_by_close_frame() {
     );
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_CLOSE,
-            10,
-            &first_addr,
-            b"",
+        .send_datagram(Bytes::from(
+            encode_udp_control(UDP_FRAME_CLOSE, 10).unwrap(),
         ))
         .unwrap();
     wait_for_udp_active(&portal, 0).await;
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            11,
-            &second_addr,
-            b"accepted",
-        ))
+        .send_datagram(test_udp_datagram(11, &second_addr, b"accepted"))
         .unwrap();
     let (size, _) = timeout(
         Duration::from_secs(2),
@@ -401,13 +442,7 @@ async fn udp_queue_budget_is_checked_before_flow_creation() {
     authenticate_test_connection(&portal, &connection).await;
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            20,
-            &target_addr,
-            b"dropped",
-        ))
+        .send_datagram(test_udp_datagram(20, &target_addr, b"dropped"))
         .unwrap();
     let mut received = [0u8; 16];
     assert!(
@@ -416,20 +451,12 @@ async fn udp_queue_budget_is_checked_before_flow_creation() {
             .is_err()
     );
     assert_eq!(portal.inner.stats.udp_active.load(Ordering::Relaxed), 0);
-    timeout(Duration::from_secs(1), async {
-        while portal.inner.stats.udp_dropped.load(Ordering::Relaxed) != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-
     connection.close(VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
 }
 
 #[tokio::test]
-async fn compact_udp_uses_connection_queue_budget_and_counts_drop() {
+async fn udp_uses_connection_queue_budget() {
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap().to_string();
     let limits = UdpFlowLimits {
@@ -444,8 +471,9 @@ async fn compact_udp_uses_connection_queue_budget_and_counts_drop() {
         .await;
     authenticate_test_connection(&portal, &connection).await;
 
-    let open = encode_udp_open_data(21, Carrier::Udp, &target_addr, b"dropped").unwrap();
-    connection.send_datagram(Bytes::from(open)).unwrap();
+    connection
+        .send_datagram(test_udp_datagram(21, &target_addr, b"dropped"))
+        .unwrap();
 
     let mut received = [0u8; 16];
     assert!(
@@ -453,13 +481,6 @@ async fn compact_udp_uses_connection_queue_budget_and_counts_drop() {
             .await
             .is_err()
     );
-    timeout(Duration::from_secs(1), async {
-        while portal.inner.stats.udp_dropped.load(Ordering::Relaxed) != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
     assert_eq!(portal.inner.stats.udp_active.load(Ordering::Relaxed), 0);
 
     connection.close(VarInt::from_u32(0), b"");
@@ -475,13 +496,7 @@ async fn udp_dial_failure_releases_flow_accounting() {
     authenticate_test_connection(&portal, &connection).await;
 
     connection
-        .send_datagram(test_udp_datagram(
-            &portal,
-            DATAGRAM_UDP_REQUEST,
-            30,
-            "rejected.test:53",
-            b"request",
-        ))
+        .send_datagram(test_udp_datagram(30, "rejected.test:53", b"request"))
         .unwrap();
     socks_task.await.unwrap();
     wait_for_udp_active(&portal, 0).await;
