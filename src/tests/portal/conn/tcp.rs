@@ -15,14 +15,30 @@ use url::Url;
 use crate::common::{LogLevel, Logger, handshake_timeout};
 use crate::portal::Portal;
 use crate::protocol::{
-    UOT_MAGIC_TARGET, read_uot_packet, write_auth_frame, write_request_frame,
-    write_uot_packet_frame, write_uot_setup_frame,
+    Carrier, FlowHeader, FlowKind, FlowResult, FlowRole, UDP_STREAM_DATA, UdpStreamFrame,
+    encode_udp_stream_frame, read_flow_result, read_udp_stream_frame, write_auth_frame,
+    write_flow_header, write_request_frame,
 };
 
 use super::super::*;
 use super::support::{
     TestSocksAuth, connect_test_tls, spawn_test_socks5_tcp, spawn_test_socks5_udp,
 };
+
+fn duplex_setup(portal: &Portal, flow_id: u64, kind: FlowKind, target: &str) -> Vec<u8> {
+    let mut setup = write_flow_header(FlowHeader {
+        role: FlowRole::Duplex,
+        flow_id,
+        kind,
+        uplink: Carrier::TlsTcp,
+        downlink: Carrier::TlsTcp,
+    })
+    .to_vec();
+    setup.extend_from_slice(
+        &write_request_frame(target, &portal.inner.credentials.protocol_spec).unwrap(),
+    );
+    setup
+}
 
 #[tokio::test]
 async fn tls_tcp_pool_waits_beyond_handshake_timeout_then_relays() {
@@ -75,10 +91,11 @@ async fn tls_tcp_pool_waits_beyond_handshake_timeout_then_relays() {
     tokio::time::sleep(handshake_timeout() + Duration::from_millis(100)).await;
     assert_eq!(portal.inner.pool_active.load(Ordering::Relaxed), 1);
 
-    let mut request =
-        write_request_frame(&target.to_string(), &portal.inner.credentials.protocol_spec).unwrap();
+    let mut request = duplex_setup(&portal, 1, FlowKind::Tcp, &target.to_string());
     request.extend_from_slice(b"ping");
     tls.write_all(&request).await.unwrap();
+
+    assert_eq!(read_flow_result(&mut tls).await.unwrap(), FlowResult::Ready);
 
     let mut response = [0u8; 4];
     timeout(Duration::from_secs(3), tls.read_exact(&mut response))
@@ -125,11 +142,11 @@ async fn tls_tcp_relays_through_socks5_connect() {
         &portal.inner.credentials.protocol_spec,
         [21; 32],
     );
-    request.extend_from_slice(
-        &write_request_frame("target.test:443", &portal.inner.credentials.protocol_spec).unwrap(),
-    );
+    request.extend_from_slice(&duplex_setup(&portal, 2, FlowKind::Tcp, "target.test:443"));
     request.extend_from_slice(b"ping");
     tls.write_all(&request).await.unwrap();
+
+    assert_eq!(read_flow_result(&mut tls).await.unwrap(), FlowResult::Ready);
 
     let mut response = [0u8; 4];
     timeout(Duration::from_secs(3), tls.read_exact(&mut response))
@@ -180,19 +197,25 @@ async fn tls_tcp_uot_relays_udp_and_counts_logical_udp() {
         &portal.inner.credentials.protocol_spec,
         [13; 32],
     );
-    bootstrap.extend_from_slice(
-        &write_request_frame(UOT_MAGIC_TARGET, &portal.inner.credentials.protocol_spec).unwrap(),
-    );
-    bootstrap.extend_from_slice(&write_uot_setup_frame(&target_addr.to_string()).unwrap());
-    bootstrap.extend_from_slice(&write_uot_packet_frame(b"ping").unwrap());
+    bootstrap.extend_from_slice(&duplex_setup(
+        &portal,
+        3,
+        FlowKind::Udp,
+        &target_addr.to_string(),
+    ));
+    bootstrap.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_DATA, b"ping").unwrap());
     tls.write_all(&bootstrap).await.unwrap();
 
-    let response = timeout(Duration::from_secs(3), read_uot_packet(&mut tls))
+    assert_eq!(
+        read_udp_stream_frame(&mut tls).await.unwrap(),
+        Some(UdpStreamFrame::Ready)
+    );
+    let response = timeout(Duration::from_secs(3), read_udp_stream_frame(&mut tls))
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(response, b"pong");
+    assert_eq!(response, UdpStreamFrame::Data(b"pong".to_vec()));
     assert_eq!(portal.inner.stats.udp_active.load(Ordering::Relaxed), 1);
     assert_eq!(portal.inner.stats.udp_rx.load(Ordering::Relaxed), 4);
     assert_eq!(portal.inner.stats.udp_tx.load(Ordering::Relaxed), 4);
@@ -202,6 +225,13 @@ async fn tls_tcp_uot_relays_udp_and_counts_logical_udp() {
     shutdown.cancel();
     echo_task.await.unwrap();
     server_task.await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        while portal.inner.stats.udp_active.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(portal.inner.stats.udp_active.load(Ordering::Relaxed), 0);
 }
 
@@ -237,19 +267,20 @@ async fn tls_tcp_uot_relays_through_authenticated_socks5_udp() {
         &portal.inner.credentials.protocol_spec,
         [22; 32],
     );
-    bootstrap.extend_from_slice(
-        &write_request_frame(UOT_MAGIC_TARGET, &portal.inner.credentials.protocol_spec).unwrap(),
-    );
-    bootstrap.extend_from_slice(&write_uot_setup_frame("dns.test:53").unwrap());
-    bootstrap.extend_from_slice(&write_uot_packet_frame(b"ping").unwrap());
+    bootstrap.extend_from_slice(&duplex_setup(&portal, 4, FlowKind::Udp, "dns.test:53"));
+    bootstrap.extend_from_slice(&encode_udp_stream_frame(UDP_STREAM_DATA, b"ping").unwrap());
     tls.write_all(&bootstrap).await.unwrap();
 
-    let response = timeout(Duration::from_secs(3), read_uot_packet(&mut tls))
+    assert_eq!(
+        read_udp_stream_frame(&mut tls).await.unwrap(),
+        Some(UdpStreamFrame::Ready)
+    );
+    let response = timeout(Duration::from_secs(3), read_udp_stream_frame(&mut tls))
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(response, b"pong");
+    assert_eq!(response, UdpStreamFrame::Data(b"pong".to_vec()));
     assert_eq!(portal.inner.stats.udp_rx.load(Ordering::Relaxed), 4);
     assert_eq!(portal.inner.stats.udp_tx.load(Ordering::Relaxed), 4);
 
@@ -356,4 +387,51 @@ async fn tls_tcp_pool_ttl_closes_unused_connection() {
 
     shutdown.cancel();
     let _ = tls.shutdown().await;
+}
+
+#[tokio::test]
+async fn tls_tcp_idle_pool_limit_closes_excess_authenticated_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let portal = Portal::new(
+        Url::parse("portal://secret@127.0.0.1:2077?log=none&net=tcp").unwrap(),
+        Logger::new(LogLevel::None, false),
+    )
+    .unwrap();
+    portal.inner.tcp_idle_pool_budget.close();
+    let portal_inner = portal.inner.clone();
+    let shutdown = CancellationToken::new();
+    let child_shutdown = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let admission = portal_inner
+            .unauthenticated_admission
+            .try_acquire(peer.ip())
+            .unwrap();
+        handle_tcp_incoming(portal_inner, stream, peer, admission, child_shutdown).await;
+    });
+
+    let mut tls = connect_test_tls(listen_addr).await;
+    let auth = write_auth_frame(
+        portal.inner.credentials.key,
+        &portal.inner.credentials.protocol_spec,
+        [9; 32],
+    );
+    tls.write_all(&auth).await.unwrap();
+
+    timeout(Duration::from_secs(1), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(portal.inner.pool_active.load(Ordering::Relaxed), 0);
+    let mut byte = [0u8; 1];
+    match timeout(Duration::from_secs(1), tls.read(&mut byte))
+        .await
+        .unwrap()
+    {
+        Ok(0) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        result => panic!("expected closed excess pool connection, got {result:?}"),
+    }
+    shutdown.cancel();
 }

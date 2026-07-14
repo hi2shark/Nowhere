@@ -4,7 +4,7 @@
 //! Transport-independent logical flow envelope used to pair TCP and QUIC halves.
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const SESSION_ID_LEN: usize = 16;
 pub type SessionId = [u8; SESSION_ID_LEN];
@@ -13,11 +13,16 @@ pub const FLOW_FRAME_MAGIC: u8 = 0xf1;
 const FLOW_FRAME_VERSION: u8 = 1;
 const FLOW_HEADER_LEN: usize = 14;
 
+pub const FLOW_RESULT_MAGIC: u8 = 0xf2;
+const FLOW_RESULT_VERSION: u8 = 1;
+const FLOW_RESULT_LEN: usize = 4;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FlowRole {
     Open = 1,
     Attach = 2,
+    Duplex = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,8 +35,50 @@ pub enum FlowKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Carrier {
-    Tcp = 1,
-    Udp = 2,
+    TlsTcp = 1,
+    Quic = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FlowStatus {
+    Ready = 1,
+    Reject = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FlowErrorCode {
+    InvalidRequest = 1,
+    MetadataConflict = 2,
+    PairTimeout = 3,
+    FlowLimit = 4,
+    DialFailed = 5,
+    SessionReplaced = 6,
+    InternalError = 7,
+}
+
+impl TryFrom<u8> for FlowErrorCode {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::InvalidRequest),
+            2 => Ok(Self::MetadataConflict),
+            3 => Ok(Self::PairTimeout),
+            4 => Ok(Self::FlowLimit),
+            5 => Ok(Self::DialFailed),
+            6 => Ok(Self::SessionReplaced),
+            7 => Ok(Self::InternalError),
+            value => bail!("protocol::flow: invalid flow error code: {value}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowResult {
+    Ready,
+    Reject(FlowErrorCode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +114,7 @@ pub async fn read_flow_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Fl
     let role = match bytes[2] {
         1 => FlowRole::Open,
         2 => FlowRole::Attach,
+        3 => FlowRole::Duplex,
         value => bail!("protocol::flow::read_flow_header: invalid role: {value}"),
     };
     let flow_id = u64::from_be_bytes(bytes[3..11].try_into().expect("fixed flow id"));
@@ -79,17 +127,62 @@ pub async fn read_flow_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Fl
         value => bail!("protocol::flow::read_flow_header: invalid kind: {value}"),
     };
     let carrier = |value| match value {
-        1 => Ok(Carrier::Tcp),
-        2 => Ok(Carrier::Udp),
+        1 => Ok(Carrier::TlsTcp),
+        2 => Ok(Carrier::Quic),
         value => bail!("protocol::flow::read_flow_header: invalid carrier: {value}"),
     };
-    Ok(FlowHeader {
+    let header = FlowHeader {
         role,
         flow_id,
         kind,
         uplink: carrier(bytes[12])?,
         downlink: carrier(bytes[13])?,
-    })
+    };
+    match header.role {
+        FlowRole::Duplex if header.uplink != header.downlink => {
+            bail!("protocol::flow::read_flow_header: duplex carrier mismatch")
+        }
+        FlowRole::Open | FlowRole::Attach if header.uplink == header.downlink => {
+            bail!("protocol::flow::read_flow_header: split carriers must differ")
+        }
+        _ => Ok(header),
+    }
+}
+
+pub fn encode_flow_result(result: FlowResult) -> [u8; FLOW_RESULT_LEN] {
+    let (status, code) = match result {
+        FlowResult::Ready => (FlowStatus::Ready as u8, 0),
+        FlowResult::Reject(code) => (FlowStatus::Reject as u8, code as u8),
+    };
+    [FLOW_RESULT_MAGIC, FLOW_RESULT_VERSION, status, code]
+}
+
+pub async fn write_flow_result<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    result: FlowResult,
+) -> Result<()> {
+    writer
+        .write_all(&encode_flow_result(result))
+        .await
+        .context("protocol::flow::write_flow_result: failed to write result")
+}
+
+pub async fn read_flow_result<R: AsyncRead + Unpin>(reader: &mut R) -> Result<FlowResult> {
+    let mut bytes = [0; FLOW_RESULT_LEN];
+    reader
+        .read_exact(&mut bytes)
+        .await
+        .context("protocol::flow::read_flow_result: failed to read result")?;
+    if bytes[0] != FLOW_RESULT_MAGIC || bytes[1] != FLOW_RESULT_VERSION {
+        bail!("protocol::flow::read_flow_result: invalid magic or version");
+    }
+    match (bytes[2], bytes[3]) {
+        (status, 0) if status == FlowStatus::Ready as u8 => Ok(FlowResult::Ready),
+        (status, code) if status == FlowStatus::Reject as u8 => {
+            Ok(FlowResult::Reject(code.try_into()?))
+        }
+        _ => bail!("protocol::flow::read_flow_result: invalid status or code"),
+    }
 }
 
 #[cfg(test)]

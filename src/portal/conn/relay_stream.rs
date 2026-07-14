@@ -39,8 +39,8 @@ where
             portal.stats.tcp_rx.fetch_add(n as u64, Ordering::Relaxed);
             if let Some((uplink, _)) = carriers {
                 match uplink {
-                    Carrier::Tcp => &portal.stats.up_tcp,
-                    Carrier::Udp => &portal.stats.up_udp,
+                    Carrier::TlsTcp => &portal.stats.up_tcp,
+                    Carrier::Quic => &portal.stats.up_udp,
                 }
                 .fetch_add(n as u64, Ordering::Relaxed);
             }
@@ -67,8 +67,8 @@ where
             portal.stats.tcp_tx.fetch_add(n as u64, Ordering::Relaxed);
             if let Some((_, downlink)) = carriers {
                 match downlink {
-                    Carrier::Tcp => &portal.stats.down_tcp,
-                    Carrier::Udp => &portal.stats.down_udp,
+                    Carrier::TlsTcp => &portal.stats.down_tcp,
+                    Carrier::Quic => &portal.stats.down_udp,
                 }
                 .fetch_add(n as u64, Ordering::Relaxed);
             }

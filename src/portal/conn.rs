@@ -8,6 +8,8 @@ mod relay;
 mod session;
 mod tcp;
 
+pub(in crate::portal) use self::session::QueuedDatagram;
+
 use std::sync::Arc;
 
 use quinn::{Connection, Incoming, VarInt};
@@ -81,11 +83,14 @@ async fn handle_connection(
     drop(admission);
     let session = authenticated.session;
     let link_replaced = CancellationToken::new();
-    let link_guard = portal.pairing.register_quic_link(
-        session.session_id,
-        portal.stats.clone(),
-        link_replaced.clone(),
-    );
+    let link_guard = portal
+        .pairing
+        .register_quic_link(
+            session.session_id,
+            portal.stats.clone(),
+            link_replaced.clone(),
+        )
+        .await;
     session.set_quic_generation(link_guard.quic_generation());
     let _link_guard = link_guard;
 
@@ -115,7 +120,8 @@ async fn handle_connection(
                 match stream {
                     Ok((send, recv)) => {
                         let session = session.clone();
-                        tokio::spawn(async move {
+                        let tasks = portal.flow_tasks.clone();
+                        tasks.spawn(async move {
                             session.handle_stream(send, recv).await;
                         });
                     }
@@ -132,6 +138,7 @@ async fn handle_connection(
 
     session.close().await;
     datagram_task.abort();
+    let _ = datagram_task.await;
     conn.close(VarInt::from_u32(0), b"");
 }
 

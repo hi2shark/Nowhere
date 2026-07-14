@@ -91,16 +91,23 @@ impl Drop for LinkGuard {
     fn drop(&mut self) {
         let mut links = self.registry.links.lock().expect("link registry poisoned");
         let Some(counts) = links.get_mut(&self.session_id) else {
+            if let Some(generation) = self.quic_generation {
+                self.registry
+                    .cancel_quic_generation(self.session_id, generation);
+            }
             return;
         };
         let was_paired = counts.tcp > 0 && counts.udp.is_some();
         match self.carrier {
-            crate::protocol::Carrier::Tcp => counts.tcp = counts.tcp.saturating_sub(1),
-            crate::protocol::Carrier::Udp => {
+            crate::protocol::Carrier::TlsTcp => counts.tcp = counts.tcp.saturating_sub(1),
+            crate::protocol::Carrier::Quic => {
                 let Some(generation) = self.quic_generation else {
                     return;
                 };
                 if counts.udp.as_ref().map(|active| active.generation) != Some(generation) {
+                    drop(links);
+                    self.registry
+                        .cancel_quic_generation(self.session_id, generation);
                     return;
                 }
                 counts.udp = None;
@@ -114,10 +121,16 @@ impl Drop for LinkGuard {
             links.remove(&self.session_id);
         }
         match self.carrier {
-            crate::protocol::Carrier::Tcp => &self.stats.link_tcp,
-            crate::protocol::Carrier::Udp => &self.stats.link_udp,
+            crate::protocol::Carrier::TlsTcp => &self.stats.link_tcp,
+            crate::protocol::Carrier::Quic => &self.stats.link_udp,
         }
         .fetch_sub(1, Ordering::Relaxed);
+        let generation = self.quic_generation;
+        drop(links);
+        if let Some(generation) = generation {
+            self.registry
+                .cancel_quic_generation(self.session_id, generation);
+        }
     }
 }
 
@@ -128,7 +141,9 @@ impl PairingRegistry {
         stats: Arc<Stats>,
     ) -> LinkGuard {
         let mut links = self.links.lock().expect("link registry poisoned");
-        let counts = links.entry(session_id).or_default();
+        let counts = links
+            .entry(session_id)
+            .or_insert_with(|| super::state::LinkCounts::new(self.max_udp_flows));
         let was_paired = counts.tcp > 0 && counts.udp.is_some();
         counts.tcp += 1;
         let is_paired = counts.udp.is_some();
@@ -141,42 +156,52 @@ impl PairingRegistry {
             registry: self.clone(),
             stats,
             session_id,
-            carrier: crate::protocol::Carrier::Tcp,
+            carrier: crate::protocol::Carrier::TlsTcp,
             quic_generation: None,
         }
     }
 
     /// Registers the latest authenticated QUIC carrier for a transport bundle.
-    pub(in crate::portal) fn register_quic_link(
+    pub(in crate::portal) async fn register_quic_link(
         self: &Arc<Self>,
         session_id: SessionId,
         stats: Arc<Stats>,
         replacement: tokio_util::sync::CancellationToken,
     ) -> LinkGuard {
         let generation = self.next_quic_generation.fetch_add(1, Ordering::Relaxed);
-        let mut links = self.links.lock().expect("link registry poisoned");
-        let counts = links.entry(session_id).or_default();
-        let was_paired = counts.tcp > 0 && counts.udp.is_some();
-        let previous = counts.udp.replace(ActiveQuic {
-            generation,
-            replacement,
-        });
-        let is_paired = counts.tcp > 0;
-        if previous.is_none() {
-            stats.link_udp.fetch_add(1, Ordering::Relaxed);
-            if !was_paired && is_paired {
-                stats.link_pairs.fetch_add(1, Ordering::Relaxed);
+        let previous = {
+            let mut links = self.links.lock().expect("link registry poisoned");
+            let counts = links
+                .entry(session_id)
+                .or_insert_with(|| super::state::LinkCounts::new(self.max_udp_flows));
+            let was_paired = counts.tcp > 0 && counts.udp.is_some();
+            let previous = counts.udp.replace(ActiveQuic {
+                generation,
+                replacement,
+            });
+            let is_paired = counts.tcp > 0;
+            if previous.is_none() {
+                stats.link_udp.fetch_add(1, Ordering::Relaxed);
+                if !was_paired && is_paired {
+                    stats.link_pairs.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
-        drop(links);
+            previous
+        };
         if let Some(previous) = previous {
             previous.replacement.cancel();
+            // Finish purging the previous generation before streams from the
+            // replacement carrier are admitted.  This makes pending-half
+            // replacement deterministic instead of depending on a spawned
+            // cleanup task winning a race with the first new stream.
+            self.replace_quic_generation(session_id, previous.generation)
+                .await;
         }
         LinkGuard {
             registry: self.clone(),
             stats,
             session_id,
-            carrier: crate::protocol::Carrier::Udp,
+            carrier: crate::protocol::Carrier::Quic,
             quic_generation: Some(generation),
         }
     }

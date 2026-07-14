@@ -89,8 +89,8 @@ count payload after Nowhere framing is removed.
 
 `rate` limits client-to-target traffic. `etar` limits target-to-client traffic.
 Both are process-wide limits shared across active TLS/TCP and QUIC sessions.
-For UoT, only UDP payload bytes are charged; the two-byte packet lengths and
-setup framing are not.
+For UoT, only UDP payload bytes are charged; typed frame headers and setup
+framing are not.
 
 ```text
 portal://secret@:2077?rate=100&etar=200
@@ -117,8 +117,16 @@ The Portal:
   authentication;
 - dispatches each DATAGRAM UDP flow to an independent bounded worker so target
   dialing and rate-limit waits do not block unrelated flows;
-- drops new DATAGRAM requests when the per-flow queue, per-connection byte
-  budget, or per-connection flow limit is full;
+- reassembles fixed `NOWU` fragments under a 64-slot, 10-second, connection-byte
+  budget before forwarding one complete UDP packet;
+- applies one flow permit budget to every symmetric and asymmetric UDP flow
+  involving the authenticated QUIC session;
+- uses backpressured DATAGRAM submission, re-fragments once after a path-MTU
+  change, and drops only the affected packet if it remains too large;
+- drops new DATAGRAM packets when the per-flow queue, per-QUIC-connection byte
+  budget, or reassembly cap is full;
+- rejects new UDP flow setup when the authenticated logical session's shared
+  flow limit is full;
 - raises the connection-level receive credit to 32 MiB after authentication;
 - uses 16 MiB per-stream receive credit;
 - permits up to 32 MiB of unacknowledged stream data per connection;
@@ -135,11 +143,12 @@ socket buffer requests.
 
 UoT is available whenever the TLS/TCP listener is enabled; it has no separate
 configuration switch. After normal transport authentication, a client sends a
-TCP request for the reserved target `uot.nowhere.invalid:0`, one UDP target
-setup frame, and then a sequence of two-byte-length-prefixed packets.
+logical-flow header with UDP kind, the target request required by its role, and
+then typed `DATA`, `READY`, `CLOSE`, and `REJECT` frames.
 
-Each UoT connection represents one logical UDP flow to one target. Packet
-boundaries are preserved, traffic in either direction refreshes
+Each UoT connection represents one carrier half, or one symmetric Duplex flow,
+for a logical UDP flow to one target. Packet boundaries are preserved, traffic
+in either direction refreshes
 `NOW_UDP_IDLE_TIMEOUT`, and closing the TLS/TCP connection closes the flow.
 UoT flows increment `UDPS`, `UDPRX`, and `UDPTX`, not the TCP relay counters.
 
@@ -182,10 +191,11 @@ authentication succeeds or fails.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOW_QUIC_MAX_STREAMS` | `1024` | Maximum concurrent QUIC bidirectional streams after authentication. |
-| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum QUIC DATAGRAM UDP flows per authenticated connection. |
-| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued QUIC DATAGRAM bytes per authenticated connection. |
-| `NOW_MAX_PENDING_FLOW_PAIRS` | `1024` | Maximum pending asymmetric flow pairs per session. |
-| `NOW_FLOW_PAIR_TIMEOUT` | `5s` | Timeout for an unmatched flow half. |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | Maximum active UDP flows per authenticated logical session across all carrier combinations. |
+| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` | Maximum queued and partially reassembled UDP payload bytes per authenticated QUIC connection. |
+| `NOW_TCP_IDLE_POOL_CONNS` | `4096` | Maximum authenticated TLS/TCP connections waiting for a first request. |
+| `NOW_MAX_PENDING_PAIRS` | `1024` | Maximum pending logical-flow records (`flow_id` values) per session. |
+| `NOW_FLOW_PAIR_TIMEOUT` | `15s` | Time allowed to complete a split logical flow. |
 | `NOW_TCP_DATA_BUF_SIZE` | `32768` | Buffer size for each TCP relay direction. |
 | `NOW_UDP_DATA_BUF_SIZE` | `65536` | UDP target-socket receive buffer size. |
 | `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connection timeout. |
@@ -194,13 +204,14 @@ authentication succeeds or fails.
 | `NOW_UDP_IDLE_TIMEOUT` | `120s` | QUIC connection and QUIC DATAGRAM/UoT flow idle timeout. |
 | `NOW_HANDSHAKE_TIMEOUT` | `5s` | Base authentication deadline before jitter. |
 | `NOW_REPORT_INTERVAL` | `5s` | Local checkpoint event interval. |
-| `NOW_SHUTDOWN_TIMEOUT` | `5s` | Endpoint idle wait during shutdown. |
+| `NOW_SHUTDOWN_TIMEOUT` | `5s` | Single graceful drain window shared by endpoints, accept loops, and flow tasks. |
 | `NOW_RELOAD_INTERVAL` | `3600s` | Minimum interval between PEM reload attempts. |
 
 Duration values accept forms such as `500ms`, `15s`, and `2m`. Invalid values
-use the defaults above. `NOW_QUIC_MAX_UDP_FLOWS` and
-`NOW_QUIC_UDP_QUEUE_BYTES` must be positive; zero or invalid values use their
-defaults and emit a warning. Other integer controls must be non-negative.
+use the defaults above. `NOW_QUIC_MAX_UDP_FLOWS`,
+`NOW_QUIC_UDP_QUEUE_BYTES`, and `NOW_TCP_IDLE_POOL_CONNS` must be
+positive; zero or invalid values use their defaults and emit a warning. Other
+integer controls must be non-negative.
 
 `NOW_SERVICE_COOLDOWN` also exists in the runtime defaults and currently
 defaults to `3s`; it is reserved for service-side retry paths.
@@ -211,8 +222,10 @@ defaults to `3s`; it is reserved for service-side retry paths.
 
 1. Cancels accept loops.
 2. Closes QUIC endpoints and active connections.
-3. Waits up to `NOW_SHUTDOWN_TIMEOUT` for endpoints to become idle.
-4. Waits for TCP connection tasks inside the same bounded shutdown window.
+3. Cancels logical flows and starts one `NOW_SHUTDOWN_TIMEOUT` drain window
+   shared by endpoints, accept loops, connection tasks, and flow tasks.
+4. At the shared deadline, force-aborts and joins any remaining accept,
+   connection, or flow tasks.
 5. Resets active rate limiters.
 6. Emits the shutdown-complete log and flushes the logger.
 

@@ -5,12 +5,11 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use bytes::Bytes;
 use quinn::Connection;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{FlowKind, SessionId};
 
@@ -23,19 +22,20 @@ pub(in crate::portal) struct FlowKey {
     pub(in crate::portal) flow_id: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::portal) struct Metadata {
     pub(in crate::portal) kind: FlowKind,
     pub(in crate::portal) uplink: crate::protocol::Carrier,
     pub(in crate::portal) downlink: crate::protocol::Carrier,
-    pub(in crate::portal) target: String,
 }
 
 pub(in crate::portal) struct PendingTcp {
     pub(in crate::portal) epoch: u64,
     pub(in crate::portal) metadata: Metadata,
+    pub(in crate::portal) target: Option<String>,
     pub(in crate::portal) uplink: Option<BoxReader>,
     pub(in crate::portal) downlink: Option<BoxWriter>,
+    pub(in crate::portal) downlink_liveness: Option<BoxReader>,
     pub(in crate::portal) uplink_path: Option<LinkPath>,
     pub(in crate::portal) downlink_path: Option<LinkPath>,
     pub(in crate::portal) uplink_generation: Option<u64>,
@@ -70,18 +70,18 @@ impl LinkHalf {
 }
 
 pub(in crate::portal) enum UdpUp {
-    Tcp(BoxReader),
+    TlsTcp(BoxReader),
     Quic(QuicUdpReceiver),
 }
 
 pub(in crate::portal) struct QuicUdpReceiver {
-    receiver: mpsc::Receiver<Bytes>,
+    receiver: mpsc::Receiver<crate::portal::conn::QueuedDatagram>,
     on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl QuicUdpReceiver {
     pub(in crate::portal) fn new(
-        receiver: mpsc::Receiver<Bytes>,
+        receiver: mpsc::Receiver<crate::portal::conn::QueuedDatagram>,
         on_drop: impl FnOnce() + Send + 'static,
     ) -> Self {
         Self {
@@ -90,8 +90,8 @@ impl QuicUdpReceiver {
         }
     }
 
-    pub(in crate::portal) async fn recv(&mut self) -> Option<Bytes> {
-        self.receiver.recv().await
+    pub(in crate::portal) async fn recv(&mut self) -> Option<bytes::Bytes> {
+        self.receiver.recv().await.map(|datagram| datagram.payload)
     }
 }
 
@@ -104,29 +104,29 @@ impl Drop for QuicUdpReceiver {
 }
 
 pub(in crate::portal) enum UdpDown {
-    Tcp(BoxWriter),
-    Quic(Connection),
+    TlsTcp {
+        writer: BoxWriter,
+        liveness: Option<BoxReader>,
+    },
+    Quic {
+        control: BoxWriter,
+        conn: Connection,
+    },
 }
 
 pub(in crate::portal) enum UdpHalf {
-    Uplink {
-        uplink: UdpUp,
-        compact_ack: Option<CompactAck>,
-    },
+    Uplink { uplink: UdpUp },
     Downlink(UdpDown),
-}
-
-pub(in crate::portal) struct CompactAck {
-    pub(in crate::portal) conn: Connection,
-    pub(in crate::portal) acked: Arc<AtomicBool>,
+    Duplex { uplink: UdpUp, downlink: UdpDown },
 }
 
 pub(in crate::portal) struct PendingUdp {
     pub(in crate::portal) epoch: u64,
     pub(in crate::portal) metadata: Metadata,
+    pub(in crate::portal) target: Option<String>,
     pub(in crate::portal) uplink: Option<UdpUp>,
     pub(in crate::portal) downlink: Option<UdpDown>,
-    pub(in crate::portal) compact_ack: Option<CompactAck>,
+    pub(in crate::portal) flow_permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(in crate::portal) uplink_path: Option<LinkPath>,
     pub(in crate::portal) downlink_path: Option<LinkPath>,
     pub(in crate::portal) uplink_generation: Option<u64>,
@@ -142,26 +142,69 @@ pub(in crate::portal) struct PairedUdp {
     pub(in crate::portal) downlink_carrier: crate::protocol::Carrier,
     pub(in crate::portal) uplink_path: LinkPath,
     pub(in crate::portal) downlink_path: LinkPath,
-    pub(in crate::portal) compact_ack: Option<CompactAck>,
+    pub(in crate::portal) _flow_lease: FlowLease,
 }
 
 pub(in crate::portal) struct PairedTcp {
     pub(in crate::portal) target: String,
     pub(in crate::portal) uplink: BoxReader,
     pub(in crate::portal) downlink: BoxWriter,
+    pub(in crate::portal) downlink_liveness: Option<BoxReader>,
     pub(in crate::portal) uplink_carrier: crate::protocol::Carrier,
     pub(in crate::portal) downlink_carrier: crate::protocol::Carrier,
     pub(in crate::portal) uplink_path: LinkPath,
     pub(in crate::portal) downlink_path: LinkPath,
+    pub(in crate::portal) _flow_lease: FlowLease,
 }
 
-#[derive(Default)]
 pub(in crate::portal) struct LinkCounts {
     pub(in crate::portal) tcp: usize,
     pub(in crate::portal) udp: Option<ActiveQuic>,
+    pub(in crate::portal) udp_flow_budget: Arc<Semaphore>,
+}
+
+impl LinkCounts {
+    pub(in crate::portal) fn new(max_udp_flows: usize) -> Self {
+        Self {
+            tcp: 0,
+            udp: None,
+            udp_flow_budget: Arc::new(Semaphore::new(max_udp_flows)),
+        }
+    }
 }
 
 pub(in crate::portal) struct ActiveQuic {
     pub(in crate::portal) generation: u64,
     pub(in crate::portal) replacement: tokio_util::sync::CancellationToken,
+}
+
+pub(in crate::portal) struct FlowClaim {
+    pub(in crate::portal) epoch: u64,
+    pub(in crate::portal) metadata: Metadata,
+    pub(in crate::portal) target: Option<String>,
+    pub(in crate::portal) active: bool,
+    pub(in crate::portal) cancel: CancellationToken,
+    pub(in crate::portal) quic_generations: Vec<u64>,
+}
+
+pub(in crate::portal) struct FlowLease {
+    pub(in crate::portal) registry: std::sync::Weak<super::PairingRegistry>,
+    pub(in crate::portal) key: FlowKey,
+    pub(in crate::portal) epoch: u64,
+    pub(in crate::portal) cancel: CancellationToken,
+    pub(in crate::portal) _udp_permit: Option<Arc<OwnedSemaphorePermit>>,
+}
+
+impl FlowLease {
+    pub(in crate::portal) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for FlowLease {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.finish_flow(self.key, self.epoch);
+        }
+    }
 }

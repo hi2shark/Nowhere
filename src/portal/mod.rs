@@ -11,10 +11,12 @@ mod mode;
 mod pairing;
 mod runtime;
 mod setup;
+mod tasks;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use tokio::sync::Semaphore;
 
 use crate::common::{Logger, OutboundDialer, TLSMode};
 use crate::protocol::Credentials;
@@ -24,6 +26,7 @@ pub(crate) use self::mode::NetworkMode;
 
 const DEFAULT_QUIC_MAX_UDP_FLOWS: usize = 256;
 const DEFAULT_QUIC_UDP_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_TCP_IDLE_POOL_CONNECTIONS: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
 struct UdpFlowLimits {
@@ -50,6 +53,7 @@ struct PortalInner {
     logger: Logger,
     stats: Arc<Stats>,
     pool_active: AtomicU64,
+    tcp_idle_pool_budget: Arc<Semaphore>,
     buffers: Buffers,
     rate_limiter: Option<Arc<RateLimiter>>,
     udp_flow_limits: UdpFlowLimits,
@@ -57,6 +61,7 @@ struct PortalInner {
     quic_server_config: quinn::ServerConfig,
     unauthenticated_admission: Arc<admission::UnauthenticatedAdmission>,
     pairing: Arc<pairing::PairingRegistry>,
+    flow_tasks: Arc<tasks::FlowTaskTracker>,
 }
 
 #[cfg(test)]

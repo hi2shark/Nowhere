@@ -6,6 +6,8 @@
 use anyhow::Result;
 use quinn::{Endpoint, VarInt};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::shutdown_timeout;
@@ -21,21 +23,21 @@ impl Portal {
         let tcp_listeners = self.listen_tcp_listeners()?;
         self.log_info("starting");
 
-        let event_task = tokio::spawn(event::event_loop(self.inner.clone(), shutdown.clone()));
-        let mut accept_tasks = Vec::with_capacity(endpoints.len() + tcp_listeners.len());
+        let mut runtime_tasks = JoinSet::new();
+        runtime_tasks.spawn(event::event_loop(self.inner.clone(), shutdown.clone()));
         for endpoint in endpoints.iter().cloned() {
             let portal = self.inner.clone();
             let child_shutdown = shutdown.clone();
-            accept_tasks.push(tokio::spawn(async move {
+            runtime_tasks.spawn(async move {
                 accept_endpoint_loop(portal, endpoint, child_shutdown).await;
-            }));
+            });
         }
         for listener in tcp_listeners {
             let portal = self.inner.clone();
             let child_shutdown = shutdown.clone();
-            accept_tasks.push(tokio::spawn(async move {
+            runtime_tasks.spawn(async move {
                 accept_tcp_loop(portal, listener, child_shutdown).await;
-            }));
+            });
         }
 
         tokio::select! {
@@ -45,16 +47,39 @@ impl Portal {
             _ = shutdown.cancelled() => {}
         }
 
+        let shutdown_deadline = Instant::now() + shutdown_timeout();
         for endpoint in &endpoints {
             endpoint.close(VarInt::from_u32(0), b"");
         }
+        self.inner.flow_tasks.close();
+        let _ = timeout_at(shutdown_deadline, self.inner.pairing.cancel_all()).await;
+
+        let mut endpoint_tasks = JoinSet::new();
         for endpoint in &endpoints {
-            let _ = tokio::time::timeout(shutdown_timeout(), endpoint.wait_idle()).await;
+            let endpoint = endpoint.clone();
+            endpoint_tasks.spawn(async move {
+                endpoint.wait_idle().await;
+            });
         }
-        for task in accept_tasks {
-            let _ = task.await;
+        let graceful = timeout_at(shutdown_deadline, async {
+            while endpoint_tasks.join_next().await.is_some() {}
+            while runtime_tasks.join_next().await.is_some() {}
+            self.inner.flow_tasks.wait().await;
+        })
+        .await
+        .is_ok();
+        if !graceful {
+            endpoint_tasks.abort_all();
+            runtime_tasks.abort_all();
+            self.inner.flow_tasks.abort_all();
+            while endpoint_tasks.join_next().await.is_some() {}
+            while runtime_tasks.join_next().await.is_some() {}
+            self.inner.flow_tasks.wait().await;
         }
-        let _ = event_task.await;
+        // Setup tasks that were already running when admission closed may have
+        // reached the registry after the first sweep.  No tracked ingress task
+        // remains here, so a final deterministic sweep closes that race.
+        self.inner.pairing.cancel_all().await;
         if let Some(rate) = &self.inner.rate_limiter {
             rate.reset();
         }

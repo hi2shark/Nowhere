@@ -20,8 +20,8 @@ use crate::transport::{Buffers, RateLimiter, Stats};
 
 use super::listener::{configure_transport, format_endpoint_addr};
 use super::{
-    DEFAULT_QUIC_MAX_UDP_FLOWS, DEFAULT_QUIC_UDP_QUEUE_BYTES, NetworkMode, Portal, PortalInner,
-    UdpFlowLimits, admission,
+    DEFAULT_QUIC_MAX_UDP_FLOWS, DEFAULT_QUIC_UDP_QUEUE_BYTES, DEFAULT_TCP_IDLE_POOL_CONNECTIONS,
+    NetworkMode, Portal, PortalInner, UdpFlowLimits, admission,
 };
 
 impl Portal {
@@ -104,6 +104,12 @@ impl Portal {
                 &logger,
             ),
         };
+        let tcp_idle_pool_connections = read_positive_env(
+            "NOW_TCP_IDLE_POOL_CONNS",
+            DEFAULT_TCP_IDLE_POOL_CONNECTIONS,
+            Semaphore::MAX_PERMITS,
+            &logger,
+        );
 
         Ok(Self {
             inner: Arc::new(PortalInner {
@@ -119,13 +125,17 @@ impl Portal {
                 logger,
                 stats: Arc::new(Stats::default()),
                 pool_active: AtomicU64::new(0),
+                tcp_idle_pool_budget: Arc::new(Semaphore::new(tcp_idle_pool_connections)),
                 buffers: Buffers::new(tcp_data_buf_size(), udp_data_buf_size()),
                 rate_limiter,
                 udp_flow_limits,
                 tls_server_config,
                 quic_server_config,
                 unauthenticated_admission: Arc::new(admission::UnauthenticatedAdmission::new()),
-                pairing: Arc::new(super::pairing::PairingRegistry::new()),
+                pairing: Arc::new(super::pairing::PairingRegistry::new(
+                    udp_flow_limits.max_flows,
+                )),
+                flow_tasks: Arc::new(super::tasks::FlowTaskTracker::default()),
             }),
         })
     }
