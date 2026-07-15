@@ -1,123 +1,431 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Fixed QUIC UDP frame codec tests.
+use std::time::{Duration, Instant};
 
 use super::*;
 
 #[test]
-fn fixed_vectors_match_the_swift_codec() {
-    let data = encode_udp_data_fragments(0x0102_0304_0506_0708, 0x1122_3344, &[0xaa, 0xbb], 1_200)
-        .unwrap();
+fn normal_data_and_close_have_exact_five_byte_headers() {
     assert_eq!(
-        data[0],
-        [
-            b'N', b'O', b'W', b'U', 1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x22, 0x33, 0x44, 0, 1, 0, 2,
-            0xaa, 0xbb,
-        ]
+        encode_udp_data(0x0102_0304, &[0xaa, 0xbb]).unwrap(),
+        [0x00, 1, 2, 3, 4, 0xaa, 0xbb]
     );
-
-    let empty = encode_udp_data_fragments(1, 2, &[], 1_200).unwrap();
     assert_eq!(
-        empty[0],
-        [
-            b'N', b'O', b'W', b'U', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 1, 0, 0,
-        ]
+        encode_udp_data(0x0102_0304, &[]).unwrap(),
+        [0x00, 1, 2, 3, 4]
     );
-
-    assert_eq!(
-        encode_udp_close(0x0102_0304_0506_0708).unwrap(),
-        [b'N', b'O', b'W', b'U', 2, 1, 2, 3, 4, 5, 6, 7, 8]
-    );
+    assert_eq!(encode_udp_close(0x0102_0304).unwrap(), [0x02, 1, 2, 3, 4]);
+    assert_eq!(UDP_HEADER_LEN, 5);
 }
 
 #[test]
-fn close_round_trips_and_rejects_payloads() {
-    let close = encode_udp_close(9).unwrap();
-    assert_eq!(
-        decode_udp_frame(&close).unwrap(),
-        UdpFrame::Close { flow_id: 9 }
-    );
-
-    let mut invalid = close;
-    invalid.push(0);
-    assert!(decode_udp_frame(&invalid).is_err());
-    assert!(encode_udp_close(0).is_err());
+fn unfragmented_packets_never_carry_fragment_metadata() {
+    for payload_len in [0, 1, 95] {
+        let payload = vec![0x5a; payload_len];
+        let frames = encode_udp_data_fragments(7, 11, &payload, 100).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), UDP_HEADER_LEN + payload_len);
+        assert_eq!(
+            decode_udp_frame(&frames[0]).unwrap(),
+            UdpFrame::Data {
+                flow_id: 7,
+                payload: &payload,
+            }
+        );
+    }
 }
 
 #[test]
-fn data_packet_fragments_round_trip() {
-    let payload = vec![0x5a; 2_500];
-    let frames = encode_udp_data_fragments(11, 0x1020_3040, &payload, 1_200).unwrap();
+fn fragmented_packets_use_exact_thirteen_byte_headers() {
+    let payload = vec![0x5a; 2500];
+    let frames = encode_udp_data_fragments(0x0102_0304, 0x1122_3344, &payload, 1200).unwrap();
     assert_eq!(frames.len(), 3);
+    assert_eq!(UDP_FRAGMENT_HEADER_LEN, 13);
+    assert_eq!(
+        &frames[0][..UDP_FRAGMENT_HEADER_LEN],
+        &[0x01, 1, 2, 3, 4, 0x11, 0x22, 0x33, 0x44, 0, 3, 0x09, 0xc4]
+    );
 
     let mut assembled = Vec::new();
     for (index, frame) in frames.iter().enumerate() {
-        assert!(frame.len() <= 1_200);
-        match decode_udp_frame(frame).unwrap() {
-            UdpFrame::Data { flow_id, fragment } => {
-                assert_eq!(flow_id, 11);
-                assert_eq!(fragment.packet_id, 0x1020_3040);
-                assert_eq!(fragment.fragment_id as usize, index);
-                assert_eq!(fragment.fragment_count as usize, frames.len());
-                assert_eq!(fragment.total_len as usize, payload.len());
-                assembled.extend_from_slice(fragment.payload);
-            }
-            other => panic!("unexpected frame: {other:?}"),
-        }
+        assert!(frame.len() <= 1200);
+        let UdpFrame::Fragment { flow_id, fragment } = decode_udp_frame(frame).unwrap() else {
+            panic!("expected fragment");
+        };
+        assert_eq!(flow_id, 0x0102_0304);
+        assert_eq!(fragment.packet_id, 0x1122_3344);
+        assert_eq!(fragment.fragment_index as usize, index);
+        assert_eq!(fragment.fragment_count, 3);
+        assert_eq!(fragment.total_len, 2500);
+        assembled.extend_from_slice(fragment.payload);
     }
     assert_eq!(assembled, payload);
 }
 
 #[test]
-fn data_packet_preserves_empty_udp_payload() {
-    let frames = encode_udp_data_fragments(5, 6, &[], 64).unwrap();
-    assert_eq!(frames.len(), 1);
-    match decode_udp_frame(&frames[0]).unwrap() {
-        UdpFrame::Data { flow_id, fragment } => {
-            assert_eq!(flow_id, 5);
-            assert_eq!(fragment.packet_id, 6);
-            assert_eq!(fragment.fragment_count, 1);
-            assert_eq!(fragment.total_len, 0);
-            assert!(fragment.payload.is_empty());
+fn lazy_fragment_plan_materializes_only_requested_frames() {
+    let payload = vec![0x6b; 2500];
+    {
+        let mut fragments = encode_udp_fragments(7, 9, &payload, 1200).unwrap();
+        assert_eq!(fragments.len(), 3);
+
+        let first = fragments.next().unwrap();
+        assert_eq!(first.len(), 1200);
+        assert_eq!(fragments.len(), 2);
+        let UdpFrame::Fragment { fragment, .. } = decode_udp_frame(&first).unwrap() else {
+            panic!("expected fragment");
+        };
+        assert_eq!(fragment.fragment_index, 0);
+        assert_eq!(fragment.fragment_count, 3);
+        // Leaving this scope abandons two frames without materializing them.
+    }
+    // The compatibility collector and lazy planner must remain wire-identical.
+    let collected = encode_udp_fragments(7, 9, &payload, 1200)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        collected,
+        encode_udp_data_fragments(7, 9, &payload, 1200).unwrap()
+    );
+}
+
+#[test]
+fn lazy_fragment_plan_enforces_two_to_255_fragments() {
+    assert!(encode_udp_fragments(1, 1, &[0; 9], 14).is_err());
+    let fragments = encode_udp_fragments(1, 1, &[0; 255], 14).unwrap();
+    assert_eq!(fragments.len(), 255);
+    assert!(encode_udp_fragments(1, 1, &[0; 256], 14).is_err());
+    assert!(encode_udp_fragments(1, 0, &[0; 20], 14).is_err());
+}
+
+#[test]
+fn decoder_round_trips_zero_length_data_and_close() {
+    let data = encode_udp_data(5, &[]).unwrap();
+    assert_eq!(
+        decode_udp_frame(&data).unwrap(),
+        UdpFrame::Data {
+            flow_id: 5,
+            payload: &[],
         }
-        other => panic!("unexpected frame: {other:?}"),
+    );
+    let close = encode_udp_close(5).unwrap();
+    assert_eq!(
+        decode_udp_frame(&close).unwrap(),
+        UdpFrame::Close { flow_id: 5 }
+    );
+}
+
+#[test]
+fn owned_decoder_slices_data_and_fragment_payloads_without_copying() {
+    let data = Bytes::from(encode_udp_data(5, b"payload").unwrap());
+    let data_payload_ptr = data.as_ptr().wrapping_add(UDP_HEADER_LEN);
+    let OwnedUdpFrame::Data { flow_id, payload } = decode_udp_frame_owned(data).unwrap() else {
+        panic!("expected owned UDP DATA");
+    };
+    assert_eq!(flow_id, 5);
+    assert_eq!(payload, b"payload"[..]);
+    assert_eq!(payload.as_ptr(), data_payload_ptr);
+
+    let frame = Bytes::from(
+        encode_udp_data_fragments(7, 9, &[0x5a; 100], 64)
+            .unwrap()
+            .remove(0),
+    );
+    let fragment_payload_ptr = frame.as_ptr().wrapping_add(UDP_FRAGMENT_HEADER_LEN);
+    let OwnedUdpFrame::Fragment { flow_id, fragment } = decode_udp_frame_owned(frame).unwrap()
+    else {
+        panic!("expected owned UDP FRAGMENT");
+    };
+    assert_eq!(flow_id, 7);
+    assert_eq!(fragment.payload.as_ptr(), fragment_payload_ptr);
+    assert_eq!(fragment.payload, [0x5a; 51][..]);
+}
+
+#[test]
+fn flow_and_packet_ids_must_be_nonzero() {
+    assert!(encode_udp_data(0, b"x").is_err());
+    assert!(encode_udp_close(0).is_err());
+    assert!(encode_udp_data_fragments(0, 1, b"x", 64).is_err());
+    assert!(encode_udp_fragment_header(1, 0, 0, 2, 2).is_err());
+
+    let mut fragment = encode_udp_data_fragments(1, 9, &[1; 100], 64)
+        .unwrap()
+        .remove(0);
+    fragment[5..9].fill(0);
+    assert!(decode_udp_frame(&fragment).is_err());
+}
+
+#[test]
+fn decoder_rejects_short_reserved_unknown_and_close_payload_frames() {
+    for input in [
+        vec![],
+        vec![0],
+        vec![0, 0, 0, 0],
+        vec![0, 0, 0, 0, 0],
+        vec![3, 0, 0, 0, 1],
+        vec![0x04, 0, 0, 0, 1],
+        vec![0x40, 0, 0, 0, 1],
+        vec![0x82, 0, 0, 0, 1],
+        vec![2, 0, 0, 0, 1, 0],
+    ] {
+        assert!(decode_udp_frame(&input).is_err(), "accepted {input:?}");
     }
 }
 
 #[test]
-fn data_packet_rejects_invalid_fragment_metadata() {
-    assert!(encode_udp_data_fragments(5, 0, b"abc", 64).is_err());
+fn fragment_validation_rejects_every_invalid_metadata_shape() {
+    assert!(encode_udp_fragment_header(1, 1, 0, 1, 1).is_err());
+    assert!(encode_udp_fragment_header(1, 1, 2, 2, 1).is_err());
+    assert!(encode_udp_fragment_header(1, 1, 0, 2, 0).is_err());
+    assert!(encode_udp_fragment_header(1, 1, 0, 3, 2).is_err());
 
-    let mut zero_packet = encode_udp_data_fragments(5, 6, b"abc", 64)
+    let valid = encode_udp_data_fragments(1, 2, &[7; 100], 64)
         .unwrap()
         .remove(0);
-    zero_packet[13..17].fill(0);
-    assert!(decode_udp_frame(&zero_packet).is_err());
-
-    let mut zero_count = encode_udp_data_fragments(5, 6, b"abc", 64)
-        .unwrap()
-        .remove(0);
-    zero_count[18] = 0;
-    assert!(decode_udp_frame(&zero_count).is_err());
-
-    let mut wrong_total = encode_udp_data_fragments(5, 6, b"abc", 64)
-        .unwrap()
-        .remove(0);
-    wrong_total[19..21].copy_from_slice(&2u16.to_be_bytes());
-    assert!(decode_udp_frame(&wrong_total).is_err());
+    for mutate in [
+        |frame: &mut Vec<u8>| frame[10] = 1,
+        |frame: &mut Vec<u8>| frame[9] = frame[10],
+        |frame: &mut Vec<u8>| frame[11..13].fill(0),
+        |frame: &mut Vec<u8>| frame.truncate(12),
+        |frame: &mut Vec<u8>| frame.truncate(13),
+    ] {
+        let mut frame = valid.clone();
+        mutate(&mut frame);
+        assert!(decode_udp_frame(&frame).is_err());
+    }
 }
 
 #[test]
-fn fragmentation_rejects_impossible_datagram_limits_and_oversized_udp() {
-    assert!(encode_udp_data_fragments(1, 1, b"x", 21).is_err());
-    assert!(encode_udp_data_fragments(1, 1, &vec![0; UDP_PACKET_MAX + 1], usize::MAX).is_err());
+fn fragmentation_enforces_udp_and_fragment_count_limits() {
+    assert!(encode_udp_data_fragments(1, 1, b"x", 4).is_err());
+    assert!(encode_udp_data_fragments(1, 1, &[0; 20], UDP_FRAGMENT_HEADER_LEN).is_err());
+    let oversized = vec![0; UDP_PACKET_MAX + 1];
+    assert!(encode_udp_data_fragments(1, 1, &oversized, usize::MAX).is_err());
+    assert!(encode_udp_data_fragments(1, 1, &[0; 256], UDP_FRAGMENT_HEADER_LEN + 1).is_err());
 }
 
 #[test]
-fn fixed_magic_and_types_reject_older_udp_layouts() {
-    assert!(decode_udp_frame(&[0x01, 0x13, b'a', b'a']).is_err());
-    let mut old_data = encode_udp_data_fragments(1, 1, b"x", 64).unwrap().remove(0);
-    old_data[4] = 3;
-    assert!(decode_udp_frame(&old_data).is_err());
+fn reassembler_completes_out_of_order_and_ignores_identical_duplicates() {
+    let frames = encode_udp_data_fragments(3, 4, &[0x33; 100], 64).unwrap();
+    let now = Instant::now();
+    let mut reassembler = DatagramReassembler::default();
+    let last_source = Bytes::from(frames[1].clone());
+    let last_source_owner = last_source.clone();
+    let (_, last) = owned_fragment(last_source);
+    let last_payload_ptr = last.payload.as_ptr();
+    assert_eq!(
+        reassembler.push(3, last.clone(), now),
+        ReassemblyOutcome::Pending {
+            evicted_partial: false
+        }
+    );
+    let retained = reassembler
+        .slots
+        .values()
+        .next()
+        .and_then(|slot| slot.fragments[1].as_ref())
+        .expect("last fragment retained");
+    assert_eq!(retained.as_ptr(), last_payload_ptr);
+    drop(last_source_owner);
+    assert_eq!(
+        reassembler.push(3, last, now),
+        ReassemblyOutcome::Pending {
+            evicted_partial: false
+        }
+    );
+    let (_, first) = owned_fragment(Bytes::from(frames[0].clone()));
+    let ReassemblyOutcome::Complete { payload, .. } = reassembler.push(3, first, now) else {
+        panic!("expected complete packet");
+    };
+    assert_eq!(payload.as_ref(), vec![0x33; 100]);
+    assert_eq!(reassembler.slot_count(), 0);
+    assert_eq!(reassembler.reserved_bytes(), 0);
+}
+
+#[test]
+fn reassembler_drops_conflicting_duplicate_and_metadata_for_the_whole_packet() {
+    let now = Instant::now();
+    let original = OwnedUdpFragment {
+        packet_id: 7,
+        fragment_index: 0,
+        fragment_count: 2,
+        total_len: 2,
+        payload: Bytes::from_static(b"a"),
+    };
+    let mut reassembler = DatagramReassembler::default();
+    assert!(matches!(
+        reassembler.push(1, original.clone(), now),
+        ReassemblyOutcome::Pending { .. }
+    ));
+    assert_eq!(
+        reassembler.push(
+            1,
+            OwnedUdpFragment {
+                payload: Bytes::from_static(b"b"),
+                ..original.clone()
+            },
+            now
+        ),
+        ReassemblyOutcome::Dropped(ReassemblyDropReason::DuplicateConflict)
+    );
+    assert_eq!(reassembler.slot_count(), 0);
+
+    assert!(matches!(
+        reassembler.push(1, original.clone(), now),
+        ReassemblyOutcome::Pending { .. }
+    ));
+    assert_eq!(
+        reassembler.push(
+            1,
+            OwnedUdpFragment {
+                fragment_count: 3,
+                total_len: 3,
+                ..original
+            },
+            now
+        ),
+        ReassemblyOutcome::Dropped(ReassemblyDropReason::MetadataConflict)
+    );
+    assert_eq!(reassembler.slot_count(), 0);
+}
+
+#[test]
+fn reassembler_enforces_declared_length_byte_budget_slot_cap_timeout_and_flow_removal() {
+    let now = Instant::now();
+    let config = ReassemblyConfig {
+        max_slots: 1,
+        max_bytes: 4,
+        ttl: Duration::from_secs(1),
+    };
+    let first = OwnedUdpFragment {
+        packet_id: 1,
+        fragment_index: 0,
+        fragment_count: 2,
+        total_len: 4,
+        payload: Bytes::from_static(b"aa"),
+    };
+    let mut reassembler = DatagramReassembler::<()>::new(config);
+    assert!(matches!(
+        reassembler.push(1, first.clone(), now),
+        ReassemblyOutcome::Pending { .. }
+    ));
+    assert_eq!(reassembler.reserved_bytes(), 4);
+
+    let second_flow = OwnedUdpFragment {
+        packet_id: 2,
+        ..first.clone()
+    };
+    assert_eq!(
+        reassembler.push(2, second_flow, now + Duration::from_millis(1)),
+        ReassemblyOutcome::Pending {
+            evicted_partial: true
+        }
+    );
+    assert_eq!(reassembler.slot_count(), 1);
+    reassembler.remove_flow(2);
+    assert_eq!(reassembler.reserved_bytes(), 0);
+
+    let too_large = OwnedUdpFragment {
+        total_len: 5,
+        ..first.clone()
+    };
+    assert_eq!(
+        reassembler.push(3, too_large, now),
+        ReassemblyOutcome::Dropped(ReassemblyDropReason::ByteLimit)
+    );
+
+    assert!(matches!(
+        reassembler.push(1, first, now),
+        ReassemblyOutcome::Pending { .. }
+    ));
+    assert!(reassembler.expire(now + Duration::from_secs(2)));
+    assert_eq!(reassembler.slot_count(), 0);
+}
+
+#[test]
+fn reassembler_rejects_inconsistent_final_length() {
+    let now = Instant::now();
+    let first = OwnedUdpFragment {
+        packet_id: 9,
+        fragment_index: 0,
+        fragment_count: 2,
+        total_len: 3,
+        payload: Bytes::from_static(b"a"),
+    };
+    let second = OwnedUdpFragment {
+        fragment_index: 1,
+        payload: Bytes::from_static(b"b"),
+        ..first.clone()
+    };
+    let mut reassembler = DatagramReassembler::default();
+    assert!(matches!(
+        reassembler.push(1, first, now),
+        ReassemblyOutcome::Pending { .. }
+    ));
+    assert_eq!(
+        reassembler.push(1, second, now),
+        ReassemblyOutcome::Dropped(ReassemblyDropReason::InvalidLength)
+    );
+}
+
+#[test]
+fn reassembler_rejects_forged_metadata_without_panicking() {
+    let now = Instant::now();
+    let mut reassembler = DatagramReassembler::default();
+    for (flow_id, fragment) in [
+        (
+            0,
+            OwnedUdpFragment {
+                packet_id: 1,
+                fragment_index: 0,
+                fragment_count: 2,
+                total_len: 2,
+                payload: Bytes::from_static(b"a"),
+            },
+        ),
+        (
+            1,
+            OwnedUdpFragment {
+                packet_id: 0,
+                fragment_index: 0,
+                fragment_count: 2,
+                total_len: 2,
+                payload: Bytes::from_static(b"a"),
+            },
+        ),
+        (
+            1,
+            OwnedUdpFragment {
+                packet_id: 1,
+                fragment_index: 2,
+                fragment_count: 2,
+                total_len: 2,
+                payload: Bytes::from_static(b"a"),
+            },
+        ),
+        (
+            1,
+            OwnedUdpFragment {
+                packet_id: 1,
+                fragment_index: 0,
+                fragment_count: 0,
+                total_len: 0,
+                payload: Bytes::new(),
+            },
+        ),
+    ] {
+        assert_eq!(
+            reassembler.push(flow_id, fragment, now),
+            ReassemblyOutcome::Dropped(ReassemblyDropReason::InvalidLength)
+        );
+    }
+}
+
+fn owned_fragment(frame: Bytes) -> (FlowId, OwnedUdpFragment) {
+    let OwnedUdpFrame::Fragment { flow_id, fragment } = decode_udp_frame_owned(frame).unwrap()
+    else {
+        panic!("expected owned fragment");
+    };
+    (flow_id, fragment)
 }

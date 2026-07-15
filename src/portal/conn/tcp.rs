@@ -3,14 +3,16 @@
 
 //! TLS/TCP ingress handling and universal flow setup.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use socket2::SockRef;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
@@ -18,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::handshake_timeout;
 use crate::protocol::{
-    FlowErrorCode, FlowKind, FlowResult, FlowRole, UDP_STREAM_REJECT, read_auth_frame,
-    read_flow_header, read_request, write_flow_result, write_udp_stream_frame,
+    AuthTransport, Carrier, FlowErrorCode, FlowKind, FlowResult, FlowRole, read_auth_frame,
+    read_flow_header, read_request, write_flow_result,
 };
 
 use super::auth::{authentication_deadline, wait_for_auth_deadline};
@@ -76,14 +78,26 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     };
     let auth_deadline = authentication_deadline();
     let mut tls_stream = tls_stream;
+    let mut exporter = [0u8; 32];
+    if let Err(err) = tls_stream.get_ref().1.export_keying_material(
+        &mut exporter,
+        b"EXPORTER-Nowhere-Auth",
+        Some(&[]),
+    ) {
+        portal.logger.debug(format_args!(
+            "portal::conn::handle_tcp_incoming: TLS exporter failed: {err}"
+        ));
+        return;
+    }
     let auth = tokio::select! {
         _ = shutdown.cancelled() => return,
         result = timeout_at(
             auth_deadline,
             read_auth_frame(
                 &mut tls_stream,
-                portal.credentials.key,
-                &portal.credentials.protocol_spec,
+                portal.credentials.auth_key,
+                AuthTransport::TlsTcp,
+                &exporter,
             ),
         ) => result,
     };
@@ -109,10 +123,6 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
             return;
         }
     };
-    let pool_permit = match portal.tcp_idle_pool_budget.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return,
-    };
     let mut link_guard = Some(
         portal
             .pairing
@@ -128,9 +138,56 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
     let (recv, mut send) = tokio::io::split(tls_stream);
     let mut recv = BufReader::new(recv);
 
-    let pool_guard = PoolGuard::new(&portal.pool_active);
+    // A cold lane may carry `auth || flow` in the same TLS application write.
+    // Such a lane is already active and must not consume (or be rejected by)
+    // the idle warm-pool budget. Only lanes with no plaintext ready after auth
+    // enter the pool. When the pool is saturated, give an adjacent TLS record
+    // one scheduler turn to become visible before rejecting it as idle.
+    let mut input = match poll_input(&mut recv) {
+        Ok(input) => input,
+        Err(err) => {
+            portal.logger.debug(format_args!(
+                "portal::conn::handle_tcp_incoming: failed to inspect flow bytes: {err}"
+            ));
+            return;
+        }
+    };
+    let pool_permit = if input == InputAvailability::Pending {
+        match portal.tcp_idle_pool_budget.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                tokio::task::yield_now().await;
+                input = match poll_input(&mut recv) {
+                    Ok(input) => input,
+                    Err(err) => {
+                        portal.logger.debug(format_args!(
+                            "portal::conn::handle_tcp_incoming: failed to inspect flow bytes: {err}"
+                        ));
+                        return;
+                    }
+                };
+                if input == InputAvailability::Pending {
+                    return;
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if input == InputAvailability::Closed {
+        return;
+    }
+    let pool_guard = pool_permit
+        .as_ref()
+        .map(|_| PoolGuard::new(&portal.pool_active));
+    let flow_timeout = if pool_permit.is_some() {
+        pool_ttl
+    } else {
+        handshake_timeout()
+    };
     let header = match tokio::select! {
-        result = timeout(pool_ttl, async {
+        result = timeout(flow_timeout, async {
             match recv.fill_buf().await {
                 Ok([]) => return Ok(None),
                 Ok(_) => {}
@@ -150,13 +207,28 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
             return;
         }
     };
+    if let Err(err) = header.validate_on(Carrier::TlsTcp) {
+        portal.logger.debug(format_args!(
+            "portal::conn::handle_tcp_incoming: carrier mismatch: {err}"
+        ));
+        if header.role == FlowRole::Open {
+            portal
+                .pairing
+                .reject_flow_setup(session_id, header.flow_id, FlowErrorCode::InvalidRequest)
+                .await;
+        } else {
+            let write = async {
+                let _ =
+                    write_flow_result(&mut send, FlowResult::Reject(FlowErrorCode::InvalidRequest))
+                        .await;
+                let _ = send.shutdown().await;
+            };
+            let _ = timeout(FLOW_REJECT_TIMEOUT, write).await;
+        }
+        return;
+    }
     let target = if matches!(header.role, FlowRole::Open | FlowRole::Duplex) {
-        match timeout(
-            handshake_timeout(),
-            read_request(&mut recv, &portal.credentials.protocol_spec),
-        )
-        .await
-        {
+        match timeout(handshake_timeout(), read_request(&mut recv)).await {
             Ok(Ok(target)) => Some(target),
             _ => {
                 if header.role == FlowRole::Open {
@@ -170,23 +242,11 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
                         .await;
                 } else if header.role == FlowRole::Duplex {
                     let write = async {
-                        match header.kind {
-                            FlowKind::Tcp => {
-                                let _ = write_flow_result(
-                                    &mut send,
-                                    FlowResult::Reject(FlowErrorCode::InvalidRequest),
-                                )
-                                .await;
-                            }
-                            FlowKind::Udp => {
-                                let _ = write_udp_stream_frame(
-                                    &mut send,
-                                    UDP_STREAM_REJECT,
-                                    &[FlowErrorCode::InvalidRequest as u8],
-                                )
-                                .await;
-                            }
-                        }
+                        let _ = write_flow_result(
+                            &mut send,
+                            FlowResult::Reject(FlowErrorCode::InvalidRequest),
+                        )
+                        .await;
                         let _ = send.shutdown().await;
                     };
                     let _ = timeout(FLOW_REJECT_TIMEOUT, write).await;
@@ -303,6 +363,36 @@ pub(super) async fn handle_tcp_incoming_with_pool_ttl(
 }
 
 struct PoolGuard<'a>(&'a AtomicU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputAvailability {
+    Available,
+    Pending,
+    Closed,
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn poll_input<R>(reader: &mut BufReader<R>) -> io::Result<InputAvailability>
+where
+    R: AsyncRead + Unpin,
+{
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    match Pin::new(reader).poll_fill_buf(&mut context) {
+        Poll::Ready(Ok([])) => Ok(InputAvailability::Closed),
+        Poll::Ready(Ok(_)) => Ok(InputAvailability::Available),
+        Poll::Ready(Err(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+            Ok(InputAvailability::Closed)
+        }
+        Poll::Ready(Err(err)) => Err(err),
+        Poll::Pending => Ok(InputAvailability::Pending),
+    }
+}
 
 impl<'a> PoolGuard<'a> {
     fn new(active: &'a AtomicU64) -> Self {

@@ -100,12 +100,11 @@ impl Portal {
     /// Returns the effective startup URL that is logged for operators.
     pub(super) fn effective_url(&self) -> String {
         format!(
-            "portal://{}?tls={}&net={}&spec={}&alpn={}&rate={}&etar={}&dial={}&socks={}",
+            "portal://{}?net={}&tls={}&alpn={}&rate={}&etar={}&dial={}&socks={}",
             self.inner.endpoint_addr,
-            self.inner.tls_mode,
             self.inner.network_mode,
-            self.inner.credentials.protocol_spec.effective_spec,
-            self.inner.credentials.protocol_spec.effective_alpn,
+            self.inner.tls_mode,
+            self.inner.alpn,
             self.inner.rate_limit,
             self.inner.etar_limit,
             self.inner.outbound.dialer_ip(),

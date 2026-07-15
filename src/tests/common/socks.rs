@@ -11,7 +11,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use url::Url;
 
+use super::protocol::{
+    ADDRESS_IPV4, AUTH_NONE, AUTH_PASSWORD, SOCKS_VERSION, encode_address, parse_udp_header,
+    read_address,
+};
 use super::*;
+use crate::protocol::Target;
 
 fn parse(raw: &str) -> Result<Option<SocksConfig>> {
     SocksConfig::from_url(&Url::parse(raw).unwrap())
@@ -56,7 +61,6 @@ fn parses_percent_encoded_credentials_without_exposing_them() {
 #[test]
 fn rejects_ambiguous_or_invalid_configuration() {
     for raw in [
-        "portal://secret@127.0.0.1:2077?socks=proxy.test:1080&socks=other.test:1080",
         "portal://secret@127.0.0.1:2077?socks=user@proxy.test:1080",
         "portal://secret@127.0.0.1:2077?socks=:pass@proxy.test:1080",
         "portal://secret@127.0.0.1:2077?socks=user:@proxy.test:1080",
@@ -68,6 +72,25 @@ fn rejects_ambiguous_or_invalid_configuration() {
     ] {
         assert!(parse(raw).is_err(), "accepted {raw}");
     }
+}
+
+#[test]
+fn duplicate_socks_uses_the_first_value() {
+    let config =
+        parse("portal://secret@127.0.0.1:2077?socks=proxy.test:1080&socks=other.test:1080")
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(config.endpoint(), "proxy.test:1080");
+}
+
+#[test]
+fn malformed_unknown_query_key_is_ignored() {
+    let config = parse("portal://secret@127.0.0.1:2077?%FF=x&socks=proxy.test:1080")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(config.endpoint(), "proxy.test:1080");
 }
 
 #[test]
@@ -107,8 +130,9 @@ async fn tcp_connect_uses_only_no_auth_and_preserves_domain() {
     ))
     .unwrap();
     let dialer = OutboundDialer::new("auto".to_string(), config);
+    let target = Target::domain("target.test", 443).unwrap();
     let mut stream = dialer
-        .dial_tcp("target.test:443", Duration::from_secs(2))
+        .dial_tcp_target(&target, Duration::from_secs(2))
         .await
         .unwrap();
     stream.write_all(b"ping").await.unwrap();
@@ -135,9 +159,10 @@ async fn authenticated_connect_cannot_downgrade_to_no_auth() {
     ))
     .unwrap();
     let dialer = OutboundDialer::new("auto".to_string(), config);
+    let target = Target::domain("target.test", 443).unwrap();
     assert!(
         dialer
-            .dial_tcp("target.test:443", Duration::from_secs(2))
+            .dial_tcp_target(&target, Duration::from_secs(2))
             .await
             .is_err()
     );
@@ -188,8 +213,9 @@ async fn udp_associate_wraps_payload_and_keeps_control_alive() {
 
     let config = parse(&format!("portal://secret@127.0.0.1:2077?socks={endpoint}")).unwrap();
     let dialer = OutboundDialer::new("127.0.0.1".to_string(), config);
+    let target = Target::domain("dns.test", 53).unwrap();
     let socket = dialer
-        .dial_udp("dns.test:53", Duration::from_secs(2))
+        .dial_udp_target(&target, Duration::from_secs(2))
         .await
         .unwrap();
     let mut packet = Vec::new();
@@ -229,9 +255,10 @@ async fn proxy_failure_never_falls_back_to_direct_target() {
     ))
     .unwrap();
     let dialer = OutboundDialer::new("auto".to_string(), config);
+    let protocol_target = Target::ip(target_addr).unwrap();
     assert!(
         dialer
-            .dial_tcp(&target_addr.to_string(), Duration::from_secs(2))
+            .dial_tcp_target(&protocol_target, Duration::from_secs(2))
             .await
             .is_err()
     );
@@ -263,8 +290,9 @@ async fn udp_association_ends_when_control_connection_closes() {
 
     let config = parse(&format!("portal://secret@127.0.0.1:2077?socks={endpoint}")).unwrap();
     let dialer = OutboundDialer::new("auto".to_string(), config);
+    let target = Target::domain("dns.test", 53).unwrap();
     let socket = dialer
-        .dial_udp("dns.test:53", Duration::from_secs(2))
+        .dial_udp_target(&target, Duration::from_secs(2))
         .await
         .unwrap();
     let mut response = [0u8; 64];
@@ -314,12 +342,14 @@ async fn each_udp_flow_uses_a_distinct_association() {
 
     let config = parse(&format!("portal://secret@127.0.0.1:2077?socks={endpoint}")).unwrap();
     let dialer = OutboundDialer::new("auto".to_string(), config);
+    let first_target = Target::domain("one.test", 53).unwrap();
     let first = dialer
-        .dial_udp("one.test:53", Duration::from_secs(2))
+        .dial_udp_target(&first_target, Duration::from_secs(2))
         .await
         .unwrap();
+    let second_target = Target::domain("two.test", 53).unwrap();
     let second = dialer
-        .dial_udp("two.test:53", Duration::from_secs(2))
+        .dial_udp_target(&second_target, Duration::from_secs(2))
         .await
         .unwrap();
     drop((first, second));

@@ -3,12 +3,12 @@
 
 //! Pre-authentication admission tests.
 
-use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::time::Duration;
 
-use bytes::Bytes;
+use crate::portal::admission::{
+    MAX_UNAUTHENTICATED_CONNECTIONS, MAX_UNAUTHENTICATED_PER_SOURCE, UnauthenticatedAdmission,
+};
 
 use super::super::*;
 
@@ -18,17 +18,6 @@ fn authentication_failure_close_uses_access_denied() {
 
     assert_eq!(code.into_inner(), 1);
     assert_eq!(reason, b"access denied");
-}
-
-#[test]
-fn authentication_timeout_jitter_covers_default_four_to_six_seconds() {
-    let base = Duration::from_secs(5);
-
-    assert_eq!(scaled_auth_timeout(base, 0), Duration::from_secs(4));
-    assert_eq!(scaled_auth_timeout(base, 4_000), Duration::from_secs(6));
-    let sampled = jittered_auth_timeout(base);
-    assert!(sampled >= Duration::from_secs(4));
-    assert!(sampled <= Duration::from_secs(6));
 }
 
 #[test]
@@ -90,25 +79,4 @@ fn unauthenticated_admission_enforces_shared_global_limit() {
             .try_acquire(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))
             .is_some()
     );
-}
-
-#[test]
-fn pre_auth_datagram_buffer_never_exceeds_64_kib() {
-    let mut pending = VecDeque::new();
-    let mut pending_bytes = 0;
-
-    for _ in 0..64 {
-        assert!(retain_pre_auth_datagram(
-            &mut pending,
-            &mut pending_bytes,
-            Bytes::from(vec![0; 1024]),
-        ));
-    }
-    assert_eq!(pending_bytes, PRE_AUTH_DATAGRAM_BUFFER_SIZE);
-    assert!(!retain_pre_auth_datagram(
-        &mut pending,
-        &mut pending_bytes,
-        Bytes::from_static(b"x"),
-    ));
-    assert_eq!(pending_bytes, PRE_AUTH_DATAGRAM_BUFFER_SIZE);
 }

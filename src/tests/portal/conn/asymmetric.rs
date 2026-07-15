@@ -14,12 +14,12 @@ use url::Url;
 use crate::common::{LogLevel, Logger};
 use crate::portal::Portal;
 use crate::protocol::{
-    Carrier, FlowHeader, FlowKind, FlowResult, FlowRole, UDP_STREAM_DATA, UdpFrame, UdpStreamFrame,
-    decode_udp_frame, encode_udp_data_fragments, encode_udp_stream_frame, read_flow_result,
-    read_udp_stream_frame, write_flow_header, write_request_frame, write_session_auth_frame,
+    Carrier, FlowHeader, FlowKind, FlowResult, FlowRole, Target, UdpFrame, decode_udp_frame,
+    encode_udp_data_fragments, encode_udp_packet, read_flow_result, read_udp_packet,
+    write_flow_header, write_request_frame,
 };
 
-use super::support::{connect_test_quic_to, connect_test_tls};
+use super::support::{connect_test_quic_to, connect_test_tls, quic_auth_frame, tls_auth_frame};
 
 async fn connect_tls_from_separate_loopback(
     port: u16,
@@ -94,14 +94,9 @@ async fn start_mixed(
 
 async fn authenticate_quic(portal: &Portal, conn: &quinn::Connection, session: [u8; 16]) {
     let (mut send, _) = conn.open_bi().await.unwrap();
-    send.write_all(&write_session_auth_frame(
-        portal.inner.credentials.key,
-        &portal.inner.credentials.protocol_spec,
-        [0x31; 32],
-        session,
-    ))
-    .await
-    .unwrap();
+    send.write_all(&quic_auth_frame(portal, conn, session))
+        .await
+        .unwrap();
     send.finish().unwrap();
     timeout(Duration::from_secs(2), conn.open_bi())
         .await
@@ -109,13 +104,10 @@ async fn authenticate_quic(portal: &Portal, conn: &quinn::Connection, session: [
         .unwrap();
 }
 
-fn request(portal: &Portal, header: FlowHeader, target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+fn request(header: FlowHeader, target: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut out = write_flow_header(header).to_vec();
     if matches!(header.role, FlowRole::Open | FlowRole::Duplex) {
-        out.extend_from_slice(
-            &write_request_frame(&target.to_string(), &portal.inner.credentials.protocol_spec)
-                .unwrap(),
-        );
+        out.extend_from_slice(&write_request_frame(&Target::ip(target).unwrap()).unwrap());
     }
     out.extend_from_slice(payload);
     out
@@ -154,22 +146,16 @@ async fn asymmetric_tcp_flows_pair_in_both_directions() {
             ..open
         };
         let mut tls = connect_tls_from_separate_loopback(port).await;
-        tls.write_all(&write_session_auth_frame(
-            portal.inner.credentials.key,
-            &portal.inner.credentials.protocol_spec,
-            [flow_id as u8; 32],
-            session,
-        ))
-        .await
-        .unwrap();
+        let auth = tls_auth_frame(&portal, &tls, session);
+        tls.write_all(&auth).await.unwrap();
         let (mut quic_send, mut quic_recv) = quic.open_bi().await.unwrap();
 
         if uplink == Carrier::TlsTcp {
-            tls.write_all(&request(&portal, open, target_addr, b"ping"))
+            tls.write_all(&request(open, target_addr, b"ping"))
                 .await
                 .unwrap();
             quic_send
-                .write_all(&request(&portal, attach, target_addr, b""))
+                .write_all(&request(attach, target_addr, b""))
                 .await
                 .unwrap();
             quic_send.finish().unwrap();
@@ -184,11 +170,11 @@ async fn asymmetric_tcp_flows_pair_in_both_directions() {
                 .unwrap();
             assert_eq!(&pong, b"pong");
         } else {
-            tls.write_all(&request(&portal, attach, target_addr, b""))
+            tls.write_all(&request(attach, target_addr, b""))
                 .await
                 .unwrap();
             quic_send
-                .write_all(&request(&portal, open, target_addr, b"ping"))
+                .write_all(&request(open, target_addr, b"ping"))
                 .await
                 .unwrap();
             quic_send.finish().unwrap();
@@ -235,13 +221,8 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
         downlink: Carrier::TlsTcp,
     };
     let mut tls = connect_tls_from_separate_loopback(port).await;
-    let mut bootstrap = write_session_auth_frame(
-        portal.inner.credentials.key,
-        &portal.inner.credentials.protocol_spec,
-        [0x11; 32],
-        session,
-    );
-    bootstrap.extend_from_slice(&request(&portal, attach, target_addr, b""));
+    let mut bootstrap = tls_auth_frame(&portal, &tls, session).to_vec();
+    bootstrap.extend_from_slice(&request(attach, target_addr, b""));
     tls.write_all(&bootstrap).await.unwrap();
     let open = FlowHeader {
         role: FlowRole::Open,
@@ -249,20 +230,17 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
     };
     let (mut open_send, _) = quic.open_bi().await.unwrap();
     open_send
-        .write_all(&request(&portal, open, target_addr, b""))
+        .write_all(&request(open, target_addr, b""))
         .await
         .unwrap();
     open_send.finish().unwrap();
-    assert_eq!(
-        read_udp_stream_frame(&mut tls).await.unwrap(),
-        Some(UdpStreamFrame::Ready)
-    );
+    assert_eq!(read_flow_result(&mut tls).await.unwrap(), FlowResult::Ready);
     let data = encode_udp_data_fragments(11, 1, b"ping", 1200).unwrap();
     quic.send_datagram(bytes::Bytes::from(data.into_iter().next().unwrap()))
         .unwrap();
     assert_eq!(
-        read_udp_stream_frame(&mut tls).await.unwrap(),
-        Some(UdpStreamFrame::Data(b"pong".to_vec()))
+        read_udp_packet(&mut tls).await.unwrap(),
+        Some(b"pong".to_vec())
     );
     echo.await.unwrap();
 
@@ -287,17 +265,12 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
         ..open
     };
     let mut tls = connect_tls_from_separate_loopback(port).await;
-    let mut bootstrap = write_session_auth_frame(
-        portal.inner.credentials.key,
-        &portal.inner.credentials.protocol_spec,
-        [0x12; 32],
-        session,
-    );
-    bootstrap.extend_from_slice(&request(&portal, open, target_addr, b""));
+    let mut bootstrap = tls_auth_frame(&portal, &tls, session).to_vec();
+    bootstrap.extend_from_slice(&request(open, target_addr, b""));
     tls.write_all(&bootstrap).await.unwrap();
     let (mut attach_send, mut attach_recv) = quic.open_bi().await.unwrap();
     attach_send
-        .write_all(&request(&portal, attach, target_addr, b""))
+        .write_all(&request(attach, target_addr, b""))
         .await
         .unwrap();
     attach_send.finish().unwrap();
@@ -305,18 +278,18 @@ async fn asymmetric_udp_flows_pair_in_both_directions() {
         read_flow_result(&mut attach_recv).await.unwrap(),
         FlowResult::Ready
     );
-    tls.write_all(&encode_udp_stream_frame(UDP_STREAM_DATA, b"ping").unwrap())
+    tls.write_all(&encode_udp_packet(b"ping").unwrap())
         .await
         .unwrap();
     let frame = timeout(Duration::from_secs(3), quic.read_datagram())
         .await
         .unwrap()
         .unwrap();
-    let UdpFrame::Data { flow_id, fragment } = decode_udp_frame(&frame).unwrap() else {
+    let UdpFrame::Data { flow_id, payload } = decode_udp_frame(&frame).unwrap() else {
         panic!("expected UDP DATA");
     };
     assert_eq!(flow_id, 12);
-    assert_eq!(fragment.payload, b"pong");
+    assert_eq!(payload, b"pong");
     echo.await.unwrap();
 
     shutdown.cancel();

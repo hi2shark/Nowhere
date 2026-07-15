@@ -8,6 +8,7 @@ mod relay;
 mod session;
 mod tcp;
 
+pub(in crate::portal) use self::session::DatagramReadyRequest;
 pub(in crate::portal) use self::session::QueuedDatagram;
 
 use std::sync::Arc;
@@ -19,20 +20,9 @@ use self::auth::{
     AuthenticationOutcome, authenticate_connection, authentication_deadline,
     authentication_failure_close,
 };
-#[cfg(test)]
-use self::auth::{
-    PRE_AUTH_DATAGRAM_BUFFER_SIZE, jittered_auth_timeout, retain_pre_auth_datagram,
-    scaled_auth_timeout,
-};
 pub(super) use self::tcp::handle_tcp_incoming;
-#[cfg(test)]
-use self::tcp::handle_tcp_incoming_with_pool_ttl;
 use super::PortalInner;
 use super::admission::UnauthenticatedGuard;
-#[cfg(test)]
-use super::admission::{
-    MAX_UNAUTHENTICATED_CONNECTIONS, MAX_UNAUTHENTICATED_PER_SOURCE, UnauthenticatedAdmission,
-};
 use crate::common::{quic_max_streams, rate_limit_bytes_per_second};
 
 pub(super) async fn handle_incoming(
@@ -101,11 +91,14 @@ async fn handle_connection(
         ));
     }
 
-    let datagram_task = tokio::spawn(
-        session
-            .clone()
-            .datagram_loop(authenticated.pending_datagrams, shutdown.clone()),
-    );
+    let datagram_task = tokio::spawn(session.clone().datagram_loop(shutdown.clone()));
+    let first_session = session.clone();
+    let first_tasks = portal.flow_tasks.clone();
+    first_tasks.spawn(async move {
+        first_session
+            .handle_first_stream(authenticated.first_send, authenticated.first_recv)
+            .await;
+    });
 
     loop {
         tokio::select! {
@@ -136,7 +129,7 @@ async fn handle_connection(
         }
     }
 
-    session.close().await;
+    session.close();
     datagram_task.abort();
     let _ = datagram_task.await;
     conn.close(VarInt::from_u32(0), b"");

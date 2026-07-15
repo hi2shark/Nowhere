@@ -4,14 +4,38 @@
 //! Configuration parsing tests.
 
 use super::*;
+use url::Url;
 
 #[test]
-fn query_int_accepts_only_positive_values() {
-    assert_eq!(query_int(Some("7"), 3), 7);
-    assert_eq!(query_int(Some("0"), 3), 3);
-    assert_eq!(query_int(Some("-1"), 3), 3);
-    assert_eq!(query_int(Some("invalid"), 3), 3);
-    assert_eq!(query_int(None, 3), 3);
+fn query_first_ignores_unknown_parameters_and_keeps_first_duplicate() {
+    let parsed = Url::parse("portal://key@localhost:2077?log=debug&alpn=now%2F1").unwrap();
+    let values = query_first(&parsed, &["log", "alpn"]).unwrap();
+    assert_eq!(values["log"], "debug");
+    assert_eq!(values["alpn"], "now/1");
+
+    let duplicate = Url::parse("portal://key@localhost:2077?log=debug&log=event").unwrap();
+    assert_eq!(query_first(&duplicate, &["log"]).unwrap()["log"], "debug");
+    let unknown = Url::parse("portal://key@localhost:2077?typo=value&%FF=value").unwrap();
+    assert!(query_first(&unknown, &["log"]).unwrap().is_empty());
+}
+
+#[test]
+fn query_first_preserves_literal_plus_and_validates_the_selected_value() {
+    let parsed = Url::parse("portal://key@localhost:2077?alpn=now+private").unwrap();
+    assert_eq!(
+        query_first(&parsed, &["alpn"]).unwrap()["alpn"],
+        "now+private"
+    );
+
+    let bad = Url::parse("portal://key@localhost:2077?alpn=%GG").unwrap();
+    assert!(query_first(&bad, &["alpn"]).is_err());
+
+    let ignored_bad_duplicate =
+        Url::parse("portal://key@localhost:2077?alpn=now%2F1&alpn=%GG").unwrap();
+    assert_eq!(
+        query_first(&ignored_bad_duplicate, &["alpn"]).unwrap()["alpn"],
+        "now/1"
+    );
 }
 
 #[test]

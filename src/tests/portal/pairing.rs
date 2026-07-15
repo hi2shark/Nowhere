@@ -5,15 +5,15 @@
 
 use super::*;
 use crate::protocol::{
-    Carrier, FlowKind, FlowResult, FlowRole, SESSION_ID_LEN, UdpStreamFrame, encode_flow_result,
-    read_flow_result, read_udp_stream_frame,
+    Carrier, FlowKind, FlowResult, FlowRole, SESSION_ID_LEN, Target, encode_flow_result,
+    read_flow_result,
 };
 use crate::transport::Stats;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -36,7 +36,7 @@ fn registry(max_udp_flows: usize, timeout: Duration) -> Arc<PairingRegistry> {
 
 fn header(
     role: FlowRole,
-    flow_id: u64,
+    flow_id: u32,
     kind: FlowKind,
     uplink: Carrier,
     downlink: Carrier,
@@ -48,6 +48,10 @@ fn header(
         uplink,
         downlink,
     }
+}
+
+fn target(value: &str) -> Target {
+    value.parse().unwrap()
 }
 
 fn path(label: &str) -> LinkPath {
@@ -160,7 +164,7 @@ async fn old_quic_guard_does_not_cancel_flow_on_replacement_generation() {
                 Carrier::TlsTcp,
                 Carrier::Quic,
             ),
-            Some("target.test:443".into()),
+            Some(target("target.test:443")),
             tcp_half("up"),
             Some(Box::pin(uplink)),
             None,
@@ -183,6 +187,110 @@ async fn old_quic_guard_does_not_cancel_flow_on_replacement_generation() {
     drop(paired);
     drop(second);
     assert_eq!(stats.link_udp.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn quic_replacement_immediately_rejects_pending_split_flows() {
+    let registry = registry(8, Duration::from_secs(30));
+    let stats = Arc::new(Stats::default());
+    let session_id = [0x33; SESSION_ID_LEN];
+    let _tcp_guard = registry.register_tcp_link(session_id, stats.clone());
+    let first = registry
+        .register_quic_link(
+            session_id,
+            stats.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    let (tcp_uplink, _tcp_peer) = tokio::io::duplex(64);
+    assert!(
+        registry
+            .submit_tcp(
+                session_id,
+                header(
+                    FlowRole::Open,
+                    30,
+                    FlowKind::Tcp,
+                    Carrier::TlsTcp,
+                    Carrier::Quic,
+                ),
+                Some(target("target.test:443")),
+                tcp_half("tcp-pending"),
+                Some(Box::pin(tcp_uplink)),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (uot_downlink, mut uot_peer) = tokio::io::duplex(64);
+    assert!(
+        registry
+            .submit_udp(
+                session_id,
+                header(
+                    FlowRole::Attach,
+                    31,
+                    FlowKind::Udp,
+                    Carrier::Quic,
+                    Carrier::TlsTcp,
+                ),
+                None,
+                tcp_half("udp-pending"),
+                UdpHalf::Downlink(UdpDown::TlsTcp {
+                    writer: Box::pin(uot_downlink),
+                    liveness: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let second = registry
+        .register_quic_link(
+            session_id,
+            stats,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert!(registry.tcp.lock().await.is_empty());
+    assert!(registry.udp.lock().await.is_empty());
+    assert_eq!(
+        read_flow_result(&mut uot_peer).await.unwrap(),
+        FlowResult::Reject(FlowErrorCode::SessionReplaced)
+    );
+
+    let (tcp_downlink, mut tcp_result) = tokio::io::duplex(64);
+    let error = registry
+        .submit_tcp(
+            session_id,
+            header(
+                FlowRole::Attach,
+                30,
+                FlowKind::Tcp,
+                Carrier::TlsTcp,
+                Carrier::Quic,
+            ),
+            None,
+            quic_half("replacement", second.quic_generation()),
+            None,
+            Some(Box::pin(tcp_downlink)),
+            None,
+        )
+        .await
+        .unwrap_pairing_error();
+    assert_eq!(error.code(), FlowErrorCode::SessionReplaced);
+    assert_eq!(
+        read_flow_result(&mut tcp_result).await.unwrap(),
+        FlowResult::Reject(FlowErrorCode::SessionReplaced)
+    );
+
+    drop(first);
+    drop(second);
 }
 
 #[tokio::test]
@@ -214,7 +322,7 @@ async fn stale_open_after_map_lock_leaves_exact_rejection_for_tcp_attach() {
                     Carrier::Quic,
                     Carrier::TlsTcp,
                 ),
-                Some("target.test:443".into()),
+                Some(target("target.test:443")),
                 quic_half("stale", old_generation),
                 Some(Box::pin(uplink)),
                 None,
@@ -271,7 +379,7 @@ async fn stale_open_after_map_lock_leaves_exact_rejection_for_tcp_attach() {
         .await
         .unwrap_pairing_error();
     assert_eq!(attach_error.code(), FlowErrorCode::SessionReplaced);
-    let mut result = [0; 4];
+    let mut result = [0; 1];
     downlink_peer.read_exact(&mut result).await.unwrap();
     assert_eq!(
         result,
@@ -317,10 +425,14 @@ async fn initially_stale_udp_open_leaves_exact_rejection_for_uot_attach() {
                 Carrier::Quic,
                 Carrier::TlsTcp,
             ),
-            Some("target.test:53".into()),
+            Some(target("target.test:53")),
             quic_half("stale-uplink", old_generation),
             UdpHalf::Uplink {
-                uplink: UdpUp::Quic(QuicUdpReceiver::new(datagram_rx, || {})),
+                uplink: UdpUp::Quic(QuicUdpReceiver::new_without_barrier(
+                    datagram_rx,
+                    Arc::new(AtomicBool::new(false)),
+                    || {},
+                )),
             },
         )
         .await
@@ -349,8 +461,8 @@ async fn initially_stale_udp_open_leaves_exact_rejection_for_uot_attach() {
         .unwrap_pairing_error();
     assert_eq!(attach_error.code(), FlowErrorCode::SessionReplaced);
     assert_eq!(
-        read_udp_stream_frame(&mut peer).await.unwrap(),
-        Some(UdpStreamFrame::Reject(FlowErrorCode::SessionReplaced))
+        read_flow_result(&mut peer).await.unwrap(),
+        FlowResult::Reject(FlowErrorCode::SessionReplaced)
     );
 
     drop(first);
@@ -377,7 +489,7 @@ async fn late_attach_receives_original_open_pair_timeout() {
                     Carrier::TlsTcp,
                     Carrier::TlsTcp,
                 ),
-                Some("target.test:443".into()),
+                Some(target("target.test:443")),
                 tcp_half("tcp-open"),
                 Some(Box::pin(tcp_uplink)),
                 None,
@@ -437,7 +549,7 @@ async fn late_attach_receives_original_open_pair_timeout() {
                     Carrier::TlsTcp,
                     Carrier::TlsTcp,
                 ),
-                Some("target.test:53".into()),
+                Some(target("target.test:53")),
                 tcp_half("udp-open"),
                 UdpHalf::Uplink {
                     uplink: UdpUp::TlsTcp(Box::pin(udp_uplink)),
@@ -480,8 +592,8 @@ async fn late_attach_receives_original_open_pair_timeout() {
         .unwrap_pairing_error();
     assert_eq!(udp_error.code(), FlowErrorCode::PairTimeout);
     assert_eq!(
-        read_udp_stream_frame(&mut udp_peer).await.unwrap(),
-        Some(UdpStreamFrame::Reject(FlowErrorCode::PairTimeout))
+        read_flow_result(&mut udp_peer).await.unwrap(),
+        FlowResult::Reject(FlowErrorCode::PairTimeout)
     );
 
     drop(tcp_guard);
@@ -524,7 +636,7 @@ async fn tombstones_deliver_exact_reject_on_selected_downlink() {
         .await
         .unwrap_pairing_error();
     assert_eq!(tcp_error.code(), FlowErrorCode::DialFailed);
-    let mut tcp_result = [0; 4];
+    let mut tcp_result = [0; 1];
     tcp_peer.read_exact(&mut tcp_result).await.unwrap();
     assert_eq!(
         tcp_result,
@@ -558,8 +670,8 @@ async fn tombstones_deliver_exact_reject_on_selected_downlink() {
         .unwrap_pairing_error();
     assert_eq!(udp_error.code(), FlowErrorCode::InternalError);
     assert_eq!(
-        read_udp_stream_frame(&mut uot_peer).await.unwrap(),
-        Some(UdpStreamFrame::Reject(FlowErrorCode::InternalError))
+        read_flow_result(&mut uot_peer).await.unwrap(),
+        FlowResult::Reject(FlowErrorCode::InternalError)
     );
 
     drop(quic_guard);
@@ -614,7 +726,7 @@ async fn cancel_all_cancels_active_flows_without_waiting_for_pending_writer() {
                 Carrier::TlsTcp,
                 Carrier::TlsTcp,
             ),
-            Some("target.test:443".into()),
+            Some(target("target.test:443")),
             tcp_half("active"),
             Some(Box::pin(active_stream)),
             Some(Box::pin(active_downlink)),
@@ -679,10 +791,14 @@ async fn udp_permit_is_shared_by_quic_and_uot_and_released_by_cancel() {
                     Carrier::Quic,
                     Carrier::TlsTcp,
                 ),
-                Some("target.test:53".into()),
+                Some(target("target.test:53")),
                 quic_half("udp-up", quic_guard.quic_generation()),
                 UdpHalf::Uplink {
-                    uplink: UdpUp::Quic(QuicUdpReceiver::new(datagram_rx, || {})),
+                    uplink: UdpUp::Quic(QuicUdpReceiver::new_without_barrier(
+                        datagram_rx,
+                        Arc::new(AtomicBool::new(false)),
+                        || {},
+                    )),
                 },
             )
             .await
@@ -703,7 +819,7 @@ async fn udp_permit_is_shared_by_quic_and_uot_and_released_by_cancel() {
                 Carrier::TlsTcp,
                 Carrier::TlsTcp,
             ),
-            Some("target.test:53".into()),
+            Some(target("target.test:53")),
             tcp_half("uot-limited"),
             UdpHalf::Duplex {
                 uplink: UdpUp::TlsTcp(Box::pin(rejected_uplink)),
@@ -717,8 +833,8 @@ async fn udp_permit_is_shared_by_quic_and_uot_and_released_by_cancel() {
         .unwrap_pairing_error();
     assert_eq!(rejected.code(), FlowErrorCode::FlowLimit);
     assert_eq!(
-        read_udp_stream_frame(&mut rejected_peer).await.unwrap(),
-        Some(UdpStreamFrame::Reject(FlowErrorCode::FlowLimit))
+        read_flow_result(&mut rejected_peer).await.unwrap(),
+        FlowResult::Reject(FlowErrorCode::FlowLimit)
     );
 
     registry.cancel_udp(session_id, 13).await;
@@ -736,7 +852,7 @@ async fn udp_permit_is_shared_by_quic_and_uot_and_released_by_cancel() {
                 Carrier::TlsTcp,
                 Carrier::TlsTcp,
             ),
-            Some("target.test:53".into()),
+            Some(target("target.test:53")),
             tcp_half("uot-accepted"),
             UdpHalf::Duplex {
                 uplink: UdpUp::TlsTcp(Box::pin(uot_uplink)),

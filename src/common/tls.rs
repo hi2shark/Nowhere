@@ -14,10 +14,12 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::crypto::ring;
 use url::Url;
 
-use self::tls_cert::{
-    ReloadingCertResolver, certificate_sha256, new_self_signed_cert, query_value,
-};
-use super::Logger;
+use self::tls_cert::{ReloadingCertResolver, certificate_sha256, new_self_signed_cert};
+use super::{Logger, query_first};
+
+const PORTAL_QUERY_PARAMETERS: &[&str] = &[
+    "log", "net", "tls", "crt", "key", "alpn", "rate", "etar", "dial", "socks",
+];
 
 /// TLS mode selected by the `tls` URL query parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,16 +48,12 @@ pub fn new_server_configs(
     alpn: &str,
     logger: Logger,
 ) -> Result<(TLSMode, Arc<rustls::ServerConfig>, quinn::ServerConfig)> {
-    let mode = match parsed_url
-        .query_pairs()
-        .find(|(k, _)| k == "tls")
-        .map(|(_, v)| v)
-    {
+    let query = query_first(parsed_url, PORTAL_QUERY_PARAMETERS)?;
+    let mode = match query.get("tls").map(String::as_str) {
         None => TLSMode::SelfSigned,
-        Some(v) if v.is_empty() => TLSMode::SelfSigned,
-        Some(v) if v == "0" => TLSMode::None,
-        Some(v) if v == "1" => TLSMode::SelfSigned,
-        Some(v) if v == "2" => TLSMode::CATrusted,
+        Some("0") => TLSMode::None,
+        Some("1") => TLSMode::SelfSigned,
+        Some("2") => TLSMode::CATrusted,
         _ => bail!("common::tls::new_server_configs: invalid tls mode"),
     };
 
@@ -80,8 +78,8 @@ pub fn new_server_configs(
             (server_crypto, cert_sha256)
         }
         TLSMode::CATrusted => {
-            let crt_file = query_value(parsed_url, "crt").unwrap_or_default();
-            let key_file = query_value(parsed_url, "key").unwrap_or_default();
+            let crt_file = query.get("crt").cloned().unwrap_or_default();
+            let key_file = query.get("key").cloned().unwrap_or_default();
             let (resolver, cert_sha256) =
                 ReloadingCertResolver::new(crt_file, key_file, provider, logger.clone())
                     .context("common::tls::new_server_configs: failed to load certificate")?;

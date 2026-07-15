@@ -1,26 +1,40 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Protocol utility tests.
-
 use super::*;
 
 #[test]
-fn validates_host_port_forms() {
-    assert!(validate_target("example.com:443").is_ok());
-    assert!(validate_target("93.184.216.34:443").is_ok());
-    assert!(validate_target("[::1]:443").is_ok());
-    assert!(validate_target(":443").is_ok());
-    assert!(validate_target("example.com:").is_err());
-    assert!(validate_target("::1:443").is_err());
+fn domain_validation_accepts_ascii_idna_wire_names() {
+    for domain in [b"example.com".as_slice(), b"xn--bcher-kva.example", b"a"] {
+        validate_domain_bytes(domain, "test").unwrap();
+    }
 }
 
 #[test]
-fn checks_target_length_boundaries() {
-    let max_len_target = format!("{}:1", "a".repeat(TARGET_LEN_MAX - 2));
-    let too_long_target = format!("{}:1", "a".repeat(TARGET_LEN_MAX - 1));
+fn domain_validation_rejects_unsafe_and_oversized_names() {
+    for domain in [
+        b"".as_slice(),
+        b"bad host",
+        b"bad:host",
+        b"bad[host]",
+        b"bad/host",
+        b"bad@host",
+        b"bad_host",
+        b"bad..host",
+        b"-bad.host",
+        b"bad-.host",
+        b"bad.host.",
+        b"line\nbreak",
+        &[0xff],
+    ] {
+        assert!(validate_domain_bytes(domain, "test").is_err());
+    }
+    assert!(validate_domain_bytes(&vec![b'a'; DOMAIN_LEN_MAX + 1], "test").is_err());
+}
 
-    assert!(check_target_len("test", "").is_err());
-    assert!(check_target_len("test", &max_len_target).is_ok());
-    assert!(check_target_len("test", &too_long_target).is_err());
+#[test]
+fn port_validation_rejects_only_zero() {
+    assert!(validate_port(0, "test").is_err());
+    validate_port(1, "test").unwrap();
+    validate_port(u16::MAX, "test").unwrap();
 }

@@ -1,37 +1,34 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! QUIC authentication flow and pre-auth datagram buffering.
+//! Connection-bound QUIC authentication and pre-authentication hardening.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::{Context, Poll, Wake, Waker};
 
-use bytes::Bytes;
-use quinn::{Connection, VarInt};
+use quinn::{Connection, RecvStream, SendStream, VarInt};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::handshake_timeout;
-use crate::protocol::read_auth_stream;
+use crate::protocol::{AuthTransport, read_auth_frame};
 
 use super::session::PortalSession;
 use crate::portal::PortalInner;
 
-/// Maximum bytes retained from QUIC DATAGRAMs that arrive before auth succeeds.
-pub(super) const PRE_AUTH_DATAGRAM_BUFFER_SIZE: usize = 64 * 1024;
-const AUTH_TIMEOUT_MIN_BASIS_POINTS: u64 = 8_000;
-const AUTH_TIMEOUT_BASIS_POINT_RANGE: u64 = 4_001;
+const AUTH_EXPORTER_LABEL: &[u8] = b"EXPORTER-Nowhere-Auth";
 
 /// QUIC close code and reason used for authentication failures.
 pub(super) fn authentication_failure_close() -> (VarInt, &'static [u8]) {
     (VarInt::from_u32(1), b"access denied")
 }
 
-/// Authenticated session plus DATAGRAM frames received before auth completed.
+/// Authenticated state and the first bidi stream, which may continue directly
+/// with a flow header after the fixed authentication frame.
 pub(super) struct AuthenticatedConnection {
     pub(super) session: Arc<PortalSession>,
-    pub(super) pending_datagrams: VecDeque<Bytes>,
+    pub(super) first_send: SendStream,
+    pub(super) first_recv: RecvStream,
 }
 
 /// Result of the QUIC authentication phase.
@@ -41,37 +38,39 @@ pub(super) enum AuthenticationOutcome {
     Shutdown,
 }
 
-/// Authenticates the first bidirectional stream while buffering early DATAGRAMs.
+/// Authenticates the first bidirectional stream while discarding every
+/// DATAGRAM received before authentication completes.
 pub(super) async fn authenticate_connection(
     portal: Arc<PortalInner>,
     conn: Connection,
     deadline: Instant,
     shutdown: &CancellationToken,
 ) -> AuthenticationOutcome {
+    let mut exporter = [0u8; 32];
+    if let Err(err) = conn.export_keying_material(&mut exporter, AUTH_EXPORTER_LABEL, b"") {
+        return AuthenticationOutcome::Failure(anyhow::anyhow!(
+            "portal::conn::authenticate_connection: TLS exporter failed: {err:?}"
+        ));
+    }
+    let auth_key = portal.credentials.auth_key;
     let auth = async {
-        let (_send, mut recv) = conn.accept_bi().await.map_err(|err| {
+        let (send, mut recv) = conn.accept_bi().await.map_err(|err| {
             anyhow::anyhow!(
                 "portal::conn::authenticate_connection: failed to accept auth stream: {err}"
             )
         })?;
-        read_auth_stream(
-            &mut recv,
-            portal.credentials.key,
-            &portal.credentials.protocol_spec,
-        )
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("portal::conn::authenticate_connection: failed to read auth: {err}")
-        })
+        let session_id = read_auth_frame(&mut recv, auth_key, AuthTransport::Quic, &exporter)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("portal::conn::authenticate_connection: failed to read auth: {err}")
+            })?;
+        anyhow::Ok((session_id, send, recv))
     };
     tokio::pin!(auth);
 
     let mut auth_pending = true;
     let mut datagrams_open = true;
     let mut auth_error = None;
-    let mut pending_datagrams = VecDeque::new();
-    let mut pending_bytes = 0usize;
-
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return AuthenticationOutcome::Shutdown,
@@ -85,77 +84,93 @@ pub(super) async fn authenticate_connection(
             result = &mut auth, if auth_pending => {
                 auth_pending = false;
                 match result {
-                    Ok(session_id) => {
+                    Ok((session_id, first_send, first_recv)) => {
+                        // Establish a hard phase barrier before any flow can
+                        // be installed: poll until Quinn reports no queued
+                        // DATAGRAM. Unlike the old bounded drain, an arbitrary
+                        // pre-auth backlog can never leak into a READY flow.
+                        match drain_pre_auth_datagrams(&conn, deadline, shutdown).await {
+                            PreAuthDrainOutcome::Complete => {}
+                            PreAuthDrainOutcome::Deadline => {
+                                return AuthenticationOutcome::Failure(anyhow::anyhow!(
+                                    "portal::conn::authenticate_connection: pre-auth DATAGRAM drain deadline elapsed"
+                                ));
+                            }
+                            PreAuthDrainOutcome::Shutdown => {
+                                return AuthenticationOutcome::Shutdown;
+                            }
+                        }
                         return AuthenticationOutcome::Success(AuthenticatedConnection {
                             session: Arc::new(PortalSession::new(
                                 portal.clone(),
                                 conn.clone(),
                                 session_id,
                             )),
-                            pending_datagrams,
+                            first_send,
+                            first_recv,
                         });
                     }
                     Err(err) => auth_error = Some(err),
                 }
             }
             datagram = conn.read_datagram(), if datagrams_open => match datagram {
-                Ok(datagram) => {
-                    if auth_error.is_none() {
-                        // DATAGRAM frames are unordered relative to streams; hold
-                        // early UDP packets until the auth stream succeeds.
-                        retain_pre_auth_datagram(
-                            &mut pending_datagrams,
-                            &mut pending_bytes,
-                            datagram,
-                        );
-                    }
+                Ok(_) => {
+                    // Authentication is the resource boundary. Never retain
+                    // or replay a DATAGRAM observed before it succeeds.
                 }
-                Err(err) => {
-                    datagrams_open = false;
-                    if auth_error.is_none() {
-                        auth_error = Some(anyhow::anyhow!(
-                            "portal::conn::authenticate_connection: failed to receive pre-auth datagram: {err}"
-                        ));
-                        auth_pending = false;
-                    }
-                }
+                Err(_) => datagrams_open = false,
             },
         }
     }
 }
 
-/// Appends a pre-auth datagram when it fits within the retention budget.
-pub(super) fn retain_pre_auth_datagram(
-    pending: &mut VecDeque<Bytes>,
-    pending_bytes: &mut usize,
-    datagram: Bytes,
-) -> bool {
-    if pending_bytes.saturating_add(datagram.len()) > PRE_AUTH_DATAGRAM_BUFFER_SIZE {
-        return false;
-    }
-    *pending_bytes += datagram.len();
-    pending.push_back(datagram);
-    true
+struct DatagramDrainWake;
+
+impl Wake for DatagramDrainWake {
+    fn wake(self: Arc<Self>) {}
 }
 
-/// Returns the absolute authentication deadline with jitter applied.
+enum PreAuthDrainOutcome {
+    Complete,
+    Deadline,
+    Shutdown,
+}
+
+async fn drain_pre_auth_datagrams(
+    conn: &Connection,
+    deadline: Instant,
+    shutdown: &CancellationToken,
+) -> PreAuthDrainOutcome {
+    let waker = Waker::from(Arc::new(DatagramDrainWake));
+    let mut drained = 0usize;
+    loop {
+        let polled = {
+            let read = conn.read_datagram();
+            tokio::pin!(read);
+            let mut context = Context::from_waker(&waker);
+            std::future::Future::poll(read.as_mut(), &mut context)
+        };
+        match polled {
+            Poll::Ready(Ok(_)) => {
+                drained += 1;
+                if shutdown.is_cancelled() {
+                    return PreAuthDrainOutcome::Shutdown;
+                }
+                if Instant::now() >= deadline {
+                    return PreAuthDrainOutcome::Deadline;
+                }
+                if drained.is_multiple_of(1_024) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Poll::Ready(Err(_)) | Poll::Pending => return PreAuthDrainOutcome::Complete,
+        }
+    }
+}
+
+/// Returns the fixed absolute authentication deadline.
 pub(super) fn authentication_deadline() -> Instant {
-    Instant::now() + jittered_auth_timeout(handshake_timeout())
-}
-
-/// Applies randomized jitter to the configured authentication timeout.
-pub(super) fn jittered_auth_timeout(base: Duration) -> Duration {
-    let mut random = [0u8; 8];
-    if getrandom::fill(&mut random).is_err() {
-        return base;
-    }
-    scaled_auth_timeout(base, u64::from_le_bytes(random))
-}
-
-/// Scales `base` into the 80%-120% timeout window using `sample`.
-pub(super) fn scaled_auth_timeout(base: Duration, sample: u64) -> Duration {
-    let basis_points = AUTH_TIMEOUT_MIN_BASIS_POINTS + sample % AUTH_TIMEOUT_BASIS_POINT_RANGE;
-    Duration::try_from_secs_f64(base.as_secs_f64() * basis_points as f64 / 10_000.0).unwrap_or(base)
+    Instant::now() + handshake_timeout()
 }
 
 /// Waits for the same auth deadline after a failed auth read.

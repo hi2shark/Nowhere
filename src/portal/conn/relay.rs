@@ -47,21 +47,6 @@ fn paired_exchange_path(
     )
 }
 
-#[cfg(test)]
-pub(in crate::portal::conn) fn symmetric_exchange_path(
-    carrier: Carrier,
-    peer: &str,
-    local: &str,
-    target_local: &str,
-    target: &str,
-) -> String {
-    format!(
-        "UP[{}] {peer} -> {local} -> {target_local} -> {target} | DOWN[{}] {target} -> {target_local} -> {local} -> {peer}",
-        carrier_name(carrier),
-        carrier_name(carrier),
-    )
-}
-
 fn carrier_name(carrier: Carrier) -> &'static str {
     match carrier {
         Carrier::TlsTcp => "TCP",

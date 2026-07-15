@@ -1,79 +1,175 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Transport-independent flow envelope tests.
+use tokio::io::AsyncReadExt;
 
 use super::*;
 
-#[tokio::test]
-async fn round_trip() {
-    let expected = FlowHeader {
-        role: FlowRole::Attach,
-        flow_id: 42,
-        kind: FlowKind::Udp,
+#[test]
+fn fixed_vectors_pack_flags_and_network_order_id() {
+    assert_eq!(
+        encode_flow_header(FlowHeader {
+            role: FlowRole::Duplex,
+            flow_id: 0x0102_0304,
+            kind: FlowKind::Tcp,
+            uplink: Carrier::TlsTcp,
+            downlink: Carrier::TlsTcp,
+        })
+        .unwrap(),
+        [0x00, 1, 2, 3, 4]
+    );
+    assert_eq!(
+        encode_flow_header(FlowHeader {
+            role: FlowRole::Open,
+            flow_id: 0x1122_3344,
+            kind: FlowKind::Udp,
+            uplink: Carrier::Quic,
+            downlink: Carrier::TlsTcp,
+        })
+        .unwrap(),
+        [0x0d, 0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(
+        encode_flow_header(FlowHeader {
+            role: FlowRole::Attach,
+            flow_id: 7,
+            kind: FlowKind::Udp,
+            uplink: Carrier::TlsTcp,
+            downlink: Carrier::Quic,
+        })
+        .unwrap(),
+        [0x16, 0, 0, 0, 7]
+    );
+}
+
+#[test]
+fn every_valid_role_kind_and_carrier_combination_round_trips() {
+    for kind in [FlowKind::Tcp, FlowKind::Udp] {
+        for carrier in [Carrier::TlsTcp, Carrier::Quic] {
+            round_trip(FlowHeader {
+                role: FlowRole::Duplex,
+                flow_id: 1,
+                kind,
+                uplink: carrier,
+                downlink: carrier,
+            });
+        }
+        for role in [FlowRole::Open, FlowRole::Attach] {
+            round_trip(FlowHeader {
+                role,
+                flow_id: u32::MAX,
+                kind,
+                uplink: Carrier::TlsTcp,
+                downlink: Carrier::Quic,
+            });
+            round_trip(FlowHeader {
+                role,
+                flow_id: 2,
+                kind,
+                uplink: Carrier::Quic,
+                downlink: Carrier::TlsTcp,
+            });
+        }
+    }
+}
+
+#[test]
+fn semantic_validation_rejects_zero_ids_and_carrier_conflicts() {
+    let duplex = FlowHeader {
+        role: FlowRole::Duplex,
+        flow_id: 1,
+        kind: FlowKind::Tcp,
         uplink: Carrier::TlsTcp,
         downlink: Carrier::Quic,
     };
-    let bytes = write_flow_header(expected);
-    assert_eq!(bytes, [0xf1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 42, 2, 1, 2]);
-    assert_eq!(
-        read_flow_header(&mut bytes.as_slice()).await.unwrap(),
-        expected
-    );
-}
+    assert!(encode_flow_header(duplex).is_err());
 
-#[tokio::test]
-async fn duplex_and_result_vectors_match_the_swift_codec() {
-    let header = FlowHeader {
-        role: FlowRole::Duplex,
-        flow_id: 0x0102_0304_0506_0708,
-        kind: FlowKind::Tcp,
-        uplink: Carrier::Quic,
-        downlink: Carrier::Quic,
-    };
-    let bytes = write_flow_header(header);
-    assert_eq!(bytes, [0xf1, 1, 3, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 2]);
-    assert_eq!(
-        read_flow_header(&mut bytes.as_slice()).await.unwrap(),
-        header
-    );
-
-    assert_eq!(encode_flow_result(FlowResult::Ready), [0xf2, 1, 1, 0]);
-    assert_eq!(
-        encode_flow_result(FlowResult::Reject(FlowErrorCode::PairTimeout)),
-        [0xf2, 1, 2, 3]
-    );
-    assert_eq!(
-        read_flow_result(&mut [0xf2, 1, 2, 6].as_slice())
-            .await
-            .unwrap(),
-        FlowResult::Reject(FlowErrorCode::SessionReplaced)
-    );
-}
-
-#[tokio::test]
-async fn rejects_invalid_role_carrier_shapes_and_results() {
-    let mut split = write_flow_header(FlowHeader {
+    let split = FlowHeader {
         role: FlowRole::Open,
         flow_id: 1,
         kind: FlowKind::Udp,
         uplink: Carrier::TlsTcp,
-        downlink: Carrier::Quic,
-    });
-    split[13] = Carrier::TlsTcp as u8;
-    assert!(read_flow_header(&mut split.as_slice()).await.is_err());
+        downlink: Carrier::TlsTcp,
+    };
+    assert!(encode_flow_header(split).is_err());
 
-    let mut duplex = write_flow_header(FlowHeader {
+    let zero = FlowHeader {
         role: FlowRole::Duplex,
+        flow_id: 0,
+        kind: FlowKind::Tcp,
+        uplink: Carrier::Quic,
+        downlink: Carrier::Quic,
+    };
+    assert!(encode_flow_header(zero).is_err());
+}
+
+#[test]
+fn current_lane_must_match_the_role_direction() {
+    let open = FlowHeader {
+        role: FlowRole::Open,
         flow_id: 1,
+        kind: FlowKind::Tcp,
+        uplink: Carrier::TlsTcp,
+        downlink: Carrier::Quic,
+    };
+    assert!(open.validate_on(Carrier::TlsTcp).is_ok());
+    assert!(open.validate_on(Carrier::Quic).is_err());
+
+    let attach = FlowHeader {
+        role: FlowRole::Attach,
+        ..open
+    };
+    assert!(attach.validate_on(Carrier::Quic).is_ok());
+    assert!(attach.validate_on(Carrier::TlsTcp).is_err());
+    assert!(open.carries_target());
+    assert!(!attach.carries_target());
+}
+
+#[test]
+fn decoder_rejects_invalid_flags_ids_lengths_and_semantics() {
+    for input in [&[][..], &[0; 4], &[0; 6]] {
+        assert!(decode_flow_header(input).is_err());
+    }
+    assert!(decode_flow_header(&[0, 0, 0, 0, 0]).is_err());
+
+    let valid = [0, 0, 0, 0, 1];
+    for reserved in [0x20, 0x40, 0x80, 0xe0] {
+        let mut input = valid;
+        input[0] |= reserved;
+        assert!(decode_flow_header(&input).is_err());
+    }
+    let mut invalid_role = valid;
+    invalid_role[0] = 3;
+    assert!(decode_flow_header(&invalid_role).is_err());
+
+    let mut bad_duplex = valid;
+    bad_duplex[0] = 0x10;
+    assert!(decode_flow_header(&bad_duplex).is_err());
+    let mut bad_open = valid;
+    bad_open[0] = 1;
+    assert!(decode_flow_header(&bad_open).is_err());
+}
+
+#[tokio::test]
+async fn async_reader_consumes_only_five_bytes() {
+    let header = FlowHeader {
+        role: FlowRole::Duplex,
+        flow_id: 9,
         kind: FlowKind::Udp,
         uplink: Carrier::Quic,
         downlink: Carrier::Quic,
-    });
-    duplex[13] = Carrier::TlsTcp as u8;
-    assert!(read_flow_header(&mut duplex.as_slice()).await.is_err());
+    };
+    let mut input = encode_flow_header(header).unwrap().to_vec();
+    input.extend_from_slice(b"payload");
+    let mut input = input.as_slice();
+    assert_eq!(read_flow_header(&mut input).await.unwrap(), header);
+    let mut payload = Vec::new();
+    input.read_to_end(&mut payload).await.unwrap();
+    assert_eq!(payload, b"payload");
+}
 
-    for invalid in [[0xf2, 1, 1, 1], [0xf2, 1, 2, 0], [0xf2, 1, 2, 8]] {
-        assert!(read_flow_result(&mut invalid.as_slice()).await.is_err());
-    }
+fn round_trip(header: FlowHeader) {
+    let encoded = encode_flow_header(header).unwrap();
+    assert_eq!(encoded.len(), FLOW_HEADER_LEN);
+    assert_eq!(decode_flow_header(&encoded).unwrap(), header);
 }

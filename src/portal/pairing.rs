@@ -14,8 +14,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 
 use crate::protocol::{
-    Carrier, FlowErrorCode, FlowHeader, FlowKind, FlowResult, FlowRole, SessionId,
-    UDP_STREAM_REJECT, write_flow_result, write_udp_stream_frame,
+    Carrier, FlowErrorCode, FlowHeader, FlowKind, FlowResult, FlowRole, SessionId, Target,
+    write_flow_result,
 };
 
 mod link;
@@ -40,7 +40,7 @@ struct TerminalRejection {
 
 enum TcpInstallOutcome {
     Pending(u64),
-    Paired(PairedTcp),
+    Paired(Box<PairedTcp>),
     Rejected {
         error: PairingError,
         downlink: Option<BoxWriter>,
@@ -50,7 +50,7 @@ enum TcpInstallOutcome {
 
 enum UdpInstallOutcome {
     Pending(u64),
-    Paired(PairedUdp),
+    Paired(Box<PairedUdp>),
     Rejected {
         error: PairingError,
         downlink: Option<UdpDown>,
@@ -147,7 +147,7 @@ impl PairingRegistry {
         session_id: SessionId,
         header: FlowHeader,
         expected_kind: FlowKind,
-        target: Option<&str>,
+        target: Option<&Target>,
         link: &LinkHalf,
     ) -> Result<(), PairingError> {
         if header.kind != expected_kind {
@@ -194,7 +194,7 @@ impl PairingRegistry {
         &self,
         key: FlowKey,
         metadata: Metadata,
-        target: Option<String>,
+        target: Option<Target>,
         quic_generation: Option<u64>,
     ) -> Result<(u64, bool), PairingError> {
         let mut claims = self.claims.lock().expect("flow claim registry poisoned");
@@ -366,7 +366,7 @@ impl PairingRegistry {
     pub(super) async fn reject_flow_setup(
         self: &Arc<Self>,
         session_id: SessionId,
-        flow_id: u64,
+        flow_id: u32,
         code: FlowErrorCode,
     ) {
         let key = FlowKey {
@@ -418,19 +418,15 @@ impl PairingRegistry {
         self: &Arc<Self>,
         session_id: SessionId,
         header: FlowHeader,
-        target: Option<String>,
+        target: Option<Target>,
         link: LinkHalf,
         reader: Option<BoxReader>,
         mut writer: Option<BoxWriter>,
         downlink_liveness: Option<BoxReader>,
     ) -> Result<Option<PairedTcp>, PairingError> {
-        if let Err(err) = self.validate_header_and_link(
-            session_id,
-            header,
-            FlowKind::Tcp,
-            target.as_deref(),
-            &link,
-        ) {
+        if let Err(err) =
+            self.validate_header_and_link(session_id, header, FlowKind::Tcp, target.as_ref(), &link)
+        {
             if header.role == FlowRole::Open {
                 self.reject_flow_setup(session_id, header.flow_id, err.code())
                     .await;
@@ -600,6 +596,7 @@ impl PairingRegistry {
             let pending = guard.entry(key).or_insert_with(|| PendingTcp {
                 epoch: claim_epoch,
                 metadata: metadata.clone(),
+                quic_snapshot: active_generation,
                 target: target.clone(),
                 uplink: None,
                 downlink: None,
@@ -676,7 +673,7 @@ impl PairingRegistry {
                         };
                     }
                 };
-                break 'install TcpInstallOutcome::Paired(PairedTcp {
+                break 'install TcpInstallOutcome::Paired(Box::new(PairedTcp {
                     target: complete.target.take().expect("TCP target paired"),
                     uplink: complete.uplink.take().expect("TCP uplink paired"),
                     downlink: complete.downlink.take().expect("TCP downlink paired"),
@@ -689,7 +686,7 @@ impl PairingRegistry {
                         .take()
                         .expect("TCP downlink path paired"),
                     _flow_lease: lease,
-                });
+                }));
             }
             let epoch = match self.refresh_claim(key) {
                 Ok(epoch) => epoch,
@@ -712,7 +709,7 @@ impl PairingRegistry {
                 self.spawn_tcp_timeout(key, epoch);
                 Ok(None)
             }
-            TcpInstallOutcome::Paired(paired) => Ok(Some(paired)),
+            TcpInstallOutcome::Paired(paired) => Ok(Some(*paired)),
             TcpInstallOutcome::Rejected {
                 error,
                 mut downlink,
@@ -732,17 +729,13 @@ impl PairingRegistry {
         self: &Arc<Self>,
         session_id: SessionId,
         header: FlowHeader,
-        target: Option<String>,
+        target: Option<Target>,
         link: LinkHalf,
         mut half: UdpHalf,
     ) -> Result<Option<PairedUdp>, PairingError> {
-        if let Err(err) = self.validate_header_and_link(
-            session_id,
-            header,
-            FlowKind::Udp,
-            target.as_deref(),
-            &link,
-        ) {
+        if let Err(err) =
+            self.validate_header_and_link(session_id, header, FlowKind::Udp, target.as_ref(), &link)
+        {
             if header.role == FlowRole::Open {
                 self.reject_flow_setup(session_id, header.flow_id, err.code())
                     .await;
@@ -937,6 +930,7 @@ impl PairingRegistry {
             let pending = guard.entry(key).or_insert_with(|| PendingUdp {
                 epoch: claim_epoch,
                 metadata: metadata.clone(),
+                quic_snapshot: active_generation,
                 target: target.clone(),
                 uplink: None,
                 downlink: None,
@@ -1024,7 +1018,7 @@ impl PairingRegistry {
                         };
                     }
                 };
-                break 'install UdpInstallOutcome::Paired(PairedUdp {
+                break 'install UdpInstallOutcome::Paired(Box::new(PairedUdp {
                     flow_id: header.flow_id,
                     target: complete.target.take().expect("UDP target paired"),
                     uplink: complete.uplink.take().expect("UDP uplink paired"),
@@ -1037,7 +1031,7 @@ impl PairingRegistry {
                         .take()
                         .expect("UDP downlink path paired"),
                     _flow_lease: lease,
-                });
+                }));
             }
             let epoch = match self.refresh_claim(key) {
                 Ok(epoch) => epoch,
@@ -1060,7 +1054,7 @@ impl PairingRegistry {
                 self.spawn_udp_timeout(key, epoch);
                 Ok(None)
             }
-            UdpInstallOutcome::Paired(paired) => Ok(Some(paired)),
+            UdpInstallOutcome::Paired(paired) => Ok(Some(*paired)),
             UdpInstallOutcome::Rejected {
                 error,
                 mut downlink,
@@ -1132,7 +1126,7 @@ impl PairingRegistry {
         });
     }
 
-    pub(super) async fn cancel_udp(&self, session_id: SessionId, flow_id: u64) {
+    pub(super) async fn cancel_udp(&self, session_id: SessionId, flow_id: u32) {
         let key = FlowKey {
             session_id,
             flow_id,
@@ -1202,64 +1196,31 @@ impl PairingRegistry {
         self.drain_pending().await;
     }
 
-    async fn purge_quic_generation(&self, session_id: SessionId, generation: u64) {
-        let tcp_keys = {
-            let mut flows = self.tcp.lock().await;
-            flows.retain(|key, flow| {
-                if key.session_id != session_id {
-                    return true;
-                }
-                if flow.uplink_generation == Some(generation) {
-                    flow.uplink = None;
-                    flow.target = None;
-                    flow.uplink_path = None;
-                    flow.uplink_generation = None;
-                }
-                if flow.downlink_generation == Some(generation) {
-                    flow.downlink = None;
-                    flow.downlink_liveness = None;
-                    flow.downlink_path = None;
-                    flow.downlink_generation = None;
-                }
-                flow.uplink.is_some() || flow.downlink.is_some()
-            });
-            flows.keys().copied().collect::<HashSet<_>>()
-        };
-        let udp_keys = {
-            let mut flows = self.udp.lock().await;
-            flows.retain(|key, flow| {
-                if key.session_id != session_id {
-                    return true;
-                }
-                if flow.uplink_generation == Some(generation) {
-                    flow.uplink = None;
-                    flow.target = None;
-                    flow.flow_permit = None;
-                    flow.uplink_path = None;
-                    flow.uplink_generation = None;
-                }
-                if flow.downlink_generation == Some(generation) {
-                    flow.downlink = None;
-                    flow.downlink_path = None;
-                    flow.downlink_generation = None;
-                }
-                flow.uplink.is_some() || flow.downlink.is_some()
-            });
-            flows.keys().copied().collect::<HashSet<_>>()
-        };
-        let mut claims = self.claims.lock().expect("flow claim registry poisoned");
-        claims.retain(|key, claim| {
-            if key.session_id != session_id || claim.active {
-                return true;
-            }
-            if claim.metadata.uplink == Carrier::Quic
-                && claim.quic_generations.contains(&generation)
-            {
-                claim.target = None;
-            }
-            claim.quic_generations.retain(|value| *value != generation);
-            tcp_keys.contains(key) || udp_keys.contains(key)
-        });
+    async fn purge_quic_generation(self: &Arc<Self>, session_id: SessionId, generation: u64) {
+        let mut stale = self
+            .tcp
+            .lock()
+            .await
+            .iter()
+            .filter(|(key, flow)| {
+                key.session_id == session_id && flow.quic_snapshot == Some(generation)
+            })
+            .map(|(key, _)| *key)
+            .collect::<HashSet<_>>();
+        stale.extend(
+            self.udp
+                .lock()
+                .await
+                .iter()
+                .filter(|(key, flow)| {
+                    key.session_id == session_id && flow.quic_snapshot == Some(generation)
+                })
+                .map(|(key, _)| *key),
+        );
+        for key in stale {
+            self.reject_flow_setup(key.session_id, key.flow_id, FlowErrorCode::SessionReplaced)
+                .await;
+        }
     }
 
     async fn drain_pending(&self) {
@@ -1284,7 +1245,7 @@ async fn reject_udp_downlink_ref(downlink: &mut UdpDown, code: FlowErrorCode) {
     let write = async {
         match downlink {
             UdpDown::TlsTcp { writer, .. } => {
-                let _ = write_udp_stream_frame(writer, UDP_STREAM_REJECT, &[code as u8]).await;
+                let _ = write_flow_result(writer, FlowResult::Reject(code)).await;
                 let _ = writer.shutdown().await;
             }
             UdpDown::Quic { control, .. } => {

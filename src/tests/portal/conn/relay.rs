@@ -5,6 +5,20 @@
 
 use super::*;
 
+fn symmetric_exchange_path(
+    carrier: Carrier,
+    peer: &str,
+    local: &str,
+    target_local: &str,
+    target: &str,
+) -> String {
+    format!(
+        "UP[{}] {peer} -> {local} -> {target_local} -> {target} | DOWN[{}] {target} -> {target_local} -> {local} -> {peer}",
+        carrier_name(carrier),
+        carrier_name(carrier),
+    )
+}
+
 #[test]
 fn paired_path_contains_both_carriers_and_both_client_links() {
     let uplink = LinkPath {

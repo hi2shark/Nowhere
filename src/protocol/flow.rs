@@ -1,188 +1,174 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Transport-independent logical flow envelope used to pair TCP and QUIC halves.
+//! Compact logical-flow metadata shared by every carrier.
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
+/// Logical session identifier shared by a transport bundle.
 pub const SESSION_ID_LEN: usize = 16;
+/// Fixed binary flow header length.
+pub const FLOW_HEADER_LEN: usize = 5;
+
+const ROLE_MASK: u8 = 0b0000_0011;
+const KIND_BIT: u8 = 0b0000_0100;
+const UPLINK_BIT: u8 = 0b0000_1000;
+const DOWNLINK_BIT: u8 = 0b0001_0000;
+const RESERVED_MASK: u8 = 0b1110_0000;
+
 pub type SessionId = [u8; SESSION_ID_LEN];
+/// Flow identifier scoped to one logical session.
+pub type FlowId = u32;
 
-pub const FLOW_FRAME_MAGIC: u8 = 0xf1;
-const FLOW_FRAME_VERSION: u8 = 1;
-const FLOW_HEADER_LEN: usize = 14;
-
-pub const FLOW_RESULT_MAGIC: u8 = 0xf2;
-const FLOW_RESULT_VERSION: u8 = 1;
-const FLOW_RESULT_LEN: usize = 4;
-
+/// Relationship of the current physical lane to a logical flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FlowRole {
+    /// One symmetric lane carries both directions.
+    Duplex = 0,
+    /// First half of an asymmetric flow; carries the target and uplink.
     Open = 1,
+    /// Second half of an asymmetric flow; carries the downlink.
     Attach = 2,
-    Duplex = 3,
 }
 
+/// Proxied payload semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FlowKind {
-    Tcp = 1,
-    Udp = 2,
+    Tcp = 0,
+    Udp = 1,
 }
 
+/// Physical carrier selected for one flow direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Carrier {
-    TlsTcp = 1,
-    Quic = 2,
+    TlsTcp = 0,
+    Quic = 1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum FlowStatus {
-    Ready = 1,
-    Reject = 2,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum FlowErrorCode {
-    InvalidRequest = 1,
-    MetadataConflict = 2,
-    PairTimeout = 3,
-    FlowLimit = 4,
-    DialFailed = 5,
-    SessionReplaced = 6,
-    InternalError = 7,
-}
-
-impl TryFrom<u8> for FlowErrorCode {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(Self::InvalidRequest),
-            2 => Ok(Self::MetadataConflict),
-            3 => Ok(Self::PairTimeout),
-            4 => Ok(Self::FlowLimit),
-            5 => Ok(Self::DialFailed),
-            6 => Ok(Self::SessionReplaced),
-            7 => Ok(Self::InternalError),
-            value => bail!("protocol::flow: invalid flow error code: {value}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FlowResult {
-    Ready,
-    Reject(FlowErrorCode),
-}
-
+/// Fully decoded logical-flow metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowHeader {
     pub role: FlowRole,
-    pub flow_id: u64,
+    pub flow_id: FlowId,
     pub kind: FlowKind,
     pub uplink: Carrier,
     pub downlink: Carrier,
 }
 
-pub fn write_flow_header(header: FlowHeader) -> [u8; FLOW_HEADER_LEN] {
-    let mut out = [0; FLOW_HEADER_LEN];
-    out[0] = FLOW_FRAME_MAGIC;
-    out[1] = FLOW_FRAME_VERSION;
-    out[2] = header.role as u8;
-    out[3..11].copy_from_slice(&header.flow_id.to_be_bytes());
-    out[11] = header.kind as u8;
-    out[12] = header.uplink as u8;
-    out[13] = header.downlink as u8;
-    out
+impl FlowHeader {
+    /// Validates role, ID, and carrier invariants independent of the current lane.
+    pub fn validate(self) -> Result<()> {
+        if self.flow_id == 0 {
+            bail!("protocol::flow::FlowHeader::validate: zero flow id");
+        }
+        match self.role {
+            FlowRole::Duplex if self.uplink != self.downlink => {
+                bail!("protocol::flow::FlowHeader::validate: duplex carrier mismatch")
+            }
+            FlowRole::Open | FlowRole::Attach if self.uplink == self.downlink => {
+                bail!("protocol::flow::FlowHeader::validate: split carriers must differ")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Validates that this header arrived on the physical carrier it declares.
+    pub fn validate_on(self, current: Carrier) -> Result<()> {
+        self.validate()?;
+        let expected = match self.role {
+            FlowRole::Duplex | FlowRole::Open => self.uplink,
+            FlowRole::Attach => self.downlink,
+        };
+        if current != expected {
+            bail!("protocol::flow::FlowHeader::validate_on: carrier mismatch");
+        }
+        Ok(())
+    }
+
+    /// Whether this lane is followed by a binary target.
+    pub const fn carries_target(self) -> bool {
+        matches!(self.role, FlowRole::Duplex | FlowRole::Open)
+    }
 }
 
+/// Encodes a header after validating its semantic invariants.
+pub fn encode_flow_header(header: FlowHeader) -> Result<[u8; FLOW_HEADER_LEN]> {
+    header.validate()?;
+    Ok(write_flow_header(header))
+}
+
+/// Encodes a flow header into a fixed stack array.
+///
+/// Callers accepting untrusted or dynamically assembled metadata should use
+/// [`encode_flow_header`] first. This low-level spelling remains allocation-free
+/// and matches the existing request-building call sites.
+pub fn write_flow_header(header: FlowHeader) -> [u8; FLOW_HEADER_LEN] {
+    let flags = header.role as u8
+        | (header.kind as u8) << 2
+        | (header.uplink as u8) << 3
+        | (header.downlink as u8) << 4;
+    let mut output = [0; FLOW_HEADER_LEN];
+    output[0] = flags;
+    output[1..].copy_from_slice(&header.flow_id.to_be_bytes());
+    output
+}
+
+/// Decodes exactly one fixed flow header.
+pub fn decode_flow_header(bytes: &[u8]) -> Result<FlowHeader> {
+    if bytes.len() != FLOW_HEADER_LEN {
+        bail!(
+            "protocol::flow::decode_flow_header: invalid header length: {}",
+            bytes.len()
+        );
+    }
+    let flags = bytes[0];
+    if flags & RESERVED_MASK != 0 {
+        bail!("protocol::flow::decode_flow_header: reserved flags are non-zero");
+    }
+    let role = match flags & ROLE_MASK {
+        0 => FlowRole::Duplex,
+        1 => FlowRole::Open,
+        2 => FlowRole::Attach,
+        value => bail!("protocol::flow::decode_flow_header: invalid role: {value}"),
+    };
+    let kind = if flags & KIND_BIT == 0 {
+        FlowKind::Tcp
+    } else {
+        FlowKind::Udp
+    };
+    let uplink = if flags & UPLINK_BIT == 0 {
+        Carrier::TlsTcp
+    } else {
+        Carrier::Quic
+    };
+    let downlink = if flags & DOWNLINK_BIT == 0 {
+        Carrier::TlsTcp
+    } else {
+        Carrier::Quic
+    };
+    let header = FlowHeader {
+        role,
+        flow_id: u32::from_be_bytes(bytes[1..].try_into().expect("fixed flow id")),
+        kind,
+        uplink,
+        downlink,
+    };
+    header.validate()?;
+    Ok(header)
+}
+
+/// Reads exactly one flow header, leaving initial payload buffered behind it.
 pub async fn read_flow_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<FlowHeader> {
     let mut bytes = [0; FLOW_HEADER_LEN];
     reader
         .read_exact(&mut bytes)
         .await
         .context("protocol::flow::read_flow_header: failed to read header")?;
-    if bytes[0] != FLOW_FRAME_MAGIC || bytes[1] != FLOW_FRAME_VERSION {
-        bail!("protocol::flow::read_flow_header: invalid magic or version");
-    }
-    let role = match bytes[2] {
-        1 => FlowRole::Open,
-        2 => FlowRole::Attach,
-        3 => FlowRole::Duplex,
-        value => bail!("protocol::flow::read_flow_header: invalid role: {value}"),
-    };
-    let flow_id = u64::from_be_bytes(bytes[3..11].try_into().expect("fixed flow id"));
-    if flow_id == 0 {
-        bail!("protocol::flow::read_flow_header: zero flow id");
-    }
-    let kind = match bytes[11] {
-        1 => FlowKind::Tcp,
-        2 => FlowKind::Udp,
-        value => bail!("protocol::flow::read_flow_header: invalid kind: {value}"),
-    };
-    let carrier = |value| match value {
-        1 => Ok(Carrier::TlsTcp),
-        2 => Ok(Carrier::Quic),
-        value => bail!("protocol::flow::read_flow_header: invalid carrier: {value}"),
-    };
-    let header = FlowHeader {
-        role,
-        flow_id,
-        kind,
-        uplink: carrier(bytes[12])?,
-        downlink: carrier(bytes[13])?,
-    };
-    match header.role {
-        FlowRole::Duplex if header.uplink != header.downlink => {
-            bail!("protocol::flow::read_flow_header: duplex carrier mismatch")
-        }
-        FlowRole::Open | FlowRole::Attach if header.uplink == header.downlink => {
-            bail!("protocol::flow::read_flow_header: split carriers must differ")
-        }
-        _ => Ok(header),
-    }
-}
-
-pub fn encode_flow_result(result: FlowResult) -> [u8; FLOW_RESULT_LEN] {
-    let (status, code) = match result {
-        FlowResult::Ready => (FlowStatus::Ready as u8, 0),
-        FlowResult::Reject(code) => (FlowStatus::Reject as u8, code as u8),
-    };
-    [FLOW_RESULT_MAGIC, FLOW_RESULT_VERSION, status, code]
-}
-
-pub async fn write_flow_result<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    result: FlowResult,
-) -> Result<()> {
-    writer
-        .write_all(&encode_flow_result(result))
-        .await
-        .context("protocol::flow::write_flow_result: failed to write result")
-}
-
-pub async fn read_flow_result<R: AsyncRead + Unpin>(reader: &mut R) -> Result<FlowResult> {
-    let mut bytes = [0; FLOW_RESULT_LEN];
-    reader
-        .read_exact(&mut bytes)
-        .await
-        .context("protocol::flow::read_flow_result: failed to read result")?;
-    if bytes[0] != FLOW_RESULT_MAGIC || bytes[1] != FLOW_RESULT_VERSION {
-        bail!("protocol::flow::read_flow_result: invalid magic or version");
-    }
-    match (bytes[2], bytes[3]) {
-        (status, 0) if status == FlowStatus::Ready as u8 => Ok(FlowResult::Ready),
-        (status, code) if status == FlowStatus::Reject as u8 => {
-            Ok(FlowResult::Reject(code.try_into()?))
-        }
-        _ => bail!("protocol::flow::read_flow_result: invalid status or code"),
-    }
+    decode_flow_header(&bytes)
 }
 
 #[cfg(test)]

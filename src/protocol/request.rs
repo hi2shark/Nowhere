@@ -1,155 +1,307 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! TCP request frame encoding and decoding.
+//! Compact SOCKS5-compatible target-address codec.
+
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::spec::{
-    EffectiveProtocolSpec, PROXY_FRAME_VERSION, TcpFrameElement, tcp_request_padding_bytes,
-};
-use super::util::{TARGET_LEN_MAX, check_target_len, validate_target};
+use super::util::{DOMAIN_LEN_MAX, validate_domain_bytes, validate_port};
 
-/// Reads a spec-derived TCP request frame and returns the target address.
-pub async fn read_request<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<String> {
-    let mut target: Option<String> = None;
-    let mut padding: Option<Vec<u8>> = None;
+/// SOCKS5 IPv4 address type.
+pub const TARGET_ATYP_IPV4: u8 = 0x01;
+/// SOCKS5 domain-name address type.
+pub const TARGET_ATYP_DOMAIN: u8 = 0x03;
+/// SOCKS5 IPv6 address type.
+pub const TARGET_ATYP_IPV6: u8 = 0x04;
 
-    // Target and padding may appear in either order depending on the effective
-    // spec, so validate once both fields are available.
-    for element in protocol_spec.frame_layout.tcp {
-        match element {
-            TcpFrameElement::Version => read_version(reader).await?,
-            TcpFrameElement::Target => {
-                target = Some(read_target(reader).await?);
-                if let (Some(target), Some(padding)) = (&target, &padding) {
-                    validate_padding(protocol_spec, target, padding)?;
-                }
-            }
-            TcpFrameElement::Padding => {
-                padding = Some(read_padding(reader, protocol_spec).await?);
-                if let (Some(target), Some(padding)) = (&target, &padding) {
-                    validate_padding(protocol_spec, target, padding)?;
-                }
-            }
+pub const TARGET_IPV4_LEN: usize = 1 + 4 + 2;
+pub const TARGET_IPV6_LEN: usize = 1 + 16 + 2;
+pub const TARGET_MAX_ENCODED_LEN: usize = 1 + 1 + DOMAIN_LEN_MAX + 2;
+
+/// Binary destination address carried after an opening flow header.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Target {
+    /// Literal IPv4 or IPv6 endpoint.
+    Ip(SocketAddr),
+    /// Unresolved ASCII/IDNA wire hostname and port.
+    Domain { host: String, port: u16 },
+}
+
+impl Target {
+    /// Creates a validated IP target.
+    pub fn ip(address: SocketAddr) -> Result<Self> {
+        validate_port(address.port(), "protocol::request::Target::ip")?;
+        Ok(Self::Ip(address))
+    }
+
+    /// Creates a validated unresolved domain target.
+    pub fn domain(host: impl Into<String>, port: u16) -> Result<Self> {
+        let host = host.into();
+        validate_domain_bytes(host.as_bytes(), "protocol::request::Target::domain")?;
+        validate_port(port, "protocol::request::Target::domain")?;
+        Ok(Self::Domain { host, port })
+    }
+
+    /// Destination port.
+    pub const fn port(&self) -> u16 {
+        match self {
+            Self::Ip(address) => address.port(),
+            Self::Domain { port, .. } => *port,
         }
     }
 
-    let target =
-        target.ok_or_else(|| anyhow::anyhow!("protocol::request::read_request: missing target"))?;
-    if padding.is_none() {
-        bail!("protocol::request::read_request: missing padding");
-    }
-    Ok(target)
-}
-
-async fn read_version<R: AsyncRead + Unpin>(reader: &mut R) -> Result<()> {
-    let mut version = [0u8; 1];
-    reader
-        .read_exact(&mut version)
-        .await
-        .context("protocol::request::read_request: failed to read version")?;
-    if version[0] != PROXY_FRAME_VERSION {
-        bail!(
-            "protocol::request::read_request: unsupported frame version: {}",
-            version[0]
-        );
-    }
-    Ok(())
-}
-
-async fn read_target<R: AsyncRead + Unpin>(reader: &mut R) -> Result<String> {
-    let mut header = [0u8; 2];
-    reader
-        .read_exact(&mut header)
-        .await
-        .context("protocol::request::read_request: failed to read target length")?;
-
-    let target_len = u16::from_be_bytes(header) as usize;
-    if target_len == 0 || target_len > TARGET_LEN_MAX {
-        bail!("protocol::request::read_request: invalid target length: {target_len}");
-    }
-    let mut target = vec![0; target_len];
-    reader
-        .read_exact(&mut target)
-        .await
-        .context("protocol::request::read_request: failed to read target")?;
-
-    let addr = String::from_utf8(target)
-        .context("protocol::request::read_request: target address is not valid UTF-8")?;
-    validate_target(&addr).map_err(|e| anyhow::anyhow!("protocol::request::read_request: {e}"))?;
-    Ok(addr)
-}
-
-async fn read_padding<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<Vec<u8>> {
-    let mut header = [0u8; 1];
-    reader
-        .read_exact(&mut header)
-        .await
-        .context("protocol::request::read_request: failed to read padding length")?;
-    let padding_len = header[0];
-    if padding_len != protocol_spec.tcp_padding_len {
-        bail!(
-            "protocol::request::read_request: invalid padding length: expected {}, got {padding_len}",
-            protocol_spec.tcp_padding_len
-        );
+    /// Literal socket address when the target does not require DNS resolution.
+    pub const fn socket_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Ip(address) => Some(*address),
+            Self::Domain { .. } => None,
+        }
     }
 
-    let mut padding = vec![0; padding_len as usize];
-    reader
-        .read_exact(&mut padding)
-        .await
-        .context("protocol::request::read_request: failed to read padding")?;
-    Ok(padding)
-}
-
-fn validate_padding(
-    protocol_spec: &EffectiveProtocolSpec,
-    target_addr: &str,
-    padding: &[u8],
-) -> Result<()> {
-    let expected = tcp_request_padding_bytes(protocol_spec, target_addr);
-    if padding != expected {
-        bail!("protocol::request::read_request: invalid padding");
+    /// Unresolved hostname, or `None` for a literal IP target.
+    pub fn domain_name(&self) -> Option<&str> {
+        match self {
+            Self::Ip(_) => None,
+            Self::Domain { host, .. } => Some(host),
+        }
     }
-    Ok(())
-}
 
-/// Encodes a TCP request frame in the effective spec's field order.
-pub fn write_request_frame(
-    target_addr: &str,
-    protocol_spec: &EffectiveProtocolSpec,
-) -> Result<Vec<u8>> {
-    check_target_len("protocol::request::write_request_frame", target_addr)?;
-    validate_target(target_addr)
-        .map_err(|e| anyhow::anyhow!("protocol::request::write_request_frame: {e}"))?;
+    /// Literal IP address, or `None` for an unresolved domain target.
+    pub const fn ip_addr(&self) -> Option<IpAddr> {
+        match self {
+            Self::Ip(address) => Some(address.ip()),
+            Self::Domain { .. } => None,
+        }
+    }
 
-    let target_len = (target_addr.len() as u16).to_be_bytes();
-    let padding = tcp_request_padding_bytes(protocol_spec, target_addr);
-    let mut buf = Vec::with_capacity(1 + target_len.len() + target_addr.len() + 1 + padding.len());
-    // Keep the writer layout-driven to preserve parity with the reader and
-    // spec-derived Swift mirror.
-    for element in protocol_spec.frame_layout.tcp {
-        match element {
-            TcpFrameElement::Version => buf.push(PROXY_FRAME_VERSION),
-            TcpFrameElement::Target => {
-                buf.extend_from_slice(&target_len);
-                buf.extend_from_slice(target_addr.as_bytes());
+    /// Encoded binary length after validation.
+    pub fn encoded_len(&self) -> Result<usize> {
+        match self {
+            Self::Ip(address) => {
+                validate_port(address.port(), "protocol::request::Target::encoded_len")?;
+                Ok(match address.ip() {
+                    IpAddr::V4(_) => TARGET_IPV4_LEN,
+                    IpAddr::V6(_) => TARGET_IPV6_LEN,
+                })
             }
-            TcpFrameElement::Padding => {
-                buf.push(protocol_spec.tcp_padding_len);
-                buf.extend_from_slice(&padding);
+            Self::Domain { host, port } => {
+                validate_domain_bytes(host.as_bytes(), "protocol::request::Target::encoded_len")?;
+                validate_port(*port, "protocol::request::Target::encoded_len")?;
+                Ok(1 + 1 + host.len() + 2)
             }
         }
     }
-    Ok(buf)
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(address) => address.fmt(formatter),
+            Self::Domain { host, port } => write!(formatter, "{host}:{port}"),
+        }
+    }
+}
+
+impl FromStr for Target {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if let Ok(address) = SocketAddr::from_str(value) {
+            return Self::ip(address);
+        }
+        let Some((host, raw_port)) = value.rsplit_once(':') else {
+            bail!("protocol::request::Target::from_str: missing port");
+        };
+        if host.contains(':') {
+            bail!("protocol::request::Target::from_str: IPv6 address must be bracketed");
+        }
+        let port = raw_port
+            .parse::<u16>()
+            .context("protocol::request::Target::from_str: invalid port")?;
+        Self::domain(host, port)
+    }
+}
+
+impl TryFrom<&str> for Target {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl TryFrom<String> for Target {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+/// Writes a target into caller-owned memory and returns the encoded length.
+pub fn encode_target_into(target: &Target, output: &mut [u8]) -> Result<usize> {
+    let encoded_len = target.encoded_len()?;
+    if output.len() < encoded_len {
+        bail!(
+            "protocol::request::encode_target_into: output too short: need {encoded_len}, got {}",
+            output.len()
+        );
+    }
+
+    match target {
+        Target::Ip(SocketAddr::V4(address)) => {
+            output[0] = TARGET_ATYP_IPV4;
+            output[1..5].copy_from_slice(&address.ip().octets());
+            output[5..7].copy_from_slice(&address.port().to_be_bytes());
+        }
+        Target::Ip(SocketAddr::V6(address)) => {
+            output[0] = TARGET_ATYP_IPV6;
+            output[1..17].copy_from_slice(&address.ip().octets());
+            output[17..19].copy_from_slice(&address.port().to_be_bytes());
+        }
+        Target::Domain { host, port } => {
+            output[0] = TARGET_ATYP_DOMAIN;
+            output[1] = host.len() as u8;
+            output[2..2 + host.len()].copy_from_slice(host.as_bytes());
+            output[2 + host.len()..encoded_len].copy_from_slice(&port.to_be_bytes());
+        }
+    }
+    Ok(encoded_len)
+}
+
+/// Encodes a validated target into a right-sized buffer.
+pub fn encode_target(target: &Target) -> Result<Vec<u8>> {
+    let mut output = vec![0; target.encoded_len()?];
+    let written = encode_target_into(target, &mut output)?;
+    debug_assert_eq!(written, output.len());
+    Ok(output)
+}
+
+/// Decodes one target prefix and reports how many bytes it consumed.
+pub fn decode_target(input: &[u8]) -> Result<(Target, usize)> {
+    let Some(&address_type) = input.first() else {
+        bail!("protocol::request::decode_target: missing address type");
+    };
+    match address_type {
+        TARGET_ATYP_IPV4 => {
+            if input.len() < TARGET_IPV4_LEN {
+                bail!("protocol::request::decode_target: truncated IPv4 target");
+            }
+            let address = Ipv4Addr::new(input[1], input[2], input[3], input[4]);
+            let port = u16::from_be_bytes([input[5], input[6]]);
+            Ok((
+                Target::ip(SocketAddr::new(IpAddr::V4(address), port))?,
+                TARGET_IPV4_LEN,
+            ))
+        }
+        TARGET_ATYP_IPV6 => {
+            if input.len() < TARGET_IPV6_LEN {
+                bail!("protocol::request::decode_target: truncated IPv6 target");
+            }
+            let octets: [u8; 16] = input[1..17].try_into().expect("fixed IPv6 address");
+            let port = u16::from_be_bytes([input[17], input[18]]);
+            Ok((
+                Target::ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))?,
+                TARGET_IPV6_LEN,
+            ))
+        }
+        TARGET_ATYP_DOMAIN => {
+            let Some(&domain_len) = input.get(1) else {
+                bail!("protocol::request::decode_target: missing domain length");
+            };
+            let domain_len = domain_len as usize;
+            validate_domain_bytes(
+                input.get(2..2 + domain_len).ok_or_else(|| {
+                    anyhow::anyhow!("protocol::request::decode_target: truncated domain")
+                })?,
+                "protocol::request::decode_target",
+            )?;
+            let encoded_len = 1 + 1 + domain_len + 2;
+            if input.len() < encoded_len {
+                bail!("protocol::request::decode_target: truncated domain port");
+            }
+            let host = String::from_utf8(input[2..2 + domain_len].to_vec())
+                .expect("ASCII domain is UTF-8");
+            let port = u16::from_be_bytes([input[encoded_len - 2], input[encoded_len - 1]]);
+            Ok((Target::domain(host, port)?, encoded_len))
+        }
+        value => bail!("protocol::request::decode_target: unknown address type: {value}"),
+    }
+}
+
+/// Reads one target without consuming any following initial payload.
+pub async fn read_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Target> {
+    let mut address_type = [0; 1];
+    reader
+        .read_exact(&mut address_type)
+        .await
+        .context("protocol::request::read_request: failed to read address type")?;
+
+    match address_type[0] {
+        TARGET_ATYP_IPV4 => {
+            let mut tail = [0; TARGET_IPV4_LEN - 1];
+            reader
+                .read_exact(&mut tail)
+                .await
+                .context("protocol::request::read_request: failed to read IPv4 target")?;
+            let mut encoded = [0; TARGET_IPV4_LEN];
+            encoded[0] = TARGET_ATYP_IPV4;
+            encoded[1..].copy_from_slice(&tail);
+            Ok(decode_target(&encoded)?.0)
+        }
+        TARGET_ATYP_IPV6 => {
+            let mut tail = [0; TARGET_IPV6_LEN - 1];
+            reader
+                .read_exact(&mut tail)
+                .await
+                .context("protocol::request::read_request: failed to read IPv6 target")?;
+            let mut encoded = [0; TARGET_IPV6_LEN];
+            encoded[0] = TARGET_ATYP_IPV6;
+            encoded[1..].copy_from_slice(&tail);
+            Ok(decode_target(&encoded)?.0)
+        }
+        TARGET_ATYP_DOMAIN => {
+            let mut length = [0; 1];
+            reader
+                .read_exact(&mut length)
+                .await
+                .context("protocol::request::read_request: failed to read domain length")?;
+            let domain_len = length[0] as usize;
+            if domain_len == 0 || domain_len > DOMAIN_LEN_MAX {
+                bail!("protocol::request::read_request: invalid domain length: {domain_len}");
+            }
+            let mut encoded = [0; TARGET_MAX_ENCODED_LEN];
+            encoded[0] = TARGET_ATYP_DOMAIN;
+            encoded[1] = length[0];
+            let encoded_len = 1 + 1 + domain_len + 2;
+            reader
+                .read_exact(&mut encoded[2..encoded_len])
+                .await
+                .context("protocol::request::read_request: failed to read domain target")?;
+            Ok(decode_target(&encoded[..encoded_len])?.0)
+        }
+        value => bail!("protocol::request::read_request: unknown address type: {value}"),
+    }
+}
+
+/// Writes one target directly from a stack buffer.
+pub async fn write_request<W: AsyncWrite + Unpin>(writer: &mut W, target: &Target) -> Result<()> {
+    let mut encoded = [0; TARGET_MAX_ENCODED_LEN];
+    let encoded_len = encode_target_into(target, &mut encoded)?;
+    writer
+        .write_all(&encoded[..encoded_len])
+        .await
+        .context("protocol::request::write_request: failed to write target")
+}
+
+/// Encodes a target for callers assembling auth, flow, target, and payload.
+pub fn write_request_frame(target: &Target) -> Result<Vec<u8>> {
+    encode_target(target)
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ use super::protocol::{
 use super::udp::{OutboundUdpSocket, SocksUdpAssociation};
 use crate::common::network::{connect_tcp_addr, connect_udp_addr, filter_addrs, parse_local_ip};
 use crate::common::{dial_tcp_from_local_ip, dial_udp_from_local_ip};
+use crate::protocol::Target;
 
 /// Direct-or-SOCKS outbound connector shared by every relay path.
 #[derive(Clone, Debug)]
@@ -40,27 +41,55 @@ impl OutboundDialer {
             .unwrap_or_else(|| "none".to_string())
     }
 
-    pub(crate) async fn dial_tcp(&self, target: &str, timeout: Duration) -> Result<TcpStream> {
+    /// Dials a validated binary protocol target without reparsing host/port
+    /// text at the Portal relay boundary.
+    pub(crate) async fn dial_tcp_target(
+        &self,
+        target: &Target,
+        timeout: Duration,
+    ) -> Result<TcpStream> {
         let Some(config) = &self.socks else {
-            return dial_tcp_from_local_ip(&self.dialer_ip, target, timeout).await;
+            return match target {
+                Target::Ip(address) => tokio::time::timeout(
+                    timeout,
+                    connect_tcp_addr(parse_local_ip(&self.dialer_ip), *address),
+                )
+                .await
+                .map_err(|_| anyhow!("common::socks::OutboundDialer::dial_tcp: dial timeout"))?,
+                Target::Domain { .. } => {
+                    dial_tcp_from_local_ip(&self.dialer_ip, &target.to_string(), timeout).await
+                }
+            };
         };
-        let target = SocksAddress::parse(target, "target")?;
+        let target = SocksAddress::from_target(target);
         tokio::time::timeout(timeout, self.dial_socks_tcp(config, &target))
             .await
             .map_err(|_| anyhow!("common::socks::OutboundDialer::dial_tcp: dial timeout"))?
     }
 
-    pub(crate) async fn dial_udp(
+    /// Opens a UDP path for a validated binary protocol target.
+    pub(crate) async fn dial_udp_target(
         &self,
-        target: &str,
+        target: &Target,
         timeout: Duration,
     ) -> Result<OutboundUdpSocket> {
         let Some(config) = &self.socks else {
-            return dial_udp_from_local_ip(&self.dialer_ip, target, timeout)
+            return match target {
+                Target::Ip(address) => tokio::time::timeout(
+                    timeout,
+                    connect_udp_addr(parse_local_ip(&self.dialer_ip), *address),
+                )
                 .await
-                .map(OutboundUdpSocket::Direct);
+                .map_err(|_| anyhow!("common::socks::OutboundDialer::dial_udp: dial timeout"))?
+                .map(OutboundUdpSocket::Direct),
+                Target::Domain { .. } => {
+                    dial_udp_from_local_ip(&self.dialer_ip, &target.to_string(), timeout)
+                        .await
+                        .map(OutboundUdpSocket::Direct)
+                }
+            };
         };
-        let target = SocksAddress::parse(target, "target")?;
+        let target = SocksAddress::from_target(target);
         tokio::time::timeout(timeout, self.dial_socks_udp(config, target))
             .await
             .map_err(|_| anyhow!("common::socks::OutboundDialer::dial_udp: dial timeout"))?

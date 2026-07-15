@@ -3,47 +3,57 @@
 
 //! QUIC DATAGRAM dispatch for UDP packets after reliable flow setup.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll, Wake, Waker};
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::{UdpFragment, UdpFrame, decode_udp_frame};
+use crate::common::handshake_timeout;
+use crate::protocol::{OwnedUdpFragment, OwnedUdpFrame, ReassemblyOutcome, decode_udp_frame_owned};
 
-use super::flow::ReassemblyOutcome;
-use super::{PortalSession, QueuedDatagram};
+use super::flow::reserve_packet_budget;
+use super::{DatagramReadyRequest, PortalSession, QueuedDatagram};
 
 impl PortalSession {
     /// Consumes pending and live QUIC datagrams for this authenticated session.
     pub(in crate::portal::conn) async fn datagram_loop(
         self: Arc<Self>,
-        mut pending: VecDeque<Bytes>,
         shutdown: CancellationToken,
     ) {
+        let Some(mut ready_requests) = self.take_udp_ready_requests().await else {
+            return;
+        };
         let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(1));
         cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let data = if let Some(data) = pending.pop_front() {
-                data
-            } else {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = cleanup.tick() => {
-                        if self.udp_reassembler.lock().await.expire(tokio::time::Instant::now()) {
-                            self.warn_udp_drop("incomplete UDP packet expired");
-                        }
-                        continue;
+            let data = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = cleanup.tick() => {
+                    if self.udp_reassembler
+                        .lock()
+                        .unwrap_or_else(|lock| lock.into_inner())
+                        .expire(std::time::Instant::now())
+                    {
+                        self.warn_udp_drop("incomplete UDP packet expired");
                     }
-                    datagram = self.conn.read_datagram() => match datagram {
-                        Ok(data) => data,
-                        Err(err) => {
-                            if !shutdown.is_cancelled() {
-                                self.portal.logger.debug(format_args!("portal::conn::datagram_loop: receive closed: {err}"));
-                            }
-                            return;
+                    continue;
+                }
+                request = ready_requests.recv() => {
+                    let Some(request) = request else {
+                        return;
+                    };
+                    self.commit_udp_ready(request, &shutdown).await;
+                    continue;
+                }
+                datagram = self.conn.read_datagram() => match datagram {
+                    Ok(data) => data,
+                    Err(err) => {
+                        if !shutdown.is_cancelled() {
+                            self.portal.logger.debug(format_args!("portal::conn::datagram_loop: receive closed: {err}"));
                         }
+                        return;
                     }
                 }
             };
@@ -51,65 +61,126 @@ impl PortalSession {
         }
     }
 
-    async fn handle_datagram(self: &Arc<Self>, data: Bytes) {
-        match decode_udp_frame(&data) {
-            Ok(UdpFrame::Data { flow_id, fragment }) => {
-                self.handle_udp_fragment(flow_id, fragment).await;
+    async fn commit_udp_ready(
+        self: &Arc<Self>,
+        request: DatagramReadyRequest,
+        shutdown: &CancellationToken,
+    ) {
+        let waker = Waker::from(Arc::new(DatagramReadyWake));
+        let deadline = tokio::time::Instant::now() + handshake_timeout();
+        let mut drained = 0usize;
+        loop {
+            let polled = {
+                let read = self.conn.read_datagram();
+                tokio::pin!(read);
+                let mut context = Context::from_waker(&waker);
+                std::future::Future::poll(read.as_mut(), &mut context)
+            };
+            match polled {
+                Poll::Ready(Ok(data)) => {
+                    self.handle_datagram(data).await;
+                    drained += 1;
+                    if shutdown.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                        let _ = request.acknowledge.send(false);
+                        return;
+                    }
+                    if drained.is_multiple_of(1_024) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Poll::Ready(Err(_)) => {
+                    let _ = request.acknowledge.send(false);
+                    return;
+                }
+                Poll::Pending => {
+                    let _ = request.acknowledge.send(true);
+                    return;
+                }
             }
-            Ok(UdpFrame::Close { flow_id }) => self.close_udp_flow(flow_id).await,
+        }
+    }
+
+    async fn handle_datagram(self: &Arc<Self>, data: Bytes) {
+        match decode_udp_frame_owned(data) {
+            Ok(OwnedUdpFrame::Data { flow_id, payload }) => {
+                self.handle_unfragmented_udp(flow_id, payload);
+            }
+            Ok(OwnedUdpFrame::Fragment { flow_id, fragment }) => {
+                self.handle_udp_fragment(flow_id, fragment);
+            }
+            Ok(OwnedUdpFrame::Close { flow_id }) => self.close_udp_flow(flow_id).await,
             Err(err) => self.portal.logger.debug(format_args!(
                 "portal::conn::datagram_loop: invalid UDP frame: {err}"
             )),
         }
     }
 
-    async fn handle_udp_fragment(self: &Arc<Self>, flow_id: u64, fragment: UdpFragment<'_>) {
-        if !self.udp_flows.lock().await.contains_key(&flow_id) {
+    fn handle_unfragmented_udp(&self, flow_id: u32, payload: Bytes) {
+        let flows = self
+            .udp_flows
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(state) = flows.get(&flow_id) else {
             self.warn_udp_drop("DATA for unknown UDP flow");
             return;
+        };
+        if !state.ready.load(Ordering::Acquire) {
+            self.warn_udp_drop("DATA before UDP flow READY");
+            return;
         }
-        let payload = Bytes::copy_from_slice(fragment.payload);
-        let outcome = self.udp_reassembler.lock().await.push(
-            flow_id,
-            fragment,
-            payload,
-            self.udp_queue_budget.clone(),
-        );
+        let Some(permit) = reserve_packet_budget(self.udp_queue_budget.clone(), payload.len())
+        else {
+            self.warn_udp_drop("connection queue byte limit reached");
+            return;
+        };
+        self.enqueue_udp(&state.sender, QueuedDatagram::new(payload, permit));
+    }
+
+    fn handle_udp_fragment(&self, flow_id: u32, fragment: OwnedUdpFragment) {
+        // Every dual-state operation takes flows before reassembly. Keeping
+        // both guards through enqueue prevents close/remove races from
+        // resurrecting a partial or complete packet.
+        let flows = self
+            .udp_flows
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(state) = flows.get(&flow_id) else {
+            self.warn_udp_drop("DATA for unknown UDP flow");
+            return;
+        };
+        if !state.ready.load(Ordering::Acquire) {
+            self.warn_udp_drop("DATA before UDP flow READY");
+            return;
+        }
+        let mut reassembler = self
+            .udp_reassembler
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let outcome = reassembler.push_with(flow_id, fragment, std::time::Instant::now(), |len| {
+            reserve_packet_budget(self.udp_queue_budget.clone(), usize::from(len))
+        });
         match outcome {
             ReassemblyOutcome::Pending { evicted_partial } => {
                 if evicted_partial {
                     self.warn_udp_drop("incomplete UDP packet evicted");
                 }
             }
-            ReassemblyOutcome::Dropped(reason) => self.warn_udp_drop(reason),
+            ReassemblyOutcome::Dropped(reason) => self.warn_udp_drop(reason.as_str()),
             ReassemblyOutcome::Complete {
-                datagram,
+                payload,
+                reservation,
                 evicted_partial,
             } => {
                 if evicted_partial {
                     self.warn_udp_drop("incomplete UDP packet evicted");
                 }
-                self.handle_udp_data(flow_id, datagram).await;
+                self.enqueue_udp(&state.sender, QueuedDatagram::new(payload, reservation));
             }
         }
     }
 
-    async fn handle_udp_data(&self, flow_id: u64, datagram: QueuedDatagram) {
-        let sender = self
-            .udp_flows
-            .lock()
-            .await
-            .get(&flow_id)
-            .map(|state| state.sender.clone());
-        if let Some(sender) = sender {
-            self.enqueue_udp(&sender, datagram);
-        } else {
-            self.warn_udp_drop("DATA raced with UDP flow close");
-        }
-    }
-
-    async fn close_udp_flow(&self, flow_id: u64) {
-        self.remove_udp_uplink(flow_id).await;
+    async fn close_udp_flow(&self, flow_id: u32) {
+        self.remove_udp_uplink(flow_id);
         self.portal
             .pairing
             .cancel_udp(self.session_id, flow_id)
@@ -136,4 +207,10 @@ impl PortalSession {
             ));
         }
     }
+}
+
+struct DatagramReadyWake;
+
+impl Wake for DatagramReadyWake {
+    fn wake(self: Arc<Self>) {}
 }

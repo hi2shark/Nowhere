@@ -1,197 +1,165 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! TCP request frame tests.
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+use tokio::io::AsyncReadExt;
 
 use super::*;
-use url::Url;
 
-fn protocol_spec(spec: &str) -> EffectiveProtocolSpec {
-    let url = Url::parse(&format!("portal://secret@127.0.0.1:443?spec={spec}")).unwrap();
-    EffectiveProtocolSpec::new(&url, b"secret").unwrap()
+#[test]
+fn ipv4_ipv6_and_domain_match_socks5_address_vectors() {
+    let ipv4 = Target::Ip(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::new(192, 0, 2, 1),
+        443,
+    )));
+    assert_eq!(
+        encode_target(&ipv4).unwrap(),
+        [0x01, 192, 0, 2, 1, 0x01, 0xbb]
+    );
+
+    let ipv6 = Target::Ip(SocketAddr::V6(SocketAddrV6::new(
+        "2001:db8::1".parse::<Ipv6Addr>().unwrap(),
+        53,
+        0,
+        0,
+    )));
+    assert_eq!(
+        encode_target(&ipv6).unwrap(),
+        [
+            0x04, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 53,
+        ]
+    );
+
+    let domain = Target::domain("xn--bcher-kva.example", 8080).unwrap();
+    let mut expected = vec![0x03, 21];
+    expected.extend_from_slice(b"xn--bcher-kva.example");
+    expected.extend_from_slice(&8080u16.to_be_bytes());
+    assert_eq!(encode_target(&domain).unwrap(), expected);
 }
 
 #[test]
-fn writes_versioned_target_in_derived_order() {
-    let spec = protocol_spec("edge-a");
-    let frame = write_request_frame("example.com:443", &spec).unwrap();
-    assert_eq!(
-        frame.len(),
-        1 + 2 + "example.com:443".len() + 1 + spec.tcp_padding_len as usize
-    );
-
-    let fields = decode_fields(&frame, &spec);
-    assert_eq!(fields.version, PROXY_FRAME_VERSION);
-    assert_eq!(fields.target, "example.com:443");
-    assert_eq!(
-        fields.padding,
-        tcp_request_padding_bytes(&spec, "example.com:443")
-    );
+fn all_target_variants_round_trip_and_preserve_trailing_payload() {
+    for target in [
+        Target::try_from("127.0.0.1:80").unwrap(),
+        Target::try_from("[2001:db8::5]:65535").unwrap(),
+        Target::try_from("example.com:443").unwrap(),
+    ] {
+        let mut encoded = encode_target(&target).unwrap();
+        let consumed = encoded.len();
+        encoded.extend_from_slice(b"initial payload");
+        let (decoded, actual_consumed) = decode_target(&encoded).unwrap();
+        assert_eq!(decoded, target);
+        assert_eq!(actual_consumed, consumed);
+        assert_eq!(&encoded[actual_consumed..], b"initial payload");
+        assert_eq!(Target::try_from(target.to_string()).unwrap(), target);
+    }
 }
 
 #[test]
-fn tcp_request_fixed_vectors() {
-    let cases = [
-        (
-            "auto",
-            "000f6578616d706c652e636f6d3a343433013c1526b9b947228779cfc539fe4681bcb5d1e20efa2bcb9f89eda5b473625c3c6b7fb12499fd33edfefb1934c9ae0bfc0e849f4c94814f4f2f9ae782e8",
-        ),
-        (
-            "edge-a",
-            "321e7800dfe8345ac8f3c1897d243ec10cea6218a101531221c227da14f0242f079004bf8575f00e6a2ff9c48a932410fe434601000f6578616d706c652e636f6d3a343433",
-        ),
-    ];
-
-    for (spec_name, expected_hex) in cases {
-        let spec = protocol_spec(spec_name);
-        let frame = write_request_frame("example.com:443", &spec).unwrap();
-
-        assert_eq!(hex(&frame), expected_hex);
-    }
-}
-
-#[tokio::test]
-async fn reads_request_frame() {
-    let spec = protocol_spec("edge-a");
-    let frame = write_request_frame("example.com:443", &spec).unwrap();
-    let mut reader = frame.as_slice();
-
-    assert_eq!(
-        read_request(&mut reader, &spec).await.unwrap(),
-        "example.com:443"
+fn maximum_domain_is_accepted_without_a_large_generic_target_buffer() {
+    let host = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
     );
+    assert_eq!(host.len(), 253);
+    let target = Target::domain(host.clone(), 1).unwrap();
+    let encoded = encode_target(&target).unwrap();
+    assert_eq!(encoded.len(), TARGET_MAX_ENCODED_LEN);
+    assert_eq!(encoded[0], TARGET_ATYP_DOMAIN);
+    assert_eq!(encoded[1], 253);
+    assert_eq!(decode_target(&encoded).unwrap().0, target);
+
+    assert!(Target::domain(format!("{host}a"), 1).is_err());
+}
+
+#[test]
+fn target_constructors_reject_empty_illegal_or_ambiguous_values() {
+    for value in [
+        "",
+        "example.com",
+        "example.com:0",
+        ":443",
+        "bücher.example:443",
+        "bad host:443",
+        "bad/host:443",
+        "bad@host:443",
+        "-bad.example:443",
+        "bad-.example:443",
+        "bad..example:443",
+        "example.com.:443",
+        "bad:host:443",
+        "[example.com]:443",
+        "2001:db8::1:443",
+    ] {
+        assert!(Target::try_from(value).is_err(), "accepted {value:?}");
+    }
+    assert!(Target::ip("127.0.0.1:0".parse().unwrap()).is_err());
+    assert!(Target::domain("example.com", 0).is_err());
+    assert!(Target::domain("bad[host]", 443).is_err());
+    assert!(Target::domain(format!("{}.example", "a".repeat(64)), 443).is_err());
+}
+
+#[test]
+fn public_enum_cannot_bypass_encoder_validation() {
+    assert!(
+        encode_target(&Target::Domain {
+            host: String::new(),
+            port: 443,
+        })
+        .is_err()
+    );
+    assert!(encode_target(&Target::Ip("127.0.0.1:0".parse().unwrap())).is_err());
+    let mut short = [0; 6];
+    assert!(encode_target_into(&Target::try_from("127.0.0.1:80").unwrap(), &mut short).is_err());
+}
+
+#[test]
+fn decoder_rejects_unknown_empty_zero_port_and_truncated_inputs() {
+    for input in [
+        vec![],
+        vec![0x00],
+        vec![0x02, 1, 2, 3, 4, 0, 80],
+        vec![0x01],
+        vec![0x01, 127, 0, 0, 1, 0],
+        vec![0x01, 127, 0, 0, 1, 0, 0],
+        vec![0x04; 18],
+        vec![0x03],
+        vec![0x03, 0, 0, 80],
+        vec![0x03, 3, b'a', b'b', 0, 80],
+        vec![0x03, 1, 0xff, 0, 80],
+        vec![0x03, 1, b'a', 0, 0],
+    ] {
+        assert!(decode_target(&input).is_err(), "accepted {input:?}");
+    }
 }
 
 #[tokio::test]
-async fn rejects_invalid_request_targets() {
-    let spec = protocol_spec("edge-a");
-    let mut frame = Vec::new();
-    for element in spec.frame_layout.tcp {
-        match element {
-            TcpFrameElement::Version => frame.push(PROXY_FRAME_VERSION),
-            TcpFrameElement::Target => {
-                frame.extend_from_slice(&12u16.to_be_bytes());
-                frame.extend_from_slice(b"example.com:");
-            }
-            TcpFrameElement::Padding => {
-                frame.push(spec.tcp_padding_len);
-                frame.extend_from_slice(&tcp_request_padding_bytes(&spec, "example.com:"));
-            }
-        }
-    }
-    let mut reader = frame.as_slice();
+async fn async_read_and_write_leave_initial_payload_untouched() {
+    let target = Target::try_from("example.com:443").unwrap();
+    let mut wire = Vec::new();
+    write_request(&mut wire, &target).await.unwrap();
+    assert_eq!(wire, write_request_frame(&target).unwrap());
+    wire.extend_from_slice(b"hello");
 
-    assert!(read_request(&mut reader, &spec).await.is_err());
+    let mut input = wire.as_slice();
+    assert_eq!(read_request(&mut input).await.unwrap(), target);
+    let mut payload = Vec::new();
+    input.read_to_end(&mut payload).await.unwrap();
+    assert_eq!(payload, b"hello");
 }
 
-#[tokio::test]
-async fn rejects_invalid_version() {
-    let spec = protocol_spec("edge-a");
-    let mut frame = write_request_frame("example.com:443", &spec).unwrap();
-    let offset = field_offset(&frame, &spec, TcpFrameElement::Version);
-    frame[offset] = PROXY_FRAME_VERSION + 1;
-    let mut reader = frame.as_slice();
-
-    assert!(read_request(&mut reader, &spec).await.is_err());
-}
-
-#[tokio::test]
-async fn rejects_invalid_padding_length_and_bytes() {
-    let spec = protocol_spec("edge-a");
-    let mut bad_len = write_request_frame("example.com:443", &spec).unwrap();
-    let padding_offset = field_offset(&bad_len, &spec, TcpFrameElement::Padding);
-    bad_len[padding_offset] = bad_len[padding_offset].wrapping_add(1);
-    let mut reader = bad_len.as_slice();
-    assert!(read_request(&mut reader, &spec).await.is_err());
-
-    if spec.tcp_padding_len > 0 {
-        let mut bad_padding = write_request_frame("example.com:443", &spec).unwrap();
-        bad_padding[padding_offset + 1] ^= 1;
-        let mut reader = bad_padding.as_slice();
-        assert!(read_request(&mut reader, &spec).await.is_err());
-    }
-}
-
-struct DecodedFields {
-    version: u8,
-    target: String,
-    padding: Vec<u8>,
-}
-
-fn decode_fields(frame: &[u8], spec: &EffectiveProtocolSpec) -> DecodedFields {
-    let mut offset = 0;
-    let mut version = None;
-    let mut target = None;
-    let mut padding = None;
-    for element in spec.frame_layout.tcp {
-        match element {
-            TcpFrameElement::Version => {
-                version = Some(frame[offset]);
-                offset += 1;
-            }
-            TcpFrameElement::Target => {
-                let len = u16::from_be_bytes(
-                    frame[offset..offset + 2]
-                        .try_into()
-                        .expect("target length slice"),
-                ) as usize;
-                offset += 2;
-                target = Some(
-                    std::str::from_utf8(&frame[offset..offset + len])
-                        .expect("target utf8")
-                        .to_string(),
-                );
-                offset += len;
-            }
-            TcpFrameElement::Padding => {
-                let len = frame[offset] as usize;
-                offset += 1;
-                padding = Some(frame[offset..offset + len].to_vec());
-                offset += len;
-            }
-        }
-    }
-    assert_eq!(offset, frame.len());
-
-    DecodedFields {
-        version: version.expect("version"),
-        target: target.expect("target"),
-        padding: padding.expect("padding"),
-    }
-}
-
-fn field_offset(
-    frame: &[u8],
-    spec: &EffectiveProtocolSpec,
-    target_element: TcpFrameElement,
-) -> usize {
-    let mut offset = 0;
-    for element in spec.frame_layout.tcp {
-        if element == target_element {
-            return offset;
-        }
-        offset += match element {
-            TcpFrameElement::Version => 1,
-            TcpFrameElement::Target => {
-                let len = u16::from_be_bytes(
-                    frame[offset..offset + 2]
-                        .try_into()
-                        .expect("target length slice"),
-                ) as usize;
-                2 + len
-            }
-            TcpFrameElement::Padding => 1 + frame[offset] as usize,
-        };
-    }
-    unreachable!("field must exist in TCP frame layout")
-}
-
-fn hex(data: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(data.len() * 2);
-    for byte in data {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+#[test]
+fn honest_address_accessors_distinguish_ip_and_domain() {
+    let ip = Target::try_from("127.0.0.1:80").unwrap();
+    assert_eq!(ip.ip_addr(), Some(Ipv4Addr::LOCALHOST.into()));
+    assert_eq!(ip.domain_name(), None);
+    let domain = Target::try_from("example.com:80").unwrap();
+    assert_eq!(domain.ip_addr(), None);
+    assert_eq!(domain.domain_name(), Some("example.com"));
+    assert_eq!(domain.port(), 80);
+    assert_eq!(domain.socket_addr(), None);
 }

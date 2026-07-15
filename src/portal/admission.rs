@@ -65,14 +65,6 @@ impl UnauthenticatedAdmission {
             key,
         })
     }
-
-    #[cfg(test)]
-    pub(super) fn active(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .total
-    }
 }
 
 /// RAII guard that releases an unauthenticated admission slot on drop.
@@ -97,3 +89,7 @@ impl Drop for UnauthenticatedGuard {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/portal/admission.rs"]
+mod tests;

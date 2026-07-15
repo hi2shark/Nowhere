@@ -2,10 +2,13 @@
 name = "nowhere"
 version = "1.4.0"
 edition = "2024"
+description = "One-port, two-transport encrypted relay with independently split directions"
+license = "GPL-3.0-only"
+repository = "https://github.com/NodePassProject/Nowhere"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.22"
 bytes = "1.11"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 getrandom = "0.3"
@@ -15,9 +18,11 @@ percent-encoding = "2.3"
 quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
 sha2 = "0.11"
 socket2 = "0.6"
+subtle = "2.6"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-util = "0.7"

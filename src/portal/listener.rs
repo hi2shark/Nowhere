@@ -23,7 +23,11 @@ const QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 pub(super) const QUIC_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 const QUIC_PRE_AUTH_RECEIVE_WINDOW: u32 = 64 * 1024;
 const QUIC_SEND_WINDOW: u64 = 32 * 1024 * 1024;
-const QUIC_DATAGRAM_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+// Quinn allocates this receive queue per connection before application
+// authentication. Keep it intentionally small; authenticated DATAGRAM traffic
+// is drained continuously into the separately budgeted flow queues.
+const QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
+const QUIC_DATAGRAM_SEND_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const QUIC_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const TCP_LISTEN_BACKLOG: i32 = 1024;
 
@@ -169,8 +173,8 @@ pub(super) fn configure_transport(server_config: &mut quinn::ServerConfig) -> Re
     let transport = Arc::get_mut(&mut server_config.transport).ok_or_else(|| {
         anyhow::anyhow!("portal::configure_transport: server transport already shared")
     })?;
-    transport.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
-    transport.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
+    transport.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
+    transport.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_SIZE);
     transport.stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
     transport.receive_window(VarInt::from_u32(QUIC_PRE_AUTH_RECEIVE_WINDOW));
     transport.send_window(QUIC_SEND_WINDOW);

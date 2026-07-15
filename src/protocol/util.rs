@@ -1,49 +1,65 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Shared target-address validation helpers for protocol frames.
+//! Small validation and URL-decoding helpers shared by fixed codecs.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use percent_encoding::percent_decode_str;
+use url::Url;
 
-/// Maximum target address length accepted by proxy frames.
-pub const TARGET_LEN_MAX: usize = 512;
+/// Largest domain name accepted by the binary target codec.
+pub const DOMAIN_LEN_MAX: usize = 253;
 
-/// Validates host:port target syntax without resolving the host.
-pub fn validate_target(target_addr: &str) -> Result<()> {
-    let port = split_host_port(target_addr).map_err(|e| {
-        anyhow::anyhow!("protocol::util::validate_target: invalid target address: {e}")
-    })?;
-    if port.is_empty() {
-        bail!("protocol::util::validate_target: invalid target address: empty port");
+pub(super) fn decode_url_username(parsed_url: &Url) -> Result<Vec<u8>> {
+    let username = parsed_url.username();
+    let bytes = username.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                bail!("protocol::auth::Credentials::new: malformed percent escape");
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let decoded = percent_decode_str(username)
+        .decode_utf8()
+        .context("protocol::auth::Credentials::new: shared key is not valid UTF-8")?;
+    Ok(decoded.as_bytes().to_vec())
+}
+
+pub(super) fn validate_port(port: u16, context: &str) -> Result<()> {
+    if port == 0 {
+        bail!("{context}: zero port");
     }
     Ok(())
 }
 
-fn split_host_port(target_addr: &str) -> Result<&str> {
-    if let Some(rest) = target_addr.strip_prefix('[') {
-        let Some(end) = rest.find(']') else {
-            bail!("missing ']' in address");
-        };
-        let after = &rest[end + 1..];
-        let Some(port) = after.strip_prefix(':') else {
-            bail!("missing port in address");
-        };
-        return Ok(port);
+pub(super) fn validate_domain_bytes(domain: &[u8], context: &str) -> Result<()> {
+    if domain.is_empty() || domain.len() > DOMAIN_LEN_MAX {
+        bail!("{context}: invalid domain length: {}", domain.len());
     }
-
-    let mut parts = target_addr.rsplitn(2, ':');
-    let port = parts.next().unwrap_or_default();
-    let host = parts.next();
-    if host.is_none() || host.unwrap().contains(':') {
-        bail!("too many colons in address");
+    if !domain.is_ascii() {
+        bail!("{context}: domain is not ASCII/IDNA wire form");
     }
-    Ok(port)
-}
-
-/// Checks the shared target-address length bound with a caller-specific context.
-pub fn check_target_len(context: &str, target_addr: &str) -> Result<()> {
-    if target_addr.is_empty() || target_addr.len() > TARGET_LEN_MAX {
-        bail!("{context}: invalid target length: {}", target_addr.len());
+    for label in domain.split(|byte| *byte == b'.') {
+        if label.is_empty() || label.len() > 63 {
+            bail!("{context}: invalid DNS label length");
+        }
+        if label.first() == Some(&b'-') || label.last() == Some(&b'-') {
+            bail!("{context}: DNS label begins or ends with hyphen");
+        }
+        if !label
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            bail!("{context}: invalid DNS label bytes");
+        }
     }
     Ok(())
 }

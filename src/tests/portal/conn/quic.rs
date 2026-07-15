@@ -13,22 +13,19 @@ use tokio::time::timeout;
 use crate::portal::{Portal, UdpFlowLimits};
 use crate::protocol::{
     Carrier, FlowErrorCode, FlowHeader, FlowKind, FlowResult, FlowRole, UdpFrame, decode_udp_frame,
-    encode_udp_close, encode_udp_data_fragments, read_flow_result, write_auth_frame,
-    write_flow_header, write_request_frame,
+    encode_udp_close, encode_udp_data_fragments, read_flow_result, write_flow_header,
+    write_request_frame,
 };
 
 use super::support::{
-    connect_test_quic, connect_test_quic_to, connect_test_quic_with_url_and_limits, stop_test_quic,
+    connect_test_quic, connect_test_quic_to, connect_test_quic_with_url_and_limits,
+    quic_auth_frame, stop_test_quic, test_target,
 };
 
 async fn authenticate_test_connection(portal: &Portal, connection: &quinn::Connection) {
     let (mut auth_send, _auth_recv) = connection.open_bi().await.unwrap();
     auth_send
-        .write_all(&write_auth_frame(
-            portal.inner.credentials.key,
-            &portal.inner.credentials.protocol_spec,
-            [31; 32],
-        ))
+        .write_all(&quic_auth_frame(portal, connection, [31; 16]))
         .await
         .unwrap();
     auth_send.finish().unwrap();
@@ -40,9 +37,9 @@ async fn authenticate_test_connection(portal: &Portal, connection: &quinn::Conne
 }
 
 async fn setup_quic_udp(
-    portal: &Portal,
+    _portal: &Portal,
     connection: &quinn::Connection,
-    flow_id: u64,
+    flow_id: u32,
     target: &str,
 ) -> (FlowResult, quinn::RecvStream) {
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
@@ -55,7 +52,7 @@ async fn setup_quic_udp(
     }))
     .await
     .unwrap();
-    send.write_all(&write_request_frame(target, &portal.inner.credentials.protocol_spec).unwrap())
+    send.write_all(&write_request_frame(&test_target(target)).unwrap())
         .await
         .unwrap();
     send.finish().unwrap();
@@ -66,14 +63,14 @@ async fn setup_quic_udp(
     (result, recv)
 }
 
-fn send_udp_data(connection: &quinn::Connection, flow_id: u64, packet_id: u32, payload: &[u8]) {
+fn send_udp_data(connection: &quinn::Connection, flow_id: u32, packet_id: u32, payload: &[u8]) {
     let frames = encode_udp_data_fragments(flow_id, packet_id, payload, 1_200).unwrap();
     for frame in frames {
         connection.send_datagram(Bytes::from(frame)).unwrap();
     }
 }
 
-async fn read_udp_packet(connection: &quinn::Connection) -> (u64, Vec<u8>) {
+async fn read_udp_packet(connection: &quinn::Connection) -> (u32, Vec<u8>) {
     let mut flow_id = None;
     let mut packet_id = None;
     let mut total_len = None;
@@ -83,12 +80,10 @@ async fn read_udp_packet(connection: &quinn::Connection) -> (u64, Vec<u8>) {
             .await
             .unwrap()
             .unwrap();
-        let UdpFrame::Data {
-            flow_id: frame_flow_id,
-            fragment,
-        } = decode_udp_frame(&frame).unwrap()
-        else {
-            continue;
+        let (frame_flow_id, fragment) = match decode_udp_frame(&frame).unwrap() {
+            UdpFrame::Data { flow_id, payload } => return (flow_id, payload.to_vec()),
+            UdpFrame::Fragment { flow_id, fragment } => (flow_id, fragment),
+            UdpFrame::Close { .. } => continue,
         };
         flow_id.get_or_insert(frame_flow_id);
         packet_id.get_or_insert(fragment.packet_id);
@@ -99,7 +94,7 @@ async fn read_udp_packet(connection: &quinn::Connection) -> (u64, Vec<u8>) {
         if fragments.is_empty() {
             fragments.resize(fragment.fragment_count as usize, None);
         }
-        fragments[fragment.fragment_id as usize] = Some(fragment.payload.to_vec());
+        fragments[fragment.fragment_index as usize] = Some(fragment.payload.to_vec());
         if fragments.iter().all(Option::is_some) {
             let payload = fragments
                 .into_iter()
@@ -140,15 +135,102 @@ async fn unknown_udp_data_is_ignored_without_blocking_dispatch() {
 }
 
 #[tokio::test]
-async fn reliable_setup_precedes_fragmented_udp_data() {
+async fn quic_carrier_mismatch_returns_invalid_request() {
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send.write_all(&write_flow_header(FlowHeader {
+        role: FlowRole::Duplex,
+        flow_id: 76,
+        kind: FlowKind::Tcp,
+        uplink: Carrier::TlsTcp,
+        downlink: Carrier::TlsTcp,
+    }))
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), read_flow_result(&mut recv))
+            .await
+            .unwrap()
+            .unwrap(),
+        FlowResult::Reject(FlowErrorCode::InvalidRequest)
+    );
+
+    connection.close(quinn::VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn first_stream_carries_auth_and_flow_while_pre_auth_datagrams_are_dropped() {
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap().to_string();
-    let large = vec![0x5a; 4_000];
-    let expected = large.clone();
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+
+    // This packet precedes the authentication boundary and must never be
+    // retained for replay after the flow becomes READY.
+    for packet_id in 1..=1_100 {
+        send_udp_data(&connection, 78, packet_id, b"early");
+    }
+
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send.write_all(&quic_auth_frame(&portal, &connection, [78; 16]))
+        .await
+        .unwrap();
+    send.write_all(&write_flow_header(FlowHeader {
+        role: FlowRole::Duplex,
+        flow_id: 78,
+        kind: FlowKind::Udp,
+        uplink: Carrier::Quic,
+        downlink: Carrier::Quic,
+    }))
+    .await
+    .unwrap();
+    send.write_all(&write_request_frame(&test_target(&target_addr)).unwrap())
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), read_flow_result(&mut recv))
+            .await
+            .unwrap()
+            .unwrap(),
+        FlowResult::Ready
+    );
+
+    let mut packet = [0u8; 16];
+    assert!(
+        timeout(Duration::from_millis(200), target.recv_from(&mut packet))
+            .await
+            .is_err()
+    );
+    send_udp_data(&connection, 78, 2, b"after");
+    let (size, _) = timeout(Duration::from_secs(2), target.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&packet[..size], b"after");
+
+    connection.close(quinn::VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn first_packet_after_ready_fragments_in_both_directions() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let uplink = vec![0x4a; 4_000];
+    let expected_uplink = uplink.clone();
+    let downlink = vec![0x5a; 4_000];
+    let expected_downlink = downlink.clone();
     let target_task = tokio::spawn(async move {
-        let mut buf = [0u8; 16];
-        let (_, peer) = target.recv_from(&mut buf).await.unwrap();
-        target.send_to(&large, peer).await.unwrap();
+        let mut buf = vec![0u8; 5_000];
+        let (length, peer) = target.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..length], expected_uplink);
+        target.send_to(&downlink, peer).await.unwrap();
         let (_, peer) = target.recv_from(&mut buf).await.unwrap();
         target.send_to(b"ok", peer).await.unwrap();
     });
@@ -158,10 +240,10 @@ async fn reliable_setup_precedes_fragmented_udp_data() {
 
     let (result, _) = setup_quic_udp(&portal, &connection, 79, &target_addr).await;
     assert_eq!(result, FlowResult::Ready);
-    send_udp_data(&connection, 79, 1, b"first");
+    send_udp_data(&connection, 79, 1, &uplink);
     let (flow_id, received) = read_udp_packet(&connection).await;
     assert_eq!(flow_id, 79);
-    assert_eq!(received, expected);
+    assert_eq!(received, expected_downlink);
 
     send_udp_data(&connection, 79, 2, b"second");
     let (flow_id, received) = read_udp_packet(&connection).await;
@@ -171,6 +253,39 @@ async fn reliable_setup_precedes_fragmented_udp_data() {
     connection.close(quinn::VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
     target_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_data_before_flow_ready_is_not_replayed() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
+        connect_test_quic().await;
+    authenticate_test_connection(&portal, &connection).await;
+
+    send_udp_data(&connection, 81, 1, b"early");
+    assert_eq!(
+        setup_quic_udp(&portal, &connection, 81, &target_addr)
+            .await
+            .0,
+        FlowResult::Ready
+    );
+    let mut packet = [0u8; 16];
+    assert!(
+        timeout(Duration::from_millis(200), target.recv_from(&mut packet))
+            .await
+            .is_err()
+    );
+
+    send_udp_data(&connection, 81, 2, b"after");
+    let (size, _) = timeout(Duration::from_secs(2), target.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&packet[..size], b"after");
+
+    connection.close(quinn::VarInt::from_u32(0), b"");
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
 }
 
 #[tokio::test]
@@ -242,7 +357,7 @@ async fn udp_close_releases_the_session_global_flow_permit() {
     assert_eq!(rejected.read(&mut eof).await.unwrap(), None);
 
     connection
-        .send_datagram(Bytes::from(encode_udp_close(90).unwrap()))
+        .send_datagram(Bytes::copy_from_slice(&encode_udp_close(90).unwrap()))
         .unwrap();
     wait_for_udp_active(&portal, 0).await;
     assert_eq!(
@@ -286,11 +401,7 @@ async fn quic_auth_failure_waits_for_one_deadline_and_uses_access_denied() {
     let (portal, server_endpoint, client_endpoint, connection, shutdown, server_task) =
         connect_test_quic().await;
     let (mut auth_send, _auth_recv) = connection.open_bi().await.unwrap();
-    let mut auth = write_auth_frame(
-        portal.inner.credentials.key,
-        &portal.inner.credentials.protocol_spec,
-        [10; 32],
-    );
+    let mut auth = quic_auth_frame(&portal, &connection, [10; 16]);
     auth[0] ^= 0xff;
     let started = Instant::now();
     auth_send.write_all(&auth).await.unwrap();
@@ -311,6 +422,42 @@ async fn quic_auth_failure_waits_for_one_deadline_and_uses_access_denied() {
     }
     assert_eq!(portal.inner.unauthenticated_admission.active(), 0);
 
+    stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
+}
+
+#[tokio::test]
+async fn captured_quic_auth_frame_cannot_be_replayed_on_another_connection() {
+    let (portal, server_endpoint, client_endpoint, first, shutdown, server_task) =
+        connect_test_quic().await;
+    let captured = quic_auth_frame(&portal, &first, [0x44; 16]);
+    let (mut first_send, _) = first.open_bi().await.unwrap();
+    first_send.write_all(&captured).await.unwrap();
+    first_send.finish().unwrap();
+    timeout(Duration::from_secs(2), first.open_bi())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (second_endpoint, second) =
+        connect_test_quic_to(server_endpoint.local_addr().unwrap()).await;
+    let (mut replay_send, _) = second.open_bi().await.unwrap();
+    replay_send.write_all(&captured).await.unwrap();
+    replay_send.finish().unwrap();
+    let error = timeout(Duration::from_secs(7), second.closed())
+        .await
+        .unwrap();
+    assert!(matches!(
+        error,
+        quinn::ConnectionError::ApplicationClosed(_)
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), first.closed())
+            .await
+            .is_err()
+    );
+
+    first.close(quinn::VarInt::from_u32(0), b"");
+    second_endpoint.close(quinn::VarInt::from_u32(0), b"");
     stop_test_quic(server_endpoint, client_endpoint, shutdown, server_task).await;
 }
 

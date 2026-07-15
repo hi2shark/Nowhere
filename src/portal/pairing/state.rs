@@ -5,13 +5,14 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use quinn::Connection;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::{FlowKind, SessionId};
+use crate::protocol::{FlowKind, SessionId, Target};
 
 pub(in crate::portal) type BoxReader = Pin<Box<dyn AsyncRead + Send>>;
 pub(in crate::portal) type BoxWriter = Pin<Box<dyn AsyncWrite + Send>>;
@@ -19,7 +20,7 @@ pub(in crate::portal) type BoxWriter = Pin<Box<dyn AsyncWrite + Send>>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(in crate::portal) struct FlowKey {
     pub(in crate::portal) session_id: SessionId,
-    pub(in crate::portal) flow_id: u64,
+    pub(in crate::portal) flow_id: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,7 +33,9 @@ pub(in crate::portal) struct Metadata {
 pub(in crate::portal) struct PendingTcp {
     pub(in crate::portal) epoch: u64,
     pub(in crate::portal) metadata: Metadata,
-    pub(in crate::portal) target: Option<String>,
+    /// Active QUIC generation when this split flow first became pending.
+    pub(in crate::portal) quic_snapshot: Option<u64>,
+    pub(in crate::portal) target: Option<Target>,
     pub(in crate::portal) uplink: Option<BoxReader>,
     pub(in crate::portal) downlink: Option<BoxWriter>,
     pub(in crate::portal) downlink_liveness: Option<BoxReader>,
@@ -76,24 +79,56 @@ pub(in crate::portal) enum UdpUp {
 
 pub(in crate::portal) struct QuicUdpReceiver {
     receiver: mpsc::Receiver<crate::portal::conn::QueuedDatagram>,
+    ready: Arc<AtomicBool>,
+    ready_requests: Option<mpsc::Sender<crate::portal::conn::DatagramReadyRequest>>,
     on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl QuicUdpReceiver {
     pub(in crate::portal) fn new(
         receiver: mpsc::Receiver<crate::portal::conn::QueuedDatagram>,
+        ready: Arc<AtomicBool>,
+        ready_requests: mpsc::Sender<crate::portal::conn::DatagramReadyRequest>,
         on_drop: impl FnOnce() + Send + 'static,
     ) -> Self {
         Self {
             receiver,
+            ready,
+            ready_requests: Some(ready_requests),
             on_drop: Some(Box::new(on_drop)),
         }
+    }
+
+    /// Drains the session DATAGRAM queue while this flow still rejects DATA.
+    pub(in crate::portal) async fn prepare_ready(&mut self) -> bool {
+        let Some(requests) = &self.ready_requests else {
+            return true;
+        };
+        let (acknowledge, response) = oneshot::channel();
+        if requests
+            .send(crate::portal::conn::DatagramReadyRequest { acknowledge })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+
+    /// Opens the DATA path immediately after READY has been queued on the
+    /// selected downlink. There is deliberately no await between those events.
+    pub(in crate::portal) fn activate(&self) {
+        self.ready.store(true, Ordering::Release);
     }
 
     pub(in crate::portal) async fn recv(&mut self) -> Option<bytes::Bytes> {
         self.receiver.recv().await.map(|datagram| datagram.payload)
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/portal/pairing_state.rs"]
+mod tests;
 
 impl Drop for QuicUdpReceiver {
     fn drop(&mut self) {
@@ -123,7 +158,9 @@ pub(in crate::portal) enum UdpHalf {
 pub(in crate::portal) struct PendingUdp {
     pub(in crate::portal) epoch: u64,
     pub(in crate::portal) metadata: Metadata,
-    pub(in crate::portal) target: Option<String>,
+    /// Active QUIC generation when this split flow first became pending.
+    pub(in crate::portal) quic_snapshot: Option<u64>,
+    pub(in crate::portal) target: Option<Target>,
     pub(in crate::portal) uplink: Option<UdpUp>,
     pub(in crate::portal) downlink: Option<UdpDown>,
     pub(in crate::portal) flow_permit: Option<Arc<OwnedSemaphorePermit>>,
@@ -134,8 +171,8 @@ pub(in crate::portal) struct PendingUdp {
 }
 
 pub(in crate::portal) struct PairedUdp {
-    pub(in crate::portal) flow_id: u64,
-    pub(in crate::portal) target: String,
+    pub(in crate::portal) flow_id: u32,
+    pub(in crate::portal) target: Target,
     pub(in crate::portal) uplink: UdpUp,
     pub(in crate::portal) downlink: UdpDown,
     pub(in crate::portal) uplink_carrier: crate::protocol::Carrier,
@@ -146,7 +183,7 @@ pub(in crate::portal) struct PairedUdp {
 }
 
 pub(in crate::portal) struct PairedTcp {
-    pub(in crate::portal) target: String,
+    pub(in crate::portal) target: Target,
     pub(in crate::portal) uplink: BoxReader,
     pub(in crate::portal) downlink: BoxWriter,
     pub(in crate::portal) downlink_liveness: Option<BoxReader>,
@@ -181,7 +218,7 @@ pub(in crate::portal) struct ActiveQuic {
 pub(in crate::portal) struct FlowClaim {
     pub(in crate::portal) epoch: u64,
     pub(in crate::portal) metadata: Metadata,
-    pub(in crate::portal) target: Option<String>,
+    pub(in crate::portal) target: Option<Target>,
     pub(in crate::portal) active: bool,
     pub(in crate::portal) cancel: CancellationToken,
     pub(in crate::portal) quic_generations: Vec<u64>,

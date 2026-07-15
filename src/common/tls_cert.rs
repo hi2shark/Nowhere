@@ -9,22 +9,13 @@ use std::io::BufReader;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::common::{Logger, reload_interval};
 use anyhow::{Context, Result, anyhow, bail};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
-use url::Url;
-
-use crate::common::{Logger, reload_interval};
-
-pub(super) fn query_value(parsed_url: &Url, key: &str) -> Option<String> {
-    parsed_url
-        .query_pairs()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.into_owned())
-}
 
 pub(super) fn new_self_signed_cert()
 -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {

@@ -4,17 +4,21 @@
 //! Shared configuration, logging, networking, and TLS utilities.
 
 mod config;
+mod datagram;
 mod logger;
 mod network;
-mod socks;
+pub(crate) mod socks;
 mod tls;
 
 pub(crate) use config::env_positive_usize;
 pub use config::{
     DEFAULT_DIALER_IP, DEFAULT_RATE_LIMIT, env_duration, env_int, handshake_timeout,
-    init_dialer_ip, query_int, quic_max_streams, rate_limit_bytes_per_second, reload_interval,
+    init_dialer_ip, query_first, quic_max_streams, rate_limit_bytes_per_second, reload_interval,
     report_interval, service_cooldown, shutdown_timeout, tcp_data_buf_size, tcp_dial_timeout,
     tcp_read_timeout, udp_data_buf_size, udp_dial_timeout, udp_idle_timeout,
+};
+pub(crate) use datagram::{
+    BudgetedDatagram, UdpDatagramSend, reserve_udp_budget, send_quic_udp_packet,
 };
 pub use logger::{LogLevel, Logger};
 pub use network::{bind_udp_addrs, dial_tcp_from_local_ip, dial_udp_from_local_ip};

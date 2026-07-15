@@ -3,13 +3,60 @@
 
 //! Runtime defaults and helpers for environment and URL-derived configuration.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use percent_encoding::percent_decode_str;
+use url::Url;
 
 /// Sentinel value that lets the OS choose the outbound local address.
 pub const DEFAULT_DIALER_IP: &str = "auto";
 /// Default disabled Mbps limit for inbound and outbound relay directions.
 pub const DEFAULT_RATE_LIMIT: i32 = 0;
+
+/// Parses the first value of each recognized URL query key without treating
+/// `+` as a space. Unknown keys and later duplicates are ignored.
+pub fn query_first(parsed_url: &Url, allowed: &[&str]) -> Result<HashMap<String, String>> {
+    let mut values = HashMap::with_capacity(allowed.len());
+    let Some(query) = parsed_url.query() else {
+        return Ok(values);
+    };
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Ok(key) = decode_query_component(raw_key, "query key") else {
+            continue;
+        };
+        if !allowed.contains(&key.as_str()) || values.contains_key(&key) {
+            continue;
+        }
+        values.insert(key, decode_query_component(raw_value, "query value")?);
+    }
+    Ok(values)
+}
+
+fn decode_query_component(raw: &str, name: &str) -> Result<String> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                bail!("common::config::query_first: invalid percent encoding in {name}");
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    percent_decode_str(raw)
+        .decode_utf8()
+        .with_context(|| format!("common::config::query_first: invalid UTF-8 in {name}"))
+        .map(|value| value.into_owned())
+}
 
 /// Reads a non-negative integer from the environment, falling back on invalid input.
 pub fn env_int(name: &str, default_value: i32) -> i32 {
@@ -37,14 +84,6 @@ pub fn env_duration(name: &str, default_value: Duration) -> Duration {
     std::env::var(name)
         .ok()
         .and_then(|s| humantime::parse_duration(&s).ok())
-        .unwrap_or(default_value)
-}
-
-/// Parses a positive URL query integer; zero and negative values mean "use default".
-pub fn query_int(param: Option<&str>, default_value: i32) -> i32 {
-    param
-        .and_then(|s| s.parse::<i32>().ok())
-        .filter(|v| *v > 0)
         .unwrap_or(default_value)
 }
 

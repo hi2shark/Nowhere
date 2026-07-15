@@ -19,6 +19,7 @@ use url::Url;
 
 use crate::common::{LogLevel, Logger};
 use crate::portal::{Portal, UdpFlowLimits};
+use crate::protocol::{AuthFrame, AuthTransport, SessionId, Target, encode_auth_frame};
 
 use super::super::*;
 
@@ -89,6 +90,46 @@ pub(super) async fn connect_test_tls(
         .unwrap()
 }
 
+pub(super) fn tls_auth_frame(
+    portal: &Portal,
+    stream: &tokio_rustls::client::TlsStream<TcpStream>,
+    session_id: SessionId,
+) -> AuthFrame {
+    let mut exporter = [0u8; 32];
+    stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter, b"EXPORTER-Nowhere-Auth", Some(&[]))
+        .unwrap();
+    encode_auth_frame(
+        portal.inner.credentials.auth_key,
+        AuthTransport::TlsTcp,
+        &exporter,
+        session_id,
+    )
+}
+
+pub(super) fn quic_auth_frame(
+    portal: &Portal,
+    connection: &Connection,
+    session_id: SessionId,
+) -> AuthFrame {
+    let mut exporter = [0u8; 32];
+    connection
+        .export_keying_material(&mut exporter, b"EXPORTER-Nowhere-Auth", b"")
+        .unwrap();
+    encode_auth_frame(
+        portal.inner.credentials.auth_key,
+        AuthTransport::Quic,
+        &exporter,
+        session_id,
+    )
+}
+
+pub(super) fn test_target(value: &str) -> Target {
+    value.parse().unwrap()
+}
+
 pub(super) async fn connect_test_quic() -> (
     Portal,
     quinn::Endpoint,
@@ -124,8 +165,15 @@ pub(super) async fn connect_test_quic_with_url_and_limits(
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    let mut portal =
-        Portal::new(Url::parse(url).unwrap(), Logger::new(LogLevel::None, false)).unwrap();
+    let mut parsed_url = Url::parse(url).unwrap();
+    if parsed_url.port() == Some(0) {
+        let host = parsed_url.host_str().unwrap_or("127.0.0.1");
+        let reservation = std::net::UdpSocket::bind((host, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        parsed_url.set_port(Some(port)).unwrap();
+        drop(reservation);
+    }
+    let mut portal = Portal::new(parsed_url, Logger::new(LogLevel::None, false)).unwrap();
     if let Some(limits) = limits {
         let inner = Arc::get_mut(&mut portal.inner).unwrap();
         inner.udp_flow_limits = limits;

@@ -27,6 +27,7 @@ pub(crate) use self::mode::NetworkMode;
 const DEFAULT_QUIC_MAX_UDP_FLOWS: usize = 256;
 const DEFAULT_QUIC_UDP_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_TCP_IDLE_POOL_CONNECTIONS: usize = 4096;
+const DEFAULT_ALPN: &str = "now/1";
 
 #[derive(Clone, Copy, Debug)]
 struct UdpFlowLimits {
@@ -42,6 +43,7 @@ pub struct Portal {
 
 struct PortalInner {
     credentials: Credentials,
+    alpn: String,
     tls_mode: TLSMode,
     network_mode: NetworkMode,
     endpoint_addr: String,

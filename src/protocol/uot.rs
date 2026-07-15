@@ -1,142 +1,83 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! UDP-over-TCP control and packet framing.
+//! Length-only UDP-over-stream packet framing after setup succeeds.
 
 use anyhow::{Context, Result, bail};
 use bytes::Buf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::FlowErrorCode;
+/// Fixed UoT packet header length.
+pub const UOT_HEADER_LEN: usize = 2;
+/// Largest packet representable by the UoT length prefix.
+pub const UOT_PACKET_MAX: usize = u16::MAX as usize;
 
-/// UDP packet carried by a UoT stream.
-pub const UDP_STREAM_DATA: u8 = 1;
-/// Flow-open acknowledgement carried by a paired UoT downlink.
-pub const UDP_STREAM_READY: u8 = 2;
-/// Explicit paired-flow close notification.
-pub const UDP_STREAM_CLOSE: u8 = 3;
-/// Explicit flow rejection with one error-code byte.
-pub const UDP_STREAM_REJECT: u8 = 4;
-
-/// One typed frame carried after UoT setup.
-#[derive(Debug, Eq, PartialEq)]
-pub enum UdpStreamFrame {
-    /// One complete UDP packet. The payload may be empty.
-    Data(Vec<u8>),
-    /// Flow-open acknowledgement.
-    Ready,
-    /// Flow-close notification.
-    Close,
-    /// Flow rejection.
-    Reject(FlowErrorCode),
-}
-
-/// Reads one typed UoT frame, returning `None` on clean EOF.
-pub async fn read_udp_stream_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<Option<UdpStreamFrame>> {
-    let context = "protocol::uot::read_udp_stream_frame";
-    let mut frame_type = [0u8; 1];
-    let n = reader
-        .read(&mut frame_type)
-        .await
-        .with_context(|| format!("{context}: failed to read frame type"))?;
-    if n == 0 {
-        return Ok(None);
+/// Encodes only the two-byte packet length header.
+pub fn encode_udp_packet_header(payload_len: usize) -> Result<[u8; UOT_HEADER_LEN]> {
+    if payload_len > UOT_PACKET_MAX {
+        bail!("protocol::uot::encode_udp_packet_header: payload too large: {payload_len}");
     }
-    let length = read_u16_frame_len(context, reader)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("{context}: truncated frame length"))?;
-    let mut payload = vec![0; length];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("protocol::uot::read_udp_stream_frame: failed to read payload")?;
-    match frame_type[0] {
-        UDP_STREAM_DATA => Ok(Some(UdpStreamFrame::Data(payload))),
-        UDP_STREAM_READY if payload.is_empty() => Ok(Some(UdpStreamFrame::Ready)),
-        UDP_STREAM_CLOSE if payload.is_empty() => Ok(Some(UdpStreamFrame::Close)),
-        UDP_STREAM_REJECT if payload.len() == 1 => {
-            Ok(Some(UdpStreamFrame::Reject(payload[0].try_into()?)))
-        }
-        UDP_STREAM_READY | UDP_STREAM_CLOSE | UDP_STREAM_REJECT => {
-            bail!("{context}: control frame payload")
-        }
-        value => bail!("{context}: invalid frame type: {value}"),
-    }
+    Ok((payload_len as u16).to_be_bytes())
 }
 
-/// Encodes one typed UoT frame.
-pub fn encode_udp_stream_frame(frame_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
-    check_udp_stream_frame(
-        "protocol::uot::encode_udp_stream_frame",
-        frame_type,
-        payload,
-    )?;
-    let mut frame = Vec::with_capacity(3 + payload.len());
-    frame.push(frame_type);
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
+/// Encodes one complete UoT packet.
+pub fn encode_udp_packet(payload: &[u8]) -> Result<Vec<u8>> {
+    let header = encode_udp_packet_header(payload.len())?;
+    let mut output = Vec::with_capacity(UOT_HEADER_LEN + payload.len());
+    output.extend_from_slice(&header);
+    output.extend_from_slice(payload);
+    Ok(output)
 }
 
-/// Writes one typed UoT frame without first concatenating it.
-pub async fn write_udp_stream_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frame_type: u8,
-    payload: &[u8],
-) -> Result<()> {
-    check_udp_stream_frame("protocol::uot::write_udp_stream_frame", frame_type, payload)?;
-    let kind = [frame_type];
-    let length = (payload.len() as u16).to_be_bytes();
-    let mut frame = Buf::chain(Buf::chain(&kind[..], &length[..]), payload);
+/// Writes one UoT packet without concatenating its payload into another buffer.
+pub async fn write_udp_packet<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
+    let header = encode_udp_packet_header(payload.len())?;
+    let mut frame = Buf::chain(&header[..], payload);
     writer
         .write_all_buf(&mut frame)
         .await
-        .context("protocol::uot::write_udp_stream_frame: failed to write frame")
+        .context("protocol::uot::write_udp_packet: failed to write packet")
 }
 
-fn check_udp_stream_frame(context: &str, frame_type: u8, payload: &[u8]) -> Result<()> {
-    if payload.len() > u16::MAX as usize {
-        bail!("{context}: payload too large: {}", payload.len());
-    }
-    if !matches!(
-        frame_type,
-        UDP_STREAM_DATA | UDP_STREAM_READY | UDP_STREAM_CLOSE | UDP_STREAM_REJECT
-    ) {
-        bail!("{context}: invalid frame type: {frame_type}");
-    }
-    match frame_type {
-        UDP_STREAM_DATA => {}
-        UDP_STREAM_READY | UDP_STREAM_CLOSE if payload.is_empty() => {}
-        UDP_STREAM_REJECT if payload.len() == 1 => {
-            FlowErrorCode::try_from(payload[0])?;
-        }
-        _ => bail!("{context}: control frame payload"),
-    }
-    Ok(())
+/// Reads one UoT packet, returning `None` only for a clean EOF before a header.
+pub async fn read_udp_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+    let mut payload = Vec::new();
+    let Some(payload_len) = read_udp_packet_into(reader, &mut payload).await? else {
+        return Ok(None);
+    };
+    debug_assert_eq!(payload_len, payload.len());
+    Ok(Some(payload))
 }
 
-async fn read_u16_frame_len<R: AsyncRead + Unpin>(
-    context: &str,
+/// Reads into a reusable per-flow buffer and returns the complete packet length.
+///
+/// `Some(0)` is a legal zero-length UDP packet; only `None` means clean EOF.
+pub async fn read_udp_packet_into<R: AsyncRead + Unpin>(
     reader: &mut R,
+    payload: &mut Vec<u8>,
 ) -> Result<Option<usize>> {
-    let mut first = [0u8; 1];
-    let n = reader
+    let mut first = [0; 1];
+    let count = reader
         .read(&mut first)
         .await
-        .with_context(|| format!("{context}: failed to read length"))?;
-    if n == 0 {
+        .context("protocol::uot::read_udp_packet: failed to read packet length")?;
+    if count == 0 {
+        payload.clear();
         return Ok(None);
     }
-    // Read the first byte separately so callers can distinguish clean EOF
-    // before a frame from a truncated two-byte length field.
-    let mut second = [0u8; 1];
+
+    let mut second = [0; 1];
     reader
         .read_exact(&mut second)
         .await
-        .with_context(|| format!("{context}: failed to read complete length"))?;
-    Ok(Some(u16::from_be_bytes([first[0], second[0]]) as usize))
+        .context("protocol::uot::read_udp_packet: truncated packet length")?;
+    let payload_len = u16::from_be_bytes([first[0], second[0]]) as usize;
+    payload.resize(payload_len, 0);
+    reader
+        .read_exact(payload)
+        .await
+        .context("protocol::uot::read_udp_packet: truncated packet payload")?;
+    Ok(Some(payload_len))
 }
 
 #[cfg(test)]

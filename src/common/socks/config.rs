@@ -1,7 +1,7 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Strict parsing and redacted display for the `socks` URL parameter.
+//! Validated parsing and redacted display for the `socks` URL parameter.
 
 use std::fmt;
 
@@ -9,10 +9,22 @@ use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-#[derive(Clone)]
-struct SocksCredentials {
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct SocksCredentials {
     username: String,
     password: String,
+}
+
+impl fmt::Debug for SocksCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SocksCredentials(<redacted>)")
+    }
+}
+
+impl SocksCredentials {
+    pub(crate) fn as_pair(&self) -> (&str, &str) {
+        (&self.username, &self.password)
+    }
 }
 
 /// Validated SOCKS5 endpoint and optional RFC 1929 credentials.
@@ -33,33 +45,16 @@ impl fmt::Debug for SocksConfig {
 }
 
 impl SocksConfig {
-    /// Parses the unique raw `socks` query value without decoding delimiters first.
+    /// Parses the first raw `socks` query value without decoding delimiters first.
     pub(crate) fn from_url(parsed_url: &Url) -> Result<Option<Self>> {
-        let Some(query) = parsed_url.query() else {
+        let Some(raw_value) = first_raw_socks_value(parsed_url) else {
             return Ok(None);
         };
-        let mut raw_value = None;
-        for pair in query.split('&') {
-            let (raw_key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = decode_component(raw_key, "query key")?;
-            if key != "socks" {
-                continue;
-            }
-            if raw_value.replace(value).is_some() {
-                bail!("common::socks::SocksConfig::from_url: duplicate socks parameter");
-            }
-        }
-
-        let Some(raw_value) = raw_value else {
-            return Ok(None);
-        };
-        if raw_value.is_empty() || decode_component(raw_value, "socks value")? == "none" {
+        let (endpoint, credentials) = parse_socks_value(raw_value)?;
+        if credentials.is_none() && (endpoint.is_empty() || endpoint == "none") {
             return Ok(None);
         }
-
-        let (raw_endpoint, credentials) = parse_credentials(raw_value)?;
-        let endpoint = decode_component(raw_endpoint, "socks endpoint")?;
-        let (host, port) = parse_host_port(&endpoint, "socks endpoint")?;
+        let (host, port) = parse_host_port(&endpoint, "socks endpoint", false)?;
         Ok(Some(Self {
             host,
             port,
@@ -79,9 +74,20 @@ impl SocksConfig {
     }
 }
 
-fn parse_credentials(raw_value: &str) -> Result<(&str, Option<SocksCredentials>)> {
+pub(crate) fn first_raw_socks_value(parsed_url: &Url) -> Option<&str> {
+    let query = parsed_url.query()?;
+    for pair in query.split('&') {
+        let (raw_key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if decode_component(raw_key, "query key").is_ok_and(|key| key == "socks") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_socks_value(raw_value: &str) -> Result<(String, Option<SocksCredentials>)> {
     let Some((raw_credentials, raw_endpoint)) = raw_value.split_once('@') else {
-        return Ok((raw_value, None));
+        return Ok((decode_component(raw_value, "socks endpoint")?, None));
     };
     if raw_endpoint.contains('@') {
         bail!("common::socks::SocksConfig::from_url: invalid socks credentials");
@@ -98,10 +104,17 @@ fn parse_credentials(raw_value: &str) -> Result<(&str, Option<SocksCredentials>)
     let password = decode_component(raw_password, "socks password")?;
     validate_credential("username", &username)?;
     validate_credential("password", &password)?;
-    Ok((raw_endpoint, Some(SocksCredentials { username, password })))
+    Ok((
+        decode_component(raw_endpoint, "socks endpoint")?,
+        Some(SocksCredentials { username, password }),
+    ))
 }
 
-pub(super) fn parse_host_port(value: &str, name: &str) -> Result<(String, u16)> {
+pub(crate) fn parse_host_port(
+    value: &str,
+    name: &str,
+    allow_empty_host: bool,
+) -> Result<(String, u16)> {
     let (host, raw_port) = if let Some(rest) = value.strip_prefix('[') {
         let end = rest.find(']').ok_or_else(|| {
             anyhow!("common::socks::parse_host_port: invalid {name}: missing ']'")
@@ -123,7 +136,7 @@ pub(super) fn parse_host_port(value: &str, name: &str) -> Result<(String, u16)> 
         }
         (host, port)
     };
-    if host.is_empty() {
+    if host.is_empty() && !allow_empty_host {
         bail!("common::socks::parse_host_port: invalid {name}: empty host");
     }
     let port = raw_port
@@ -134,7 +147,7 @@ pub(super) fn parse_host_port(value: &str, name: &str) -> Result<(String, u16)> 
     Ok((host.to_string(), port))
 }
 
-pub(super) fn format_host_port(host: &str, port: u16) -> String {
+pub(crate) fn format_host_port(host: &str, port: u16) -> String {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")
     } else {
