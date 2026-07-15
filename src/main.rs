@@ -1,29 +1,34 @@
 // Copyright (C) 2026 NodePassProject <https://github.com/NodePassProject>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Command-line entry point for running the Nowhere portal server.
+//! Command-line entry point for running a Nowhere Portal or Vector.
 
 use std::env;
 
 use anyhow::{Context, Result, bail};
-use nowhere::common::{LogLevel, Logger};
+use nowhere::common::{LogLevel, Logger, query_first};
 use nowhere::portal::Portal;
+use nowhere::vector::Vector;
 use url::{ParseError, Url};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP_TEXT: &str = "\
 Usage:
-  nowhere <portal-url>
+  nowhere <portal-or-vector-url>
   nowhere -h | --help
   nowhere -v | --version
 
 Commands:
-  <portal-url>     Run portal server with configuration URL.
+  <portal-url>     Run the Portal relay service.
+  <vector-url>     Run the Vector native SOCKS5 client.
   -h, --help       Print this help message.
   -v, --version    Print version and target platform.
 
 Portal URL:
   portal://<shared-key>@<listen-host>:<listen-port>[?<parameters>]
+
+Vector URL:
+  vector://<shared-key>@<portal-host>:<portal-port>?socks=<listen-endpoint>[&<parameters>]
 
 Examples:
   nowhere 'portal://secret@:2077'
@@ -31,10 +36,12 @@ Examples:
   nowhere 'portal://secret@:2077?tls=2&crt=/etc/nowhere/cert.pem&key=/etc/nowhere/key.pem'
   nowhere 'portal://secret@:2077?socks=user:pass@127.0.0.1:1080'
   nowhere 'portal://secret@:2077?rate=100&etar=200'
+  nowhere 'vector://secret@relay.example:2077?sni=relay.example&socks=127.0.0.1:1080'
+  nowhere 'vector://secret@127.0.0.1:2077?up=tcp&down=tcp&pool=5&socks=:1080'
 
 Required URL parts:
   shared-key       Non-empty URL username. Percent-encode reserved characters.
-  listen-port      TCP and/or UDP listen port.
+  endpoint-port    Portal listen port or remote Portal port.
   Password credentials are not supported.
 
 Listen host:
@@ -43,20 +50,37 @@ Listen host:
   [::]             Bind IPv6 wildcard only.
   IP or hostname   Bind the resolved listen address.
 
-URL parameters:
-  log=<level>      none, debug, info, warn, error, event. Default: info.
+Portal parameters:
+  net=mix|tcp|udp  Listener mode. Default: mix.
   tls=1|2          TLS mode. 1 for RAM certificate; 2 for PEM files. Default: 1.
                    tls=0 is not supported.
   crt=<path>       PEM certificate chain for tls=2.
   key=<path>       PEM private key for tls=2.
-  net=mix|tcp|udp  Listener mode. Default: mix.
-  spec=<value>     Protocol shape seed. Default: auto.
   alpn=<value>     TLS/QUIC ALPN. Default: now/1.
   rate=<mbps>      Client-to-target traffic limit. 0 disables it.
   etar=<mbps>      Target-to-client traffic limit. 0 disables it.
   dial=<ip|auto>   Local source IP for outbound target connections. Default: auto.
   socks=<proxy>    SOCKS5 outbound proxy: host:port or user:pass@host:port.
-                   Omit, leave empty, or use none to disable. Default: none.
+                   Omit, leave empty, or use none to disable.
+  log=<level>      none, debug, info, warn, error, event. Default: info.
+
+Vector parameters:
+  up=tcp|udp       Upload carrier. Default: udp.
+  down=tcp|udp     Download carrier. Default: udp.
+  pool=<number>    TLS warm pool for tcp/tcp; default 5, clamped to 256.
+                   Ignored for other carrier pairs, which report pool=0.
+  sni=<name|none>  Verify the certificate for a DNS name. Empty, omitted, or
+                   none disables certificate validation. Default: none.
+  alpn=<value>     TLS/QUIC ALPN. Default: now/1.
+  rate=<mbps>      SOCKS client-to-target limit. 0 disables it.
+  etar=<mbps>      Target-to-SOCKS client limit. 0 disables it.
+  socks=<listener> Required SOCKS5 listener: [user:pass@]host:port.
+                   An empty host, as in :1080, binds IPv4 and IPv6 wildcards.
+  log=<level>      none, debug, info, warn, error, event. Default: info.
+
+Query handling:
+  Unknown parameters are ignored. If a parameter appears more than once, only
+  its first value is used. Missing optional parameters use their defaults.
 
 Transport capabilities:
   TLS/TCP          TCP relay and UDP-over-TCP (UoT).
@@ -66,6 +90,11 @@ SOCKS5 outbound:
   CONNECT proxies every TCP relay. UDP ASSOCIATE proxies every DATAGRAM/UoT flow.
   Target hostnames are resolved by the proxy. Proxy failure never falls back direct.
   Percent-encode reserved characters in SOCKS usernames and passwords.
+
+SOCKS5 inbound:
+  Vector supports CONNECT and UDP ASSOCIATE. BIND is not supported.
+  Configured username/password authentication cannot downgrade to no-auth.
+  SOCKS5 UDP fragmentation is not supported.
 
 Environment:
   NOW_QUIC_MAX_STREAMS      Maximum authenticated QUIC streams.
@@ -80,8 +109,9 @@ Environment:
   NOW_UDP_DIAL_TIMEOUT      UDP target dial timeout.
   NOW_TCP_READ_TIMEOUT      TCP half-close grace timeout.
   NOW_UDP_IDLE_TIMEOUT      QUIC and DATAGRAM/UoT flow idle timeout.
-  NOW_HANDSHAKE_TIMEOUT     Base authentication deadline before jitter.
+  NOW_HANDSHAKE_TIMEOUT     Fixed authentication and setup deadline.
   NOW_REPORT_INTERVAL       Local CHECK_POINT and LINK_STATUS report interval.
+  NOW_SERVICE_COOLDOWN      Transport reconnect retry delay.
   NOW_SHUTDOWN_TIMEOUT      Graceful shutdown wait.
   NOW_RELOAD_INTERVAL       Minimum PEM certificate reload interval.";
 
@@ -89,11 +119,10 @@ Environment:
 async fn main() {
     if let Err(err) = start(env::args().collect()).await {
         eprintln!(
-            "nowhere-{VERSION} {}/{} pid={} error={}",
+            "nowhere-{VERSION} {}/{} pid={} error={err:#}",
             env::consts::OS,
             env::consts::ARCH,
             std::process::id(),
-            err
         );
         std::process::exit(1);
     }
@@ -102,6 +131,9 @@ async fn main() {
 async fn start(args: Vec<String>) -> Result<()> {
     if args.len() < 2 {
         bail!("main::start: missing configuration URL argument");
+    }
+    if args.len() > 2 {
+        bail!("main::start: expected exactly one configuration URL");
     }
 
     match args[1].as_str() {
@@ -122,14 +154,19 @@ async fn start(args: Vec<String>) -> Result<()> {
 
     let command_url =
         parse_command_url(&args[1]).with_context(|| "main::start: failed to parse command URL")?;
-    let logger = init_logger(
-        command_url
-            .url
-            .query_pairs()
-            .find(|(k, _)| k == "log")
-            .map(|(_, v)| v),
-    );
     let scheme = command_url.url.scheme().to_string();
+    let allowed = match scheme.as_str() {
+        "portal" => &[
+            "net", "tls", "crt", "key", "alpn", "rate", "etar", "dial", "socks", "log",
+        ][..],
+        "vector" => &[
+            "up", "down", "pool", "sni", "alpn", "rate", "etar", "socks", "log",
+        ][..],
+        _ => bail!("main::start: unknown URL scheme: {scheme}"),
+    };
+    let query =
+        query_first(&command_url.url, allowed).with_context(|| "main::start: invalid URL query")?;
+    let logger = init_logger(query.get("log").map(String::as_str))?;
 
     match scheme.as_str() {
         "portal" => {
@@ -140,6 +177,11 @@ async fn start(args: Vec<String>) -> Result<()> {
             )
             .with_context(|| "main::start: failed to create portal")?;
             portal.run().await
+        }
+        "vector" => {
+            let vector = Vector::new(command_url.url, logger)
+                .with_context(|| "main::start: failed to create vector")?;
+            vector.run().await
         }
         _ => bail!("main::start: unknown URL scheme: {}", scheme),
     }
@@ -198,9 +240,10 @@ fn normalize_empty_portal_host(raw: &str) -> Option<String> {
     Some(normalized)
 }
 
-fn init_logger(level: Option<std::borrow::Cow<'_, str>>) -> Logger {
+fn init_logger(level: Option<&str>) -> Result<Logger> {
     let logger = Logger::new(LogLevel::Info, true);
-    match level.as_deref() {
+    match level {
+        None | Some("info") => {}
         Some("none") => logger.set_log_level(LogLevel::None),
         Some("debug") => {
             logger.set_log_level(LogLevel::Debug);
@@ -218,9 +261,9 @@ fn init_logger(level: Option<std::borrow::Cow<'_, str>>) -> Logger {
             logger.set_log_level(LogLevel::Event);
             logger.event(format_args!("main::init_logger: log level set to EVENT"));
         }
-        _ => {}
+        Some(value) => bail!("main::init_logger: invalid log level: {value}"),
     }
-    logger
+    Ok(logger)
 }
 
 #[cfg(test)]

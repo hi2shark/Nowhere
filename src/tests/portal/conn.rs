@@ -13,3 +13,5 @@ mod quic;
 mod support;
 #[path = "conn/tcp.rs"]
 mod tcp;
+#[path = "conn/vector.rs"]
+mod vector;

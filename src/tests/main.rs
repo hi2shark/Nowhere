@@ -9,13 +9,16 @@ use super::*;
 fn help_text_documents_usage_and_configuration_surface() {
     for expected in [
         "Usage:",
-        "nowhere <portal-url>",
+        "nowhere <portal-or-vector-url>",
         "-h, --help",
         "-v, --version",
         "portal://<shared-key>@<listen-host>:<listen-port>",
+        "vector://<shared-key>@<portal-host>:<portal-port>",
         "tls=1|2",
         "net=mix|tcp|udp",
-        "socks=<proxy>",
+        "socks=<listener>",
+        "pool=<number>",
+        "sni=<name|none>",
         "UDP ASSOCIATE",
         "rate=<mbps>",
         "etar=<mbps>",
@@ -26,14 +29,36 @@ fn help_text_documents_usage_and_configuration_surface() {
         "NOW_TCP_IDLE_POOL_CONNS",
         "NOW_MAX_PENDING_PAIRS",
         "NOW_HANDSHAKE_TIMEOUT",
+        "NOW_SERVICE_COOLDOWN",
         "Password credentials are not supported.",
         "tls=0 is not supported.",
+        "BIND is not supported.",
     ] {
         assert!(
             HELP_TEXT.contains(expected),
             "missing help text: {expected}"
         );
     }
+}
+
+#[test]
+fn parse_command_url_keeps_vector_remote_host() {
+    let parsed = parse_command_url(
+        "vector://secret@relay.example:2077?up=udp&down=tcp&socks=127.0.0.1:1080",
+    )
+    .unwrap();
+    assert_eq!(parsed.url.scheme(), "vector");
+    assert_eq!(parsed.url.host_str(), Some("relay.example"));
+    assert_eq!(parsed.url.port(), Some(2077));
+    assert_eq!(parsed.listen_host, None);
+}
+
+#[test]
+fn logger_rejects_unknown_or_empty_levels() {
+    assert!(init_logger(Some("verbose")).is_err());
+    assert!(init_logger(Some("")).is_err());
+    assert!(init_logger(None).is_ok());
+    assert!(init_logger(Some("event")).is_ok());
 }
 
 #[test]
