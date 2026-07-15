@@ -1,0 +1,12 @@
+.git
+.github
+target
+docs
+assets
+
+.gitignore
+.dockerignore
+Dockerfile
+
+*.md
+LICENSE
