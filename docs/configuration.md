@@ -119,22 +119,22 @@ local host.
 
 ## Runtime Limits
 
-| Variable | Purpose |
-| --- | --- |
-| `NOW_QUIC_MAX_STREAMS` | Authenticated QUIC streams and Vector TCP flow cap |
-| `NOW_QUIC_MAX_UDP_FLOWS` | UDP flows per session and Vector UDP target cap |
-| `NOW_QUIC_UDP_QUEUE_BYTES` | QUIC UDP queue and reassembly byte budget |
-| `NOW_TCP_IDLE_POOL_CONNS` | Portal authenticated idle TLS lane cap |
-| `NOW_MAX_PENDING_PAIRS` | Pending split-flow cap per session |
-| `NOW_FLOW_PAIR_TIMEOUT` | Split-flow pairing deadline |
-| `NOW_TCP_DATA_BUF_SIZE` | TCP relay buffer size |
-| `NOW_UDP_DATA_BUF_SIZE` | UDP receive buffer size |
-| `NOW_TCP_DIAL_TIMEOUT` | TCP target connect deadline |
-| `NOW_UDP_DIAL_TIMEOUT` | UDP target setup deadline |
-| `NOW_TCP_READ_TIMEOUT` | Opposite-half TCP drain grace |
-| `NOW_UDP_IDLE_TIMEOUT` | UDP flow and association target idle timeout |
-| `NOW_HANDSHAKE_TIMEOUT` | Authentication and flow setup deadline |
-| `NOW_REPORT_INTERVAL` | CHECK_POINT and LINK_STATUS interval |
-| `NOW_SERVICE_COOLDOWN` | Carrier reconnect delay; default 3 seconds |
-| `NOW_SHUTDOWN_TIMEOUT` | Graceful shutdown deadline |
-| `NOW_RELOAD_INTERVAL` | PEM certificate reload interval |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NOW_QUIC_MAX_STREAMS` | `1024` | Authenticated QUIC streams and Vector TCP flow cap |
+| `NOW_QUIC_MAX_UDP_FLOWS` | `256` | UDP flows per session and Vector UDP target cap |
+| `NOW_QUIC_UDP_QUEUE_BYTES` | `4194304` (4 MiB) | QUIC UDP queue and reassembly byte budget |
+| `NOW_TCP_IDLE_POOL_CONNS` | `4096` | Portal authenticated idle TLS lane cap |
+| `NOW_MAX_PENDING_PAIRS` | `1024` | Pending split-flow cap per session |
+| `NOW_FLOW_PAIR_TIMEOUT` | `15s` | Split-flow pairing deadline |
+| `NOW_TCP_DATA_BUF_SIZE` | `32768` (32 KiB) | TCP relay buffer size |
+| `NOW_UDP_DATA_BUF_SIZE` | `65536` (64 KiB) | UDP receive buffer size |
+| `NOW_TCP_DIAL_TIMEOUT` | `15s` | TCP target connect deadline |
+| `NOW_UDP_DIAL_TIMEOUT` | `15s` | UDP target setup deadline |
+| `NOW_TCP_READ_TIMEOUT` | `30s` | Opposite-half TCP drain grace |
+| `NOW_UDP_IDLE_TIMEOUT` | `2m` | UDP flow and association target idle timeout |
+| `NOW_HANDSHAKE_TIMEOUT` | `5s` | Authentication and flow setup deadline |
+| `NOW_REPORT_INTERVAL` | `5s` | CHECK_POINT and LINK_STATUS interval |
+| `NOW_SERVICE_COOLDOWN` | `3s` | Carrier reconnect delay |
+| `NOW_SHUTDOWN_TIMEOUT` | `5s` | Graceful shutdown deadline |
+| `NOW_RELOAD_INTERVAL` | `1h` | PEM certificate reload interval |
