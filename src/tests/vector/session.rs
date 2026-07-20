@@ -18,3 +18,10 @@ async fn idle_health_poll_accepts_pending_and_rejects_data_or_eof() {
     drop(peer);
     assert!(!idle_stream_usable(&mut eof));
 }
+
+#[test]
+fn quic_flow_control_matches_authenticated_portal_capacity() {
+    assert_eq!(QUIC_STREAM_RECEIVE_WINDOW, 16 * 1024 * 1024);
+    assert_eq!(QUIC_RECEIVE_WINDOW, 32 * 1024 * 1024);
+    assert_eq!(QUIC_SEND_WINDOW, 32 * 1024 * 1024);
+}

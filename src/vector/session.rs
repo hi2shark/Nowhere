@@ -38,6 +38,9 @@ use super::tls::{ClientTls, EXPORTER_LABEL};
 
 const WARM_LANE_TTL: Duration = Duration::from_secs(30);
 const QUIC_DATAGRAM_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+const QUIC_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+const QUIC_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 
 pub(super) struct TlsLane {
     pub(super) stream: TlsStream<tokio::net::TcpStream>,
@@ -592,6 +595,9 @@ fn configure_quic_transport(config: &mut quinn::ClientConfig) -> Result<()> {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
     transport.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
+    transport.stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
+    transport.receive_window(VarInt::from_u32(QUIC_RECEIVE_WINDOW));
+    transport.send_window(QUIC_SEND_WINDOW);
     transport.max_concurrent_uni_streams(VarInt::from_u32(0));
     transport.max_idle_timeout(Some(quinn::IdleTimeout::try_from(udp_idle_timeout())?));
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
