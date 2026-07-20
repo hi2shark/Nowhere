@@ -44,3 +44,9 @@ fn owned_quic_packet_reaches_socks_encoder_without_intermediate_copy() {
     assert_eq!(packet.payload(&[]), b"zero-copy");
     assert_eq!(packet.payload(&[]).as_ptr(), pointer);
 }
+
+#[test]
+fn mtu_drop_is_nonfatal_and_not_accounted_as_delivered() {
+    assert!(quic_datagram_delivered(UdpDatagramSend::Sent));
+    assert!(!quic_datagram_delivered(UdpDatagramSend::DroppedTooLarge));
+}

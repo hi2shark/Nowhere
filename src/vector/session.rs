@@ -491,13 +491,8 @@ impl QuicSession {
         flow_id: FlowId,
         packet_id: &mut u32,
         payload: &[u8],
-    ) -> Result<()> {
-        match send_quic_udp_packet(&self.connection, flow_id, packet_id, payload).await? {
-            UdpDatagramSend::Sent => Ok(()),
-            UdpDatagramSend::DroppedTooLarge => {
-                bail!("vector::session::QuicSession: DATAGRAM MTU changed repeatedly")
-            }
-        }
+    ) -> Result<UdpDatagramSend> {
+        send_quic_udp_packet(&self.connection, flow_id, packet_id, payload).await
     }
 
     pub(super) fn close_udp(&self, flow_id: FlowId) {

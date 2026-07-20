@@ -13,8 +13,8 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::common::handshake_timeout;
 use crate::common::socks::SocksAddress;
+use crate::common::{UdpDatagramSend, handshake_timeout};
 use crate::protocol::{Carrier, FlowHeader, FlowKind, FlowRole, write_udp_packet};
 
 use super::VectorInner;
@@ -44,13 +44,19 @@ pub(super) struct UdpTunnel {
 
 impl UdpTunnel {
     pub(super) async fn send(&mut self, payload: &[u8]) -> Result<()> {
-        if let Some(writer) = &mut self.writer {
+        let delivered = if let Some(writer) = &mut self.writer {
             write_udp_packet(writer, payload).await?;
+            true
         } else if let Some(quic) = &self.quic {
-            quic.send_udp(self.flow_id, &mut self.packet_id, payload)
-                .await?;
+            quic_datagram_delivered(
+                quic.send_udp(self.flow_id, &mut self.packet_id, payload)
+                    .await?,
+            )
         } else {
             bail!("vector::udp_flow::UdpTunnel::send: no uplink carrier");
+        };
+        if !delivered {
+            return Ok(());
         }
         self.vector
             .stats
@@ -96,6 +102,10 @@ impl UdpTunnel {
             quic.close_udp(self.flow_id);
         }
     }
+}
+
+fn quic_datagram_delivered(outcome: UdpDatagramSend) -> bool {
+    outcome == UdpDatagramSend::Sent
 }
 
 /// A UoT packet already in the reusable read buffer, or an owned zero-copy
