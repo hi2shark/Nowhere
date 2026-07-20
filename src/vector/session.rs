@@ -3,7 +3,7 @@
 
 //! Authenticated TLS pool and shared QUIC carrier lifecycle.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,7 +118,7 @@ pub(super) struct TlsPool {
     auth_key: AuthKey,
     session_id: SessionId,
     stats: Arc<Stats>,
-    idle: Mutex<Vec<TlsLane>>,
+    idle: Mutex<VecDeque<TlsLane>>,
     preparing: AtomicU64,
     replenish: Notify,
 }
@@ -138,7 +138,7 @@ impl TlsPool {
             auth_key: credentials.auth_key,
             session_id,
             stats,
-            idle: Mutex::new(Vec::with_capacity(config.pool)),
+            idle: Mutex::new(VecDeque::with_capacity(config.pool)),
             preparing: AtomicU64::new(0),
             replenish: Notify::new(),
         })
@@ -146,7 +146,10 @@ impl TlsPool {
 
     pub(super) async fn acquire(self: &Arc<Self>) -> Result<TlsLane> {
         loop {
-            let candidate = self.idle.lock().await.pop();
+            let candidate = {
+                let mut idle = self.idle.lock().await;
+                take_oldest_idle(&mut *idle)
+            };
             match candidate {
                 Some(mut lane) if !lane.expired() => {
                     if lane.usable() {
@@ -192,7 +195,7 @@ impl TlsPool {
                     if let Ok(Ok(lane)) = result {
                         let mut idle = self.idle.lock().await;
                         if idle.len() < self.target && !shutdown.is_cancelled() {
-                            idle.push(lane);
+                            store_idle(&mut *idle, lane);
                         }
                     } else {
                         connect_failed = true;
@@ -242,6 +245,14 @@ impl TlsPool {
     pub(super) async fn idle_count(&self) -> usize {
         self.idle.lock().await.len()
     }
+}
+
+fn take_oldest_idle<T>(idle: &mut VecDeque<T>) -> Option<T> {
+    idle.pop_front()
+}
+
+fn store_idle<T>(idle: &mut VecDeque<T>, lane: T) {
+    idle.push_back(lane);
 }
 
 fn idle_stream_usable<R: AsyncRead + Unpin>(reader: &mut R) -> bool {

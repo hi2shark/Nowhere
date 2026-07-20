@@ -25,3 +25,15 @@ fn quic_flow_control_matches_authenticated_portal_capacity() {
     assert_eq!(QUIC_RECEIVE_WINDOW, 32 * 1024 * 1024);
     assert_eq!(QUIC_SEND_WINDOW, 32 * 1024 * 1024);
 }
+
+#[test]
+fn idle_pool_uses_oldest_lane_first() {
+    let mut idle = VecDeque::new();
+    store_idle(&mut idle, 1);
+    store_idle(&mut idle, 2);
+    store_idle(&mut idle, 3);
+
+    assert_eq!(take_oldest_idle(&mut idle), Some(1));
+    assert_eq!(take_oldest_idle(&mut idle), Some(2));
+    assert_eq!(take_oldest_idle(&mut idle), Some(3));
+}
